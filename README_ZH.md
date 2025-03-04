@@ -1,3 +1,11 @@
+关于有何修改，见[README\_optimize.md](https://github.com/vproxy-tools/ktransformers/blob/optimize-latest/README_optimize.md)
+
+<br/>
+<br/>
+<br/>
+<br/>
+<br/>
+
 <div align="center">
   <!-- <h1>KTransformers</h1> -->
   <p align="center">
