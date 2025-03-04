@@ -194,6 +194,7 @@ fflush(stdout);
         }
         compute_func_(task_id);
     }
+#if 0
     int steal_total = steal_to - steal_from;
     for (int t_offset = 1; t_offset < steal_total; t_offset++) {
         int t_i = (thread_id - steal_from + t_offset) % steal_total + steal_from;
@@ -210,6 +211,7 @@ fflush(stdout);
             compute_func_(task_id);
         }
     }
+#endif // work steal
     if (finalize_func_ != nullptr) {
         finalize_func_(thread_id);
     }
