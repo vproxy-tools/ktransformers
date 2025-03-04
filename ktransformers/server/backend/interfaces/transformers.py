@@ -411,6 +411,9 @@ class TransformersInterface(BackendInterfaceBase):
 
         self.profiler.pause_timer("tokenize")
 
+        YIELD_THRESHOLD = 5
+        print(f'YIELD_THRESHOLD = {YIELD_THRESHOLD}')
+
         self.profiler.create_and_start_timer("prefill")
 
         if Config().user_force_think:
@@ -426,10 +429,21 @@ class TransformersInterface(BackendInterfaceBase):
         self.profiler.pause_timer("prefill")
 
         self.profiler.create_and_start_timer("decode")
+        last_tokens = ''
+        last_reason = None
         for t, finish_reason in self.generate():
+            if finish_reason:
+                last_reason = finish_reason
             if t is not None:
-                print(t, end="",flush=True)
-                yield t, finish_reason
+                last_tokens += t
+                if len(last_tokens) > YIELD_THRESHOLD:
+                    print(last_tokens, end="", flush=True)
+                    yield last_tokens, last_reason
+                    last_tokens = ''
+                    last_reason = None
+        if last_tokens or last_reason:
+            print(last_tokens, end="", flush=True)
+            yield last_tokens, last_reason
         print("")
         self.profiler.pause_timer("decode")
         self.report_last_time_performance()
