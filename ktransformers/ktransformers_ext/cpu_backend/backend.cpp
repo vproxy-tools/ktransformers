@@ -31,6 +31,8 @@
 #include <numaif.h>
 
 thread_local int Backend::numa_node = -1;
+thread_local int Backend::steal_from = -1;
+thread_local int Backend::steal_to = -1;
 #endif
 
 thread_local int Backend::thread_local_id = -1;
@@ -115,6 +117,9 @@ void Backend::process_tasks(int thread_id) {
         numa_bitmask_setbit(mask, numa_node);
         numa_bind(mask);
 
+        steal_from = thread_id_to_steal_from[thread_id];
+        steal_to = thread_id_to_steal_to[thread_id];
+
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
 
@@ -122,7 +127,7 @@ void Backend::process_tasks(int thread_id) {
 
         CPU_SET(cpuid, &cpuset);
         sched_setaffinity(gettid(), sizeof(cpuset), &cpuset);
-printf("thread_id = %d, nodes = %d, thread_num = %d, numa_node = %d, cpuid = %d\n", thread_id, numa_num_configured_nodes(), thread_num_, numa_node, cpuid);
+printf("thread_id = %d, nodes = %d, thread_num = %d, numa_node = %d, cpuid = %d, steal_from = %d, steal_to = %d\n", thread_id, numa_num_configured_nodes(), thread_num_, numa_node, cpuid, steal_from, steal_to);
 fflush(stdout);
     }
     #endif
@@ -138,8 +143,9 @@ fflush(stdout);
         }
         compute_func_(task_id);
     }
-    for (int t_offset = 1; t_offset < thread_num_; t_offset++) {
-        int t_i = (thread_id + t_offset) % thread_num_;
+    int steal_total = steal_to - steal_from;
+    for (int t_offset = 1; t_offset < steal_total; t_offset++) {
+        int t_i = (thread_id - steal_from + t_offset) % steal_total + steal_from;
         if (thread_state_[t_i].status->load(std::memory_order_acquire) !=
             ThreadStatus::WORKING) {
             continue;
