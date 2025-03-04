@@ -9,8 +9,8 @@ flashinfer_enabled = False
 
 try:
     import flashinfer
-    flashinfer_enabled = True
-    print("found flashinfer")
+    flashinfer_enabled = False
+    print("found flashinfer but disabled explicitly")
     
 except ImportError:
     print("flashinfer not found, use triton for linux")
