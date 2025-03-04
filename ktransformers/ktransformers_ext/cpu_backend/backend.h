@@ -40,6 +40,8 @@ class Backend {
                               std::function<void(int)>);
     #ifdef USE_NUMA
     static thread_local int numa_node;
+    static thread_local int steal_from;
+    static thread_local int steal_to;
     #endif
     static thread_local int thread_local_id;
 
