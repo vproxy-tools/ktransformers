@@ -61,7 +61,7 @@ class BackendInterfaceBase:
             prefill_count = self.profiler.get_counter('prefill')
             decode_count = self.profiler.get_counter('decode')
 
-            logger.info(f'Performance(T/s): prefill {prefill_count/prefill_time}, decode {decode_count/decode_time}. Time(s): tokenize {tokenize_time}, prefill {prefill_time}, decode {decode_time}')
+            logger.info(f'Total: prefill {prefill_count}, decode {decode_count}. Performance(T/s): prefill {prefill_count/prefill_time}, decode {decode_count/decode_time}. Time(s): tokenize {tokenize_time}, prefill {prefill_time}, decode {decode_time}')
         except:
             logger.info(f'Performance statistics not recorded')
 
