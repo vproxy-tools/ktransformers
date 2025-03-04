@@ -87,7 +87,15 @@ def report_last_time_performance(profiler: Profiler):
             prefill_count = profiler.get_counter('prefill')
             decode_count = profiler.get_counter('decode')
 
-            logger.info(f'Performance(T/s): prefill {prefill_count/prefill_time}, decode {decode_count/decode_time}. Time(s): tokenize {tokenize_time}, prefill {prefill_time}, decode {decode_time}')
+            logger.info(f'Total: prefill {prefill_count}')
+            logger.info(f'       decode  {decode_count}')
+            logger.info(f'Performance: prefill {prefill_count/prefill_time} T/s')
+            logger.info(f'                     {prefill_time*1000/prefill_count} ms/T')
+            logger.info(f'             decode  {decode_count/decode_time} T/s')
+            logger.info(f'                     {decode_time*1000/decode_count} ms/T')
+            logger.info(f'Time: tokenize {tokenize_time} s')
+            logger.info(f'      prefill  {prefill_time} s')
+            logger.info(f'      decode   {decode_time} s')
         except:
             logger.info(f'Performance statistics not recorded')
 
