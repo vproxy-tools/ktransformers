@@ -2,8 +2,9 @@ cmake_minimum_required(VERSION 3.16)
 project(cpuinfer_ext VERSION 0.1.0)
 
 
+set(CMAKE_STRIP "/usr/bin/true") # force not to strip symbols
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3 -ffast-math")
 set(CMAKE_BUILD_TYPE "Release")
 include(CheckCXXCompilerFlag)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
