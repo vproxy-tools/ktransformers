@@ -378,7 +378,16 @@ class TransformersInterface(BackendInterfaceBase):
             raise ValueError("local_messages should be List or str")
         
         if Config().user_force_think:
-            token_thinks = torch.tensor([self.tokenizer.encode("<think>\n",add_special_tokens=False)],device=input_ids.device)
+            try:
+                with open("/tmp/kt_force_think_prefix", "r") as f:
+                    think_prefix = f.read()
+                    print("think_prefix =", think_prefix)
+            except OSError as e:
+                print("unable to read from /tmp/kt_force_think_prefix, continue without custom prefix")
+                think_prefix = ""
+
+            token_thinks = torch.tensor([self.tokenizer.encode("<think>\n" + think_prefix,
+                                                               add_special_tokens=False)],device=input_ids.device)
             input_ids = torch.cat(
                 [input_ids, token_thinks], dim=1
             )
@@ -388,7 +397,7 @@ class TransformersInterface(BackendInterfaceBase):
         self.profiler.create_and_start_timer("prefill")
 
         if Config().user_force_think:
-            think = '<think>\n'
+            think = '<think>\n' + think_prefix
             print(think, end="",flush=True)
             yield think
         
