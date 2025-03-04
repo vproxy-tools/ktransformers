@@ -15,6 +15,13 @@
 #include <unistd.h>
 #include <sched.h>
 
+#ifndef likely
+#define likely(x)       __builtin_expect(!!(x), 1)
+#endif // likely
+#ifndef unlikely
+#define unlikely(x)     __builtin_expect(!!(x), 0)
+#endif // unlikely
+
 #include "backend.h"
 #include "core_info.h"
 #include <pthread.h>
@@ -97,7 +104,7 @@ void Backend::do_work_stealing_job(int task_num,
 void Backend::process_tasks(int thread_id) {
     
     #ifdef USE_NUMA
-    if(numa_node == -1){
+    if(unlikely(numa_node == -1)){
         char thread_name[36];
         sprintf(thread_name, "llama.cpp:%d", thread_id);
         pthread_setname_np(pthread_self(), thread_name);
@@ -159,7 +166,7 @@ void Backend::worker_thread(int thread_id) {
     while (true) {
         ThreadStatus status =
             thread_state_[thread_id].status->load(std::memory_order_acquire);
-        if (status == ThreadStatus::WORKING) {
+        if (likely(status == ThreadStatus::WORKING)) {
             process_tasks(thread_id);
             idle = 0;
         } else if (status == ThreadStatus::WAITING) {
