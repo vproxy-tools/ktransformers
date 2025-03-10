@@ -25,7 +25,7 @@ enum ThreadStatus {
 };
 
 #define numa_atomic 1
-#if numa_atomic
+#if numa_atomic && defined(USE_NUMA)
 #define CACHE_LINE (64)
 #define CPU_CORE_COUNT (1024)
 
@@ -69,11 +69,9 @@ class Backend {
     void do_work_stealing_job(int, std::function<void(int)>,
                               std::function<void(int)>,
                               std::function<void(int)>);
-    #ifdef USE_NUMA
     static thread_local int numa_node;
     static thread_local int steal_from;
     static thread_local int steal_to;
-    #endif
     static thread_local int thread_local_id;
 
   private:
