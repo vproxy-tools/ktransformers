@@ -24,9 +24,9 @@
         <link rel="stylesheet" href="../fonts/fonts.css">
 
         <!-- Highlight.js Stylesheets -->
-        <link rel="stylesheet" href="../highlight.css">
-        <link rel="stylesheet" href="../tomorrow-night.css">
-        <link rel="stylesheet" href="../ayu-highlight.css">
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
 
         <!-- Custom theme stylesheets -->
 
@@ -191,7 +191,7 @@
 </li>
 <li><a href="#how-to-run">How to Run</a>
 <ul>
-<li><a href="#v022-longer-context--fp8-kernel">V0.2.2 longer context &amp; FP8 kernel</a>
+<li><a href="#v022--v023-longer-context--fp8-kernel">v0.2.2 &amp; v0.2.3 longer context &amp; FP8 kernel</a>
 <ul>
 <li><a href="#longer-context">longer context</a></li>
 <li><a href="#fp8-kernel">FP8 kernel</a></li>
@@ -288,7 +288,7 @@ Memory: standard DDR5-4800 server DRAM (1 TB), each socket with 8×DDR5-4800</p>
 <ul>
 <li>Longer Context (from 4K to 8K for 24GB VRAM) and Slightly Faster Speed （+15%):<br>
 Integrated the highly efficient Triton MLA Kernel from the fantastic sglang project, enable much longer context length and slightly faster prefill/decode speed</li>
-<li>We suspect that some of the improvements come from the change of hardwre platform (4090D-&gt;4090)</li>
+<li>We suspect that some of the improvements come from the change of hardware platform (4090D-&gt;4090)</li>
 </ul>
 <h4 id="benchmark-results"><a class="header" href="#benchmark-results">Benchmark Results</a></h4>
 <p>"6 experts" case is part of V0.3's preview</p>
@@ -355,7 +355,7 @@ when we slightly decrease the activation experts num in inference,
 the output quality doesn't change. But the speed of decoding and prefill
 is speed up which is inspiring. So our showcase makes use of this finding</em></p>
 <h2 id="how-to-run"><a class="header" href="#how-to-run">How to Run</a></h2>
-<h3 id="v022-longer-context--fp8-kernel"><a class="header" href="#v022-longer-context--fp8-kernel">V0.2.2 longer context &amp; FP8 kernel</a></h3>
+<h3 id="v022--v023-longer-context--fp8-kernel"><a class="header" href="#v022--v023-longer-context--fp8-kernel">v0.2.2 &amp; v0.2.3 longer context &amp; FP8 kernel</a></h3>
 <h4 id="longer-context"><a class="header" href="#longer-context">longer context</a></h4>
 <p>To use this feature, <a href="https://github.com/flashinfer-ai/flashinfer">install flashinfer</a> first.</p>
 <p>Note: The latest MLA kernel in FlashInfer still has a few minor issues. They are continuously fixing them on the main branch. If you are using FlashInfer, please install it from the main source code.</p>
