@@ -13,6 +13,7 @@ try:
     import flashinfer
     flashinfer_enabled = True
     print("found flashinfer")
+    os.environ.pop('LD_PRELOAD', None) # do not use mimalloc for flashinfer
     
 except ImportError:
     print("flashinfer not found, use triton for linux")
