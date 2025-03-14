@@ -14,6 +14,11 @@
 
 #include <unistd.h>
 #include <sched.h>
+#if use_shlock
+    #include <sys/shm.h>
+#endif
+#include <sys/mman.h>
+#include <fcntl.h>
 
 #ifndef likely
 #define likely(x)       __builtin_expect(!!(x), 1)
@@ -29,16 +34,40 @@
 #include <numa.h>
 #include <numaif.h>
 
+#if use_epoll || use_poll
+    #if use_poll
+        #include <poll.h>
+    #else
+        #include <sys/epoll.h>
+    #endif
+    #include <sys/eventfd.h>
+#endif
+
 thread_local int Backend::numa_node = -1;
 thread_local int Backend::steal_from = -1;
 thread_local int Backend::steal_to = -1;
 
 thread_local int Backend::thread_local_id = -1;
+#if use_shlock
+std::atomic_bool* Backend::shlock = nullptr;
+#endif
 
 Backend::Backend(int max_thread_num) {
     max_thread_num_ = max_thread_num;
 
-#define numa_atomic 1
+#if use_epoll || use_poll
+    for (int i = 1; i < max_thread_num; ++i) {
+        evfd[i] = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        #if use_epoll
+        epfd[i] = epoll_create(1);
+        struct epoll_event evt = {
+            .events = EPOLLIN | EPOLLET,
+        };
+        epoll_ctl(epfd[i], EPOLL_CTL_ADD, evfd[i], &evt);
+        #endif
+    }
+#endif
+
 #if numa_atomic && defined(USE_NUMA)
     int oldpolicy;
     struct bitmask* oldmask = numa_allocate_nodemask();
@@ -96,8 +125,6 @@ fflush(stdout);
     }
     numa_free_cpumask(oldmask);
 #endif
-
-#undef numa_atomic
 }
 
 Backend::~Backend() {
@@ -118,6 +145,26 @@ void Backend::do_work_stealing_job(int task_num,
                                    std::function<void(int)> init_func,
                                    std::function<void(int)> compute_func,
                                    std::function<void(int)> finalize_func) {
+#if use_shlock
+    if (unlikely(shlock == nullptr)) {
+        bool is_new = access(KT_LOCK, F_OK) != 0;
+        int shmfd = open(KT_LOCK, O_CREAT | O_RDWR, 0600);
+        size_t mmsize = sizeof(std::atomic_bool);
+        if (is_new) {
+            ftruncate(shmfd, mmsize);
+        }
+        shlock = (std::atomic_bool*) mmap(NULL, mmsize, PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_POPULATE,
+                shmfd, 0);
+printf("fd = %d, lock = %p, last errno = %d %s\n", shmfd, shlock, errno, strerror(errno));
+fflush(stdout);
+        if (is_new) {
+            memset(shlock, 0, mmsize);
+        }
+        close(shmfd);
+    }
+#endif
+
     init_func_ = init_func;
     compute_func_ = compute_func;
     finalize_func_ = finalize_func;
@@ -134,6 +181,13 @@ void Backend::do_work_stealing_job(int task_num,
     // 为主线程设置 thread_local_id
     thread_local_id = 0;
 
+#if use_shlock
+    bool bfalse = false;
+    while (!shlock->compare_exchange_weak(bfalse, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+        bfalse = false;
+    }
+#endif
+
     for (int i = 1; i < thread_num_; i++) {
         thread_state_[i].curr->store(thread_state_[i - 1].end,
                                      std::memory_order_relaxed);
@@ -141,6 +195,14 @@ void Backend::do_work_stealing_job(int task_num,
         thread_state_[i].status->store(ThreadStatus::WORKING,
                                        std::memory_order_release);
     }
+
+#if use_epoll || use_poll
+    uint64_t dummy = 1;
+    for (int i = 1; i < thread_num_; i++) {
+        write(evfd[i], &dummy, 8);
+    }
+#endif
+
     thread_state_[0].curr->store(0, std::memory_order_relaxed);
     thread_state_[0].status->store(ThreadStatus::WORKING,
                                    std::memory_order_release);
@@ -150,6 +212,10 @@ void Backend::do_work_stealing_job(int task_num,
                ThreadStatus::WORKING) {
         }
     }
+
+#if use_shlock
+    shlock->store(false, std::memory_order_release);
+#endif
 }
 
 void Backend::process_tasks(int thread_id) {
@@ -233,9 +299,27 @@ void Backend::worker_thread(int thread_id) {
             process_tasks(thread_id);
             idle = 0;
         } else if (status == ThreadStatus::WAITING) {
+#if !use_epoll && !use_poll
             if (++idle > worker_thread_idle_threshold) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else {
+                #if use_yield
+                sched_yield();
+                #endif
             }
+#else
+            uint64_t foo;
+            #if use_poll
+            struct pollfd evt = { .fd = evfd[thread_id], .events = POLLIN };
+            int n = poll(&evt, 1, 2 * 1000);
+            #else
+            struct epoll_event evt;
+            int n = epoll_wait(epfd[thread_id], &evt, 1, 3 * 1000);
+            #endif
+            if (n == 1) {
+                read(evfd[thread_id], &foo, 8);
+            }
+#endif
         } else if (status == ThreadStatus::EXIT) {
             return;
         }

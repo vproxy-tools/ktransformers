@@ -24,10 +24,17 @@ enum ThreadStatus {
     EXIT,
 };
 
+#define use_yield 0
+#define use_shlock 0
+#if use_shlock
+    #define KT_LOCK "/dev/shm/kt.lock"
+#endif
+#define use_epoll 0
+#define use_poll 0
 #define numa_atomic 1
 #if numa_atomic && defined(USE_NUMA)
-#define CACHE_LINE (64)
-#define CPU_CORE_COUNT (1024)
+    #define CACHE_LINE (64)
+    #define CPU_CORE_COUNT (1024)
 
 struct kt_atomic {
     std::atomic<int>          curr   __attribute__((aligned(CACHE_LINE)));
@@ -38,7 +45,7 @@ struct kt_atomic {
 
 struct kt_atomic_numa {
     struct kt_atomic atomics[CPU_CORE_COUNT];
-    char padding[1024 * 1024 * 2];
+    char padding[1024 * 1024 * 16];
 };
 // 超大对象会被放在mimalloc的2M巨页中，方便观察numa分配
 
@@ -59,7 +66,6 @@ struct ThreadState {
     int end;
 };
 #endif
-#undef numa_atomic
 
 class Backend {
   public:
@@ -75,6 +81,16 @@ class Backend {
     static thread_local int thread_local_id;
 
   private:
+#if use_shlock
+    static std::atomic_bool* shlock;
+#endif
+#if use_epoll || use_poll
+    int evfd[1024]; // per thread
+    #if use_epoll
+    int epfd[1024];
+    #endif
+#endif
+
     int thread_num_;
     int max_thread_num_;
     std::vector<ThreadState> thread_state_; // [thread_num]
