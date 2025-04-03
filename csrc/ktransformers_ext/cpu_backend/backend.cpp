@@ -26,21 +26,19 @@
 #include "core_info.h"
 #include <pthread.h>
 
-#ifdef USE_NUMA
 #include <numa.h>
 #include <numaif.h>
 
 thread_local int Backend::numa_node = -1;
 thread_local int Backend::steal_from = -1;
 thread_local int Backend::steal_to = -1;
-#endif
 
 thread_local int Backend::thread_local_id = -1;
 
 Backend::Backend(int max_thread_num) {
     max_thread_num_ = max_thread_num;
 
-#if numa_atomic
+#if numa_atomic && defined(USE_NUMA)
     int oldpolicy;
     struct bitmask* oldmask = numa_allocate_nodemask();
     if (get_mempolicy(&oldpolicy, oldmask->maskp,
@@ -54,7 +52,7 @@ fflush(stdout);
     thread_state_.resize(max_thread_num_);
     workers_.resize(max_thread_num_);
 
-#if numa_atomic
+#if numa_atomic && defined(USE_NUMA)
     numa_set_preferred(0);
     auto numa0 = std::make_shared<struct kt_atomic_numa>();
     numa_set_preferred(1);
@@ -63,7 +61,7 @@ fflush(stdout);
 
     thread_state_.resize(max_thread_num_);
     for (int i = 0; i < max_thread_num_; i++) {
-#if numa_atomic
+#if numa_atomic && defined(USE_NUMA)
         struct kt_atomic* atomic;
         if (thread_id_to_numa[i] == 0) {
             atomic = &numa0->atomics[i];
@@ -83,13 +81,13 @@ fflush(stdout);
 #endif
     }
     for (int i = 1; i < max_thread_num_; i++) {
-#if numa_atomic
+#if numa_atomic && defined(USE_NUMA)
         numa_set_preferred(thread_id_to_numa[i]);
 #endif
         workers_[i] = std::thread(&Backend::worker_thread, this, i);
     }
 
-#if numa_atomic
+#if numa_atomic && defined(USE_NUMA)
     if (oldpolicy == MPOL_DEFAULT) {
         numa_set_localalloc();
     } else {
@@ -154,16 +152,19 @@ void Backend::do_work_stealing_job(int task_num,
 
 void Backend::process_tasks(int thread_id) {
     
-    #ifdef USE_NUMA
     if(unlikely(numa_node == -1)){
         char thread_name[36];
         sprintf(thread_name, "llama.cpp:%d", thread_id);
         pthread_setname_np(pthread_self(), thread_name);
 
+#ifdef USE_NUMA
         numa_node = thread_id_to_numa[thread_id];
         struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
         numa_bitmask_setbit(mask, numa_node);
         numa_bind(mask);
+#else
+        numa_node = 0;
+#endif
 
         steal_from = thread_id_to_steal_from[thread_id];
         steal_to = thread_id_to_steal_to[thread_id];
@@ -175,10 +176,13 @@ void Backend::process_tasks(int thread_id) {
 
         CPU_SET(cpuid, &cpuset);
         sched_setaffinity(gettid(), sizeof(cpuset), &cpuset);
+#ifdef USE_NUMA
 printf("thread_id = %d, nodes = %d, thread_num = %d, numa_node = %d, cpuid = %d, steal_from = %d, steal_to = %d\n", thread_id, numa_num_configured_nodes(), thread_num_, numa_node, cpuid, steal_from, steal_to);
+#else
+printf("thread_id = %d, thread_num = %d, cpuid = %d, steal_from = %d, steal_to = %d\n", thread_id, thread_num_, cpuid, steal_from, steal_to);
+#endif
 fflush(stdout);
     }
-    #endif
 
     if (init_func_ != nullptr) {
         init_func_(thread_id);
