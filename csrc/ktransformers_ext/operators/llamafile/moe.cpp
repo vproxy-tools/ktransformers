@@ -11,10 +11,8 @@
 #include <iostream>
 #include <cstdint>
 
-#ifdef USE_NUMA
 #include <numa.h>
 #include <numaif.h>
-#endif
 
 #include <sys/mman.h>
 #include <fstream>
@@ -133,11 +131,12 @@ fflush(stdout);
 
 MOE::MOE(MOEConfig config) {
     config_ = config;
+
+    #ifdef USE_NUMA
     gate_proj_ = config_.gate_proj;
     up_proj_ = config_.up_proj;
     down_proj_ = config_.down_proj;
     
-    #ifdef USE_NUMA
     int numa_nodes = numa_num_configured_nodes();
     gate_proj_numa_.resize(numa_nodes);
     up_proj_numa_.resize(numa_nodes);
@@ -158,6 +157,11 @@ MOE::MOE(MOEConfig config) {
             std::cout << "Memory allocation failed for down_proj_numa_ on node " << i << std::endl;
         }
         if (alloc_info.is_new_mem) {
+if (i == 0) {
+std::cout << "copying from disk to hugepages on numa" << i << std::endl;
+} else {
+std::cout << "copying from hugepages on numa " << (i - 1) << " to numa" << i << std::endl;
+}
         memcpy(gate_proj_numa_[i], gate_proj_, exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type));
         memcpy(up_proj_numa_[i], up_proj_, exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type));
         memcpy(down_proj_numa_[i], down_proj_, exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type));
@@ -165,6 +169,18 @@ MOE::MOE(MOEConfig config) {
         gate_proj_ = gate_proj_numa_[i];
         up_proj_ = up_proj_numa_[i];
         down_proj_ = down_proj_numa_[i];
+    }
+    #else
+    size_t exp_inter_hidden_mul_ = (size_t)config.expert_num * config.intermediate_size * config.hidden_size;
+    struct kt_mem_alloc_info alloc_info;
+    gate_proj_ = _numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type), 0, &alloc_info);
+    up_proj_ = _numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type), 0, &alloc_info);
+    down_proj_ = _numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type), 0, &alloc_info);
+    if (alloc_info.is_new_mem) {
+std::cout << "copying from disk to hugepage" << std::endl;
+        memcpy(gate_proj_, config_.gate_proj, exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type));
+        memcpy(up_proj_, config_.up_proj, exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type));
+        memcpy(down_proj_, config_.down_proj, exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type));
     }
     #endif
 
