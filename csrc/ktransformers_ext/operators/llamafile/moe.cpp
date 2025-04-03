@@ -16,6 +16,92 @@
 #include <numaif.h>
 #endif
 
+#include <sys/mman.h>
+#include <fstream>
+
+static size_t KT_PER_NUMA_HUGE_MEM = (1024L * 1024 * 1024 * 375);
+#define KT_MEM_SEG_ALIGN (256)
+
+struct kt_memmgr {
+    void* raw;
+    void* mm;
+    size_t used;
+    size_t cap;
+};
+
+struct kt_memmgr kt_numa_memmgr[2];
+
+static void* _numa_alloc_onnode(size_t size, int node) {
+    struct kt_memmgr* mgr = &kt_numa_memmgr[node];
+    if (mgr->mm == NULL) {
+        int oldpolicy;
+        struct bitmask* oldmask = numa_allocate_nodemask();
+        if (get_mempolicy(&oldpolicy, oldmask->maskp,
+                          oldmask->size + 1, 0, 0) < 0) {
+printf("get_mempolicy failed, errno=%d %s\n", errno, strerror(errno));
+fflush(stdout);
+            oldpolicy = MPOL_DEFAULT;
+        }
+        numa_set_preferred(node);
+printf("numa_set_preferred(%d)\n", node);
+fflush(stdout);
+
+        try {
+            std::ifstream file("/tmp/kt_per_numa_huge_mem");
+            std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            uint64_t value = std::stoull(content.erase(content.find_last_not_of(" \t\n\r") + 1));
+printf("using %lu from /tmp/kt_per_numa_huge_mem\n", value);
+fflush(stdout);
+            KT_PER_NUMA_HUGE_MEM = value;
+        } catch (...) {
+printf("unable to read from /tmp/kt_per_numa_huge_mem, using default %lu\n", KT_PER_NUMA_HUGE_MEM);
+fflush(stdout);
+        }
+
+        void* mm = mmap(NULL, KT_PER_NUMA_HUGE_MEM, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE,
+                        -1, 0);
+        memset(mm, 0, KT_PER_NUMA_HUGE_MEM);
+printf("mmap() size=%lu result=%p\n", KT_PER_NUMA_HUGE_MEM, mm);
+fflush(stdout);
+
+        if (oldpolicy == MPOL_DEFAULT) {
+            numa_set_localalloc();
+        } else {
+            set_mempolicy(oldpolicy, oldmask->maskp,
+                          oldmask->size + 1);
+        }
+        numa_free_cpumask(oldmask);
+
+        if ((uint64_t)mm == 0xffffffffffffffffULL || mm == NULL) {
+printf("mmap failed! %d %s\n", errno, strerror(errno));
+fflush(stdout);
+            return NULL;
+        }
+        mgr->raw = mm;
+        mgr->mm = (void*) (((size_t)mgr->raw + KT_MEM_SEG_ALIGN - 1) & ~(KT_MEM_SEG_ALIGN - 1));
+        mgr->used = 0;
+        mgr->cap = KT_PER_NUMA_HUGE_MEM - ((size_t)mgr->mm - (size_t)mgr->raw);
+    }
+    if (mgr->used > mgr->cap) {
+printf("node = %d, alloc = %lu, used(before) = %lu, exceeds %lu\n", node, size, mgr->used, mgr->cap);
+fflush(stdout);
+        return NULL;
+    }
+    void* ret = (void*)((size_t)mgr->mm + mgr->used);
+    mgr->used += size;
+    if (mgr->used > mgr->cap) {
+printf("node = %d, alloc = %lu, used(after) = %lu, exceeds %lu\n", node, size, mgr->used, mgr->cap);
+fflush(stdout);
+        mgr->used -= size;
+        return NULL;
+    }
+    mgr->used = (mgr->used + KT_MEM_SEG_ALIGN - 1) & ~(KT_MEM_SEG_ALIGN - 1);
+printf("allocated %lu on node %d, used %lf%%\n", size, node, (double)mgr->used / KT_PER_NUMA_HUGE_MEM * 100);
+fflush(stdout);
+    return ret;
+}
+
 MOE::MOE(MOEConfig config) {
     config_ = config;
     gate_proj_ = config_.gate_proj;
@@ -29,9 +115,9 @@ MOE::MOE(MOEConfig config) {
     down_proj_numa_.resize(numa_nodes);
     size_t exp_inter_hidden_mul_ = (size_t)config.expert_num * config.intermediate_size * config.hidden_size;
     for (int i = 0; i < numa_nodes; i++) {
-        gate_proj_numa_[i] = numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type), i);
-        up_proj_numa_[i] = numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type), i);
-        down_proj_numa_[i] = numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type), i);
+        gate_proj_numa_[i] = _numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type), i);
+        up_proj_numa_[i] = _numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type), i);
+        down_proj_numa_[i] = _numa_alloc_onnode(exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type), i);
         if (!gate_proj_numa_[i]) {
             std::cout << "Memory allocation failed for gate_proj_numa_ on node " << i << std::endl;
         }
@@ -44,6 +130,9 @@ MOE::MOE(MOEConfig config) {
         memcpy(gate_proj_numa_[i], gate_proj_, exp_inter_hidden_mul_* ggml_type_size(config.gate_type) / ggml_blck_size(config.gate_type));
         memcpy(up_proj_numa_[i], up_proj_, exp_inter_hidden_mul_* ggml_type_size(config.up_type) / ggml_blck_size(config.up_type));
         memcpy(down_proj_numa_[i], down_proj_, exp_inter_hidden_mul_* ggml_type_size(config.down_type) / ggml_blck_size(config.down_type));
+        gate_proj_ = gate_proj_numa_[i];
+        up_proj_ = up_proj_numa_[i];
+        down_proj_ = down_proj_numa_[i];
     }
     #endif
 
@@ -108,9 +197,10 @@ MOE::~MOE() {
     #ifdef USE_NUMA
     int numa_nodes = numa_num_configured_nodes();
     for (int i = 0; i < numa_nodes; i++) {
-        numa_free(gate_proj_numa_[i], config_.expert_num * config_.intermediate_size * config_.hidden_size * ggml_type_size(config_.gate_type) / ggml_blck_size(config_.gate_type));
-        numa_free(up_proj_numa_[i], config_.expert_num * config_.intermediate_size * config_.hidden_size * ggml_type_size(config_.up_type) / ggml_blck_size(config_.up_type));
-        numa_free(down_proj_numa_[i], config_.expert_num * config_.hidden_size * config_.intermediate_size * ggml_type_size(config_.down_type) / ggml_blck_size(config_.down_type));
+        if (kt_numa_memmgr[i].mm) {
+            munmap(kt_numa_memmgr[i].raw, KT_PER_NUMA_HUGE_MEM);
+            kt_numa_memmgr[i].mm = NULL;
+        }
     }
     #endif
 }
