@@ -13,6 +13,9 @@ Copyright (c) 2023, Tri Dao.
 Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
 '''
 
+import warnings
+warnings.filterwarnings("ignore", message=".*Package .* is absent from the `packages` configuration\\..*")
+
 import os
 import sys
 import re
