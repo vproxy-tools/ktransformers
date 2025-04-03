@@ -24,11 +24,41 @@ enum ThreadStatus {
     EXIT,
 };
 
+#define numa_atomic 1
+#if numa_atomic
+#define CACHE_LINE (64)
+#define CPU_CORE_COUNT (1024)
+
+struct kt_atomic {
+    std::atomic<int>          curr   __attribute__((aligned(CACHE_LINE)));
+    std::atomic<ThreadStatus> status __attribute__((aligned(CACHE_LINE)));
+
+    kt_atomic(): curr(0), status(ThreadStatus::WAITING) {}
+};
+
+struct kt_atomic_numa {
+    struct kt_atomic atomics[CPU_CORE_COUNT];
+    char padding[1024 * 1024 * 2];
+};
+// 超大对象会被放在mimalloc的2M巨页中，方便观察numa分配
+
+struct ThreadState {
+    std::shared_ptr<struct kt_atomic_numa> numa0 __attribute__((aligned(CACHE_LINE)));
+    std::shared_ptr<struct kt_atomic_numa> numa1 __attribute__((aligned(CACHE_LINE)));
+
+    char padding[CACHE_LINE];
+
+    std::atomic<ThreadStatus>* status;
+    std::atomic<int>*          curr;
+    int end;
+};
+#else
 struct ThreadState {
     std::unique_ptr<std::atomic<ThreadStatus>> status;
     std::unique_ptr<std::atomic<int>> curr;
     int end;
 };
+#endif
 
 class Backend {
   public:
