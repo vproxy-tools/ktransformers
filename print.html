@@ -32,10 +32,11 @@
         <!-- Custom theme stylesheets -->
 
 
-        <!-- Provide site root to javascript -->
+        <!-- Provide site root and default themes to javascript -->
         <script>
-            var path_to_root = "";
-            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "navy" : "light";
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc.js"></script>
@@ -45,8 +46,8 @@
         <!-- Work around some values being stored in localStorage wrapped in quotes -->
         <script>
             try {
-                var theme = localStorage.getItem('mdbook-theme');
-                var sidebar = localStorage.getItem('mdbook-sidebar');
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
 
                 if (theme.startsWith('"') && theme.endsWith('"')) {
                     localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
@@ -60,7 +61,8 @@
 
         <!-- Set the theme before any content is loaded, prevents flash -->
         <script>
-            var theme;
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
             try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
             if (theme === null || theme === undefined) { theme = default_theme; }
             const html = document.documentElement;
@@ -73,8 +75,8 @@
 
         <!-- Hide / unhide sidebar before it is displayed -->
         <script>
-            var sidebar = null;
-            var sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
             if (document.body.clientWidth >= 1080) {
                 try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
                 sidebar = sidebar || 'visible';
@@ -110,6 +112,7 @@
                             <i class="fa fa-paint-brush"></i>
                         </button>
                         <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
                             <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
                             <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
                             <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
@@ -174,8 +177,11 @@ interface, RESTful APIs compliant with OpenAI and Ollama, and even a simplified 
 Our vision for KTransformers is to serve as a flexible platform for experimenting with innovative LLM inference optimizations. Please let us know if you need any other features.
 <h2 id="Updates"><a class="header" href="#Updates">🔥 Updates</a></h2>
 <ul>
-<li><strong>Mar 5, 2025</strong>: Support unsloth 1.58/2.51 bits weights and <a href="./doc/en/fp8_kernel.html">IQ1_S/FP8 hybrid</a> weights. Support 139K <a href="./doc/en/DeepseekR1_V3_tutorial.html#v022-longer-context">Longer Context</a> for DeepSeek-V3 and R1 in 24GB VRAM.</li>
-<li><strong>Feb 25, 2025</strong>: Support <a href="./doc/en/fp8_kernel.html">FP8 GPU kernel</a> for DeepSeek-V3 and R1; <a href="./doc/en/DeepseekR1_V3_tutorial.html#v022-longer-context">Longer Context</a>.</li>
+<li><strong>Apr 2, 2025</strong>: Support Multi-concurrency. (<a href="./en/balance-serve.html">Tutorial</a>).</li>
+<li><strong>Mar 27, 2025</strong>: Support Multi-concurrency.</li>
+<li><strong>Mar 15, 2025</strong>: Support ROCm on AMD GPU (<a href="./en/ROCm.html">Tutorial</a>).</li>
+<li><strong>Mar 5, 2025</strong>: Support unsloth 1.58/2.51 bits weights and <a href="./en/fp8_kernel.html">IQ1_S/FP8 hybrid</a> weights. Support 139K <a href="./en/DeepseekR1_V3_tutorial.html#v022-longer-context">Longer Context</a> for DeepSeek-V3 and R1 in 24GB VRAM.</li>
+<li><strong>Feb 25, 2025</strong>: Support <a href="./en/fp8_kernel.html">FP8 GPU kernel</a> for DeepSeek-V3 and R1; <a href="./en/DeepseekR1_V3_tutorial.html#v022-longer-context">Longer Context</a>.</li>
 <li><strong>Feb 10, 2025</strong>: Support Deepseek-R1 and V3 on single (24GB VRAM)/multi gpu and 382G DRAM, up to 3~28x speedup. The detailed tutorial is <a href="./en/DeepseekR1_V3_tutorial.html">here</a>.</li>
 <li><strong>Aug 28, 2024</strong>: Support 1M context under the InternLM2.5-7B-Chat-1M model, utilizing 24GB of VRAM and 150GB of DRAM. The detailed tutorial is <a href="./en/long_context_tutorial.html">here</a>.</li>
 <li><strong>Aug 28, 2024</strong>: Decrease DeepseekV2's required VRAM from 21G to 11G.</li>
@@ -187,12 +193,16 @@ Our vision for KTransformers is to serve as a flexible platform for experimentin
 <div style="break-before: page; page-break-before: always;"></div><!-- omit in toc -->
 <h1 id="how-to-run-deepseek-r1"><a class="header" href="#how-to-run-deepseek-r1">How to Run DeepSeek-R1</a></h1>
 <ul>
+<li><a href="en/install.html#how-to-run-deepseek-r1">How to Run DeepSeek-R1</a>
+<ul>
 <li><a href="en/install.html#preparation">Preparation</a></li>
 <li><a href="en/install.html#installation">Installation</a>
 <ul>
 <li><a href="en/install.html#attention">Attention</a></li>
-<li><a href="en/install.html#supported-models-include">Supported models include:</a></li>
-<li><a href="en/install.html#support-quantize-format">Support quantize format:</a></li>
+<li><a href="en/install.html#supported-models-include">Supported models include</a></li>
+<li><a href="en/install.html#support-quantize-format">Support quantize format</a></li>
+</ul>
+</li>
 </ul>
 </li>
 </ul>
@@ -226,8 +236,8 @@ fi
 </li>
 <li>
 <p>Linux-x86_64 with gcc, g++ and cmake (using Ubuntu as an example)</p>
-<pre><code class="language-sh">sudo apt-get update
-sudo apt-get install build-essential cmake ninja-build
+<pre><code class="language-sh">sudo apt-get update 
+sudo apt-get install build-essential cmake ninja-build patchelf
 </code></pre>
 </li>
 <li>
@@ -253,6 +263,9 @@ pip3 install packaging ninja cpufeature numpy
 <h2 id="installation"><a class="header" href="#installation">Installation</a></h2>
 <h3 id="attention"><a class="header" href="#attention">Attention</a></h3>
 <p>If you want to use numa support, not only do you need to set USE_NUMA=1, but you also need to make sure you have installed the libnuma-dev (<code>sudo apt-get install libnuma-dev</code> may help you).</p>
+<p>[Optional] If you want to use the multi-concurrent version, please install the following dependencies.</p>
+<pre><code>sudo apt install libtbb-dev libssl-dev libcurl4-openssl-dev libaio1 libaio-dev libgflags-dev zlib1g-dev libfmt-dev
+</code></pre>
 <!-- 1. ~~Use a Docker image, see [documentation for Docker](./doc/en/Docker.md)~~
    
    >We are working on the latest docker image, please wait for a while.
@@ -265,16 +278,13 @@ pip3 install packaging ninja cpufeature numpy
    ```
    
    for windows we prepare a pre compiled whl package on [ktransformers-0.2.0+cu125torch24avx2-cp312-cp312-win_amd64.whl](https://github.com/kvcache-ai/ktransformers/releases/download/v0.2.0/ktransformers-0.2.0+cu125torch24avx2-cp312-cp312-win_amd64.whl), which require cuda-12.5, torch-2.4, python-3.11, more pre compiled package are being produced.  -->
-<ul>
-<li>
 <p>Download source code and compile:</p>
 <ul>
 <li>
 <p>init source code</p>
 <pre><code class="language-sh">git clone https://github.com/kvcache-ai/ktransformers.git
 cd ktransformers
-git submodule init
-git submodule update
+git submodule update --init --recursive
 </code></pre>
 </li>
 <li>
@@ -290,24 +300,32 @@ git submodule update
 </li>
 <li>
 <p>For those who have two cpu and 1T RAM:</p>
-<pre><code class="language-shell"> # Make sure your system has dual sockets and double size RAM than the model's size (e.g. 1T RAM for 512G model)
+<pre><code class="language-shell"># Make sure your system has dual sockets and double size RAM than the model's size (e.g. 1T RAM for 512G model)
  apt install libnuma-dev
  export USE_NUMA=1
  bash install.sh # or #make dev_install
 </code></pre>
 </li>
-</ul>
+<li>
+<p>For Multi-concurrency with 500G RAM:</p>
+<pre><code class="language-shell">USE_BALANCE_SERVE=1 bash ./install.sh
+</code></pre>
 </li>
 <li>
-<p>For Windows</p>
-<pre><code class="language-shell">install.bat
+<p>For Multi-concurrency with two cpu and 1T RAM:</p>
+<pre><code class="language-shell">USE_BALANCE_SERVE=1 USE_NUMA=1 bash ./install.sh
 </code></pre>
 </li>
 </ul>
 </li>
 <li>
-<p>If you are developer, you can make use of the makefile to compile and format the code. <br> the detailed usage of makefile is <a href="en/./makefile_usage.html">here</a></p>
+<p>For Windows (Windows native temprarily deprecated, please try WSL)</p>
+<pre><code class="language-shell">install.bat
+</code></pre>
 </li>
+</ul>
+<ul>
+<li>If you are developer, you can make use of the makefile to compile and format the code. <br> the detailed usage of makefile is <a href="en/./makefile_usage.html">here</a></li>
 </ul>
 <h3 id="local-chat"><a class="header" href="#local-chat">Local Chat</a></h3>
 We provide a simple command-line local chat Python script that you can run for testing.
@@ -355,10 +373,21 @@ python -m ktransformers.local_chat --model_path deepseek-ai/DeepSeek-V2-Lite-Cha
 <p><code>--cpu_infer</code>: Int (default=10). The number of CPUs used for inference. Should ideally be set to the (total number of cores - 2).</p>
 </li>
 </ul>
+<h3 id="start-server"><a class="header" href="#start-server">Start Server</a></h3>
+We provide a server script, which supports multi-concurrency functionality in version v0.2.4.
+<pre><code>python ktransformers/server/main.py --model_path /mnt/data/models/DeepSeek-V3 --gguf_path /mnt/data/models/DeepSeek-V3-GGUF/DeepSeek-V3-Q4_K_M/ --cpu_infer 62 --optimize_config_path ktransformers/optimize/optimize_rules/DeepSeek-V3-Chat-serve.yaml --port 10002 --chunk_size 256 --max_new_tokens 1024 --max_batch_size 4 --port 10002 --cache_lens 32768 --backend_type balance_serve
+</code></pre>
+<p>It features the following arguments:</p>
+<ul>
+<li><code>--chunk_size</code>: Maximum number of tokens processed in a single run by the engine.</li>
+<li><code>--cache_lens</code>: Total length of kvcache allocated by the scheduler. All requests share a kvcache space corresponding to 32768 tokens, and the space occupied will be released after the requests are completed.</li>
+<li><code>--backend_type</code>: <code>balance_serve</code> is a multi-concurrency backend engine introduced in version v0.2.4. The original single-concurrency engine is <code>ktransformers</code>.</li>
+<li><code>--max_batch_size</code>: Maximum number of requests (prefill + decode) processed in a single run by the engine. (Supported only by <code>balance_serve</code>)</li>
+</ul>
 <details>
 <summary>Supported Models/quantization</summary>
-<h3 id="supported-models-include"><a class="header" href="#supported-models-include">Supported models include:</a></h3>
-<div class="table-wrapper"><table><thead><tr><th>✅ <strong>Supported Models</strong></th><th>❌ <strong>Deprecated Models</strong></th></tr></thead><tbody>
+<h3 id="supported-models-include"><a class="header" href="#supported-models-include">Supported models include</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>✅<strong>Supported Models</strong></th><th>❌<strong>Deprecated Models</strong></th></tr></thead><tbody>
 <tr><td>DeepSeek-R1</td><td><del>InternLM2.5-7B-Chat-1M</del></td></tr>
 <tr><td>DeepSeek-V3</td><td></td></tr>
 <tr><td>DeepSeek-V2</td><td></td></tr>
@@ -369,9 +398,11 @@ python -m ktransformers.local_chat --model_path deepseek-ai/DeepSeek-V2-Lite-Cha
 <tr><td>Mixtral-8x22B</td><td></td></tr>
 </tbody></table>
 </div>
-<h3 id="support-quantize-format"><a class="header" href="#support-quantize-format">Support quantize format:</a></h3>
-<div class="table-wrapper"><table><thead><tr><th>✅ <strong>Supported Formats</strong></th><th>❌ <strong>Deprecated Formats</strong></th></tr></thead><tbody>
-<tr><td>Q2_K_L</td><td><del>IQ2_XXS</del></td></tr>
+<h3 id="support-quantize-format"><a class="header" href="#support-quantize-format">Support quantize format</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>✅<strong>Supported Formats</strong></th><th>❌<strong>Deprecated Formats</strong></th></tr></thead><tbody>
+<tr><td>IQ1_S</td><td><del>IQ2_XXS</del></td></tr>
+<tr><td>IQ2_XXS</td><td></td></tr>
+<tr><td>Q2_K_L</td><td></td></tr>
 <tr><td>Q2_K_XS</td><td></td></tr>
 <tr><td>Q3_K_M</td><td></td></tr>
 <tr><td>Q4_K_M</td><td></td></tr>
@@ -448,7 +479,7 @@ python -m ktransformers.local_chat --model_name deepseek-ai/DeepSeek-V2-Chat-062
 </tbody></table>
 </div></details>
 <!-- pin block for jump -->
-<span id='id_666'> 
+<span id='id_666'>
 <h3 id="restful-api-and-web-ui"><a class="header" href="#restful-api-and-web-ui">RESTful API and Web UI  </a></h3>
 <p>Start without website:</p>
 <pre><code class="language-sh">ktransformers --model_path deepseek-ai/DeepSeek-V2-Lite-Chat --gguf_path /path/to/DeepSeek-V2-Lite-Chat-GGUF --port 10002
@@ -606,8 +637,8 @@ Integrated the highly efficient Triton MLA Kernel from the fantastic sglang proj
 <tr><td>Prefill token/s</td><td>13</td><td>105</td><td>102</td><td>88</td><td>CUDA OOM</td></tr>
 <tr><td>decode token/s</td><td>16.8</td><td>15.4</td><td>14.2</td><td>13.0</td><td>CUDA OOM</td></tr>
 <tr><td><strong>6 experts V0.2.1</strong></td><td></td><td></td><td></td><td></td><td></td></tr>
-<tr><td>Prefill token/s</td><td>13</td><td>111</td><td>112.5</td><td>102 <strong>(1.16x speedup)</strong></td><td>101</td></tr>
-<tr><td>decode token/s</td><td>16.8</td><td>15.9</td><td>15.4</td><td>14.9 <strong>(1.15x speedup)</strong></td><td>13.9</td></tr>
+<tr><td>Prefill token/s</td><td>13</td><td>111</td><td>112.5</td><td>102**(1.16x speedup)**</td><td>101</td></tr>
+<tr><td>decode token/s</td><td>16.8</td><td>15.9</td><td>15.4</td><td>14.9**(1.15x speedup)**</td><td>13.9</td></tr>
 <tr><td><strong>8 experts V0.2.1</strong></td><td></td><td></td><td></td><td></td><td></td></tr>
 <tr><td>Prefill token/s</td><td>12.2</td><td>88.2</td><td>88.5</td><td>81.9</td><td>80</td></tr>
 <tr><td>Decode token/s</td><td>13.4</td><td>13.5</td><td>13.4</td><td>13.2</td><td>12.4</td></tr>
@@ -663,6 +694,17 @@ when we slightly decrease the activation experts num in inference,
 the output quality doesn't change. But the speed of decoding and prefill
 is speed up which is inspiring. So our showcase makes use of this finding</em></p>
 <h2 id="how-to-run"><a class="header" href="#how-to-run">How to Run</a></h2>
+<h3 id="v024"><a class="header" href="#v024">v0.2.4</a></h3>
+<p>We provide a server script, which supports multi-concurrency functionality in version v0.2.4.</p>
+<pre><code>python ktransformers/server/main.py --model_path /mnt/data/models/DeepSeek-V3 --gguf_path /mnt/data/models/DeepSeek-V3-GGUF/DeepSeek-V3-Q4_K_M/ --cpu_infer 62 --optimize_config_path ktransformers/optimize/optimize_rules/DeepSeek-V3-Chat-serve.yaml --port 10002 --chunk_size 256 --max_new_tokens 1024 --max_batch_size 4 --port 10002 --cache_lens 32768 --backend_type balance_serve
+</code></pre>
+<p>It features the following arguments:</p>
+<ul>
+<li><code>--chunk_size</code>: Maximum number of tokens processed in a single run by the engine.</li>
+<li><code>--cache_lens</code>: Total length of kvcache allocated by the scheduler. All requests share a kvcache space corresponding to 32768 tokens, and the space occupied will be released after the requests are completed.</li>
+<li><code>--backend_type</code>: <code>balance_serve</code> is a multi-concurrency backend engine introduced in version v0.2.4. The original single-concurrency engine is <code>ktransformers</code>.</li>
+<li><code>--max_batch_size</code>: Maximum number of requests (prefill + decode) processed in a single run by the engine. (Supported only by <code>balance_serve</code>)</li>
+</ul>
 <h3 id="v022--v023-longer-context--fp8-kernel"><a class="header" href="#v022--v023-longer-context--fp8-kernel">v0.2.2 &amp; v0.2.3 longer context &amp; FP8 kernel</a></h3>
 <h4 id="longer-context"><a class="header" href="#longer-context">longer context</a></h4>
 <p>To use this feature, <a href="https://github.com/flashinfer-ai/flashinfer">install flashinfer</a> first.</p>
@@ -677,7 +719,7 @@ is speed up which is inspiring. So our showcase makes use of this finding</em></
       prefill_device: "cuda"
       absorb_for_prefill: True # change this to True to enable long context(prefill may slower).
 </code></pre>
-<p>If the VRAM is still insufficient, try reducing the <code>chunk_prefill_size</code> parameter (default is 8192) to further decrease the intermediate results during chunk prefill.</p>
+<p>If the VRAM is still insufficient, try reducing the <code>chunk_size</code> parameter (default is 8192) to further decrease the intermediate results during chunk prefill.</p>
 <h4 id="fp8-kernel"><a class="header" href="#fp8-kernel">FP8 kernel</a></h4>
 <p>The DeepSeek-AI team provides FP8 safetensors for DeepSeek-R1/V3 models. We achieve performance optimization through the following works:</p>
 <ul>
@@ -697,7 +739,7 @@ is speed up which is inspiring. So our showcase makes use of this finding</em></
 <pre><code class="language-shell">numactl -N 1 -m 1 python ./ktransformers/local_chat.py --model_path &lt;your model path&gt; --gguf_path &lt;your gguf path&gt;  --prompt_file &lt;your prompt txt file&gt;  --cpu_infer 33 --max_new_tokens 1000
 &lt;when you see chat, then press enter to load the text prompt_file&gt;
 </code></pre>
-<p><code>&lt;your model path&gt;</code> can be local or set from online hugging face like deepseek-ai/DeepSeek-V3. If online encounters connection problem, try use mirror (hf-mirror.com) <br>
+<p><code>&lt;your model path&gt;</code> can be local or set from online huggingface like deepseek-ai/DeepSeek-V3. If online encounters connection problem, try use mirror (hf-mirror.com) <br>
 <code>&lt;your gguf path&gt;</code> can also be online, but as its large we recommend you download it and quantize the model to what you want (notice it's the dir path) <br>
 <code>--max_new_tokens 1000</code> is the max output token length. If you find the answer is truncated, you
 can increase the number for longer answer (But be aware of OOM, and increase it will slow down the generation rate.).</p>
@@ -1346,6 +1388,94 @@ JIT compilation causes longer initial execution (subsequent runs retain optimize
 Current weight loading implementation is provisional - will be refined in future versions</p>
 <p>📁 Path Specification<br>
 Despite hybrid quantization, merged weights are stored as .safetensors - pass the containing folder path to <code>--gguf_path</code></p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="rocm-support-for-ktransformers-beta"><a class="header" href="#rocm-support-for-ktransformers-beta">ROCm Support for ktransformers (Beta)</a></h1>
+<h2 id="introduction"><a class="header" href="#introduction">Introduction</a></h2>
+<h3 id="overview-1"><a class="header" href="#overview-1">Overview</a></h3>
+<p>In our effort to expand GPU architecture support beyond NVIDIA, we are excited to introduce <strong>AMD GPU support through ROCm</strong> in ktransformers (Beta release). This implementation has been tested and developed using EPYC 9274F processors and AMD Radeon 7900xtx GPUs.</p>
+<h2 id="installation-guide"><a class="header" href="#installation-guide">Installation Guide</a></h2>
+<h3 id="1-install-rocm-driver"><a class="header" href="#1-install-rocm-driver">1. Install ROCm Driver</a></h3>
+<p>Begin by installing the ROCm drivers for your AMD GPU:</p>
+<ul>
+<li><a href="https://rocm.docs.amd.com/projects/radeon/en/latest/docs/install/native_linux/install-radeon.html">Official ROCm Installation Guide for Radeon GPUs</a></li>
+</ul>
+<h3 id="2-set-up-conda-environment"><a class="header" href="#2-set-up-conda-environment">2. Set Up Conda Environment</a></h3>
+<p>We recommend using Miniconda3/Anaconda3 for environment management:</p>
+<pre><code class="language-bash"># Download Miniconda
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+
+# Create environment
+conda create --name ktransformers python=3.11
+conda activate ktransformers
+
+# Install required libraries
+conda install -c conda-forge libstdcxx-ng
+
+# Verify GLIBCXX version (should include 3.4.32)
+strings ~/anaconda3/envs/ktransformers/lib/libstdc++.so.6 | grep GLIBCXX
+</code></pre>
+<blockquote>
+<p><strong>Note:</strong> Adjust the Anaconda path if your installation directory differs from <code>~/anaconda3</code></p>
+</blockquote>
+<h3 id="3-install-pytorch-for-rocm"><a class="header" href="#3-install-pytorch-for-rocm">3. Install PyTorch for ROCm</a></h3>
+<p>Install PyTorch with ROCm 6.2.4 support:</p>
+<pre><code class="language-bash">pip3 install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/rocm6.2.4
+pip3 install packaging ninja cpufeature numpy
+</code></pre>
+<blockquote>
+<p><strong>Tip:</strong> For other ROCm versions, visit <a href="https://pytorch.org/get-started/previous-versions/">PyTorch Previous Versions</a></p>
+</blockquote>
+<h3 id="4-build-ktransformers"><a class="header" href="#4-build-ktransformers">4. Build ktransformers</a></h3>
+<pre><code class="language-bash"># Clone repository
+git clone https://github.com/kvcache-ai/ktransformers.git
+cd ktransformers
+git submodule update --init
+
+# Optional: Compile web interface
+# See: api/server/website.md
+
+# Install dependencies
+bash install.sh
+</code></pre>
+<h2 id="running-deepseek-r1-models"><a class="header" href="#running-deepseek-r1-models">Running DeepSeek-R1 Models</a></h2>
+<h3 id="configuration-for-24gb-vram-gpus"><a class="header" href="#configuration-for-24gb-vram-gpus">Configuration for 24GB VRAM GPUs</a></h3>
+<p>Use our optimized configuration for constrained VRAM:</p>
+<pre><code class="language-bash">python ktransformers/local_chat.py \
+  --model_path deepseek-ai/DeepSeek-R1 \
+  --gguf_path &lt;path_to_gguf_files&gt; \
+  --optimize_config_path ktransformers/optimize/optimize_rules/rocm/DeepSeek-V3-Chat.yaml \
+  --cpu_infer &lt;cpu_cores + 1&gt;
+</code></pre>
+<blockquote>
+<p><strong>Beta Note:</strong> Current Q8 linear implementation (Marlin alternative) shows suboptimal performance. Expect optimizations in future releases.</p>
+</blockquote>
+<h3 id="configuration-for-40gb-vram-gpus"><a class="header" href="#configuration-for-40gb-vram-gpus">Configuration for 40GB+ VRAM GPUs</a></h3>
+<p>For better performance on high-VRAM GPUs:</p>
+<ol>
+<li>
+<p>Modify <code>DeepSeek-V3-Chat.yaml</code>:</p>
+<pre><code class="language-yaml"># Replace all instances of:
+KLinearMarlin → KLinearTorch
+</code></pre>
+</li>
+<li>
+<p>Execute with:</p>
+<pre><code class="language-bash">python ktransformers/local_chat.py \
+  --model_path deepseek-ai/DeepSeek-R1 \
+  --gguf_path &lt;path_to_gguf_files&gt; \
+  --optimize_config_path &lt;modified_yaml_path&gt; \
+  --cpu_infer &lt;cpu_cores + 1&gt;
+</code></pre>
+</li>
+</ol>
+<blockquote>
+<p><strong>Tip:</strong> If you got 2 * 24GB AMD GPUS, you may also do the same modify and run <code>ktransformers/optimize/optimize_rules/DeepSeek-V3-Chat-multi-gpu.yaml</code> instead.</p>
+</blockquote>
+<h2 id="known-limitations"><a class="header" href="#known-limitations">Known Limitations</a></h2>
+<ul>
+<li>Marlin operations not supported on ROCm platform</li>
+<li>Current Q8 linear implementation shows reduced performance (Beta limitation)</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="backend-services-server"><a class="header" href="#backend-services-server">Backend Services (Server)</a></h1>
 <p>The Server offers fast heterogeneous inference capabilities of ktransformers through an API for external usage.</p>
 <img src="en/api/server/server-arch.png" height="600" alt="Server architecture">
@@ -1575,7 +1705,7 @@ RuntimeError: probability tensor contains either `inf`, `nan` or element &lt; 0
 <ol>
 <li>First, download the latest source code using git.</li>
 <li>Then, modify the DeepSeek-V3-Chat-multi-gpu-4.yaml in the source code and all related yaml files, replacing all instances of KLinearMarlin with KLinearTorch.</li>
-<li>Next, you need to compile from the ktransformer source code until it successfully compiles on your local machine.</li>
+<li>Next, you need to compile from the ktransformers source code until it successfully compiles on your local machine.</li>
 <li>Then, install flash-attn. It won't be used, but not installing it will cause an error.</li>
 <li>Then, modify local_chat.py, replacing all instances of flash_attention_2 with eager.</li>
 <li>Then, run local_chat.py. Be sure to follow the official tutorial's commands and adjust according to your local machine's parameters.</li>
