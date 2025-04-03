@@ -39,16 +39,65 @@ thread_local int Backend::thread_local_id = -1;
 
 Backend::Backend(int max_thread_num) {
     max_thread_num_ = max_thread_num;
+
+#if numa_atomic
+    int oldpolicy;
+    struct bitmask* oldmask = numa_allocate_nodemask();
+    if (get_mempolicy(&oldpolicy, oldmask->maskp,
+                      oldmask->size + 1, 0, 0) < 0) {
+printf("get_mempolicy failed, errno=%d %s\n", errno, strerror(errno));
+fflush(stdout);
+        oldpolicy = MPOL_DEFAULT;
+    }
+#endif
+
+    thread_state_.resize(max_thread_num_);
+    workers_.resize(max_thread_num_);
+
+#if numa_atomic
+    numa_set_preferred(0);
+    auto numa0 = std::make_shared<struct kt_atomic_numa>();
+    numa_set_preferred(1);
+    auto numa1 = std::make_shared<struct kt_atomic_numa>();
+#endif
+
     thread_state_.resize(max_thread_num_);
     for (int i = 0; i < max_thread_num_; i++) {
+#if numa_atomic
+        struct kt_atomic* atomic;
+        if (thread_id_to_numa[i] == 0) {
+            atomic = &numa0->atomics[i];
+        } else {
+            atomic = &numa1->atomics[i];
+        }
+
+        thread_state_[i].curr = &atomic->curr;
+        thread_state_[i].status = &atomic->status;
+
+        thread_state_[i].numa0 = numa0;
+        thread_state_[i].numa1 = numa1;
+#else
         thread_state_[i].curr = std::make_unique<std::atomic<int>>();
         thread_state_[i].status =
             std::make_unique<std::atomic<ThreadStatus>>(ThreadStatus::WAITING);
+#endif
     }
-    workers_.resize(max_thread_num_);
     for (int i = 1; i < max_thread_num_; i++) {
+#if numa_atomic
+        numa_set_preferred(thread_id_to_numa[i]);
+#endif
         workers_[i] = std::thread(&Backend::worker_thread, this, i);
     }
+
+#if numa_atomic
+    if (oldpolicy == MPOL_DEFAULT) {
+        numa_set_localalloc();
+    } else {
+        set_mempolicy(oldpolicy, oldmask->maskp,
+                      oldmask->size + 1);
+    }
+    numa_free_cpumask(oldmask);
+#endif
 }
 
 Backend::~Backend() {
