@@ -153,21 +153,16 @@ fflush(stdout);
 }
 
 void Backend::worker_thread(int thread_id) {
-    auto start = std::chrono::steady_clock::now();
+    uint64_t idle = 0;
     thread_local_id = thread_id; // 设置线程本地变量
     while (true) {
         ThreadStatus status =
             thread_state_[thread_id].status->load(std::memory_order_acquire);
         if (status == ThreadStatus::WORKING) {
             process_tasks(thread_id);
-            start = std::chrono::steady_clock::now();
+            idle = 0;
         } else if (status == ThreadStatus::WAITING) {
-            auto now = std::chrono::steady_clock::now();
-            auto duration =
-                std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                                                                      start)
-                    .count();
-            if (duration > 50) {
+            if (++idle > worker_thread_idle_threshold) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         } else if (status == ThreadStatus::EXIT) {
