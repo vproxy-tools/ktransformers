@@ -401,6 +401,11 @@ class BalanceServeInterface(BackendInterfaceBase):
         self.queue_map[query_id] = queue
         self.thread_map[thread_id] = query_id
         is_first_token = True
+
+        YIELD_THRESHOLD = 5
+        print(f'YIELD_THRESHOLD = {YIELD_THRESHOLD}')
+        last_tokens = ''
+
         async for token in chat_stream(self.queue_map[query_id], self.tokenizer):
             if is_first_token:
                 is_first_token=False
@@ -414,9 +419,16 @@ class BalanceServeInterface(BackendInterfaceBase):
             else:
                 profiler.inc("decode")
             if token:
-                print(token, end="", flush=True)
-                yield token, None
+                last_tokens += token
+                if len(last_tokens) > YIELD_THRESHOLD:
+                    print(last_tokens, end="", flush=True)
+                    yield last_tokens, None
+                    last_tokens = ''
+                    last_reason = None
         profiler.pause_timer("decode")
+        if last_tokens:
+            print(last_tokens, end="", flush=True)
+            yield last_tokens, None
         print("")
         report_last_time_performance(profiler)
         yield self.streamer.end(), None
