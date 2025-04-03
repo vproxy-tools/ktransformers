@@ -8,7 +8,15 @@
  * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
  **/
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif // _GNU_SOURCE
+
+#include <unistd.h>
+#include <sched.h>
+
 #include "backend.h"
+#include "core_info.h"
 #include <pthread.h>
 
 #ifdef USE_NUMA
@@ -94,10 +102,20 @@ void Backend::process_tasks(int thread_id) {
         sprintf(thread_name, "llama.cpp:%d", thread_id);
         pthread_setname_np(pthread_self(), thread_name);
 
-        numa_node = thread_id * numa_num_configured_nodes() / thread_num_;
+        numa_node = thread_id_to_numa[thread_id];
         struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
         numa_bitmask_setbit(mask, numa_node);
         numa_bind(mask);
+
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+
+        int cpuid = thread_id_to_core[thread_id];
+
+        CPU_SET(cpuid, &cpuset);
+        sched_setaffinity(gettid(), sizeof(cpuset), &cpuset);
+printf("thread_id = %d, nodes = %d, thread_num = %d, numa_node = %d, cpuid = %d\n", thread_id, numa_num_configured_nodes(), thread_num_, numa_node, cpuid);
+fflush(stdout);
     }
     #endif
 
