@@ -9,6 +9,7 @@
  **/
 
 #include "backend.h"
+#include <pthread.h>
 
 #ifdef USE_NUMA
 #include <numa.h>
@@ -89,6 +90,10 @@ void Backend::process_tasks(int thread_id) {
     
     #ifdef USE_NUMA
     if(numa_node == -1){
+        char thread_name[36];
+        sprintf(thread_name, "llama.cpp:%d", thread_id);
+        pthread_setname_np(pthread_self(), thread_name);
+
         numa_node = thread_id * numa_num_configured_nodes() / thread_num_;
         struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
         numa_bitmask_setbit(mask, numa_node);
