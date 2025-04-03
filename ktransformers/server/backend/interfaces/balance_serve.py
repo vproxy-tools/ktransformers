@@ -413,8 +413,11 @@ class BalanceServeInterface(BackendInterfaceBase):
                     yield think, None
             else:
                 profiler.inc("decode")
-            yield token, None
+            if token:
+                print(token, end="", flush=True)
+                yield token, None
         profiler.pause_timer("decode")
+        print("")
         report_last_time_performance(profiler)
         yield self.streamer.end(), None
         if profiler.get_counter('decode') >= self.args.max_new_tokens - 1:
