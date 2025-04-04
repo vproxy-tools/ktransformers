@@ -56,7 +56,7 @@ class QueryInfo:
                 self.life_time = time.time() - self.enqueue_time
                 self.decode_duration_time = time.time() - self.decode_start_time
                 self.decode_tps = (self.active_position -  self.query_length) / self.decode_duration_time
-                print(f"prefill length: {self.query_length}, prefill time: {self.prefill_duration_time}, prefill tps {self.prefill_tps}, decode length: {self.active_position -  self.query_length}, decode time: {self.decode_duration_time}, decode tps {self.decode_tps}")
+                #print(f"prefill length: {self.query_length}, prefill time: {self.prefill_duration_time}, prefill tps {self.prefill_tps}, decode length: {self.active_position -  self.query_length}, decode time: {self.decode_duration_time}, decode tps {self.decode_tps}")
                 return True  # 找到匹配的停止条件
                 
         
