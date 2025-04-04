@@ -28,13 +28,13 @@ class SchedulerServer:
     
         # 初始化 ZeroMQ 上下文和套接字
         self.context = zmq.Context()
-        self.frontend = self.context.socket(zmq.ROUTER)
+        self.frontend = self.context.socket(zmq.REP) #(zmq.ROUTER)
         print(f"sched zmq rpc server on port {main_args.sched_port}")
-        self.frontend.bind(f"tcp://*:{main_args.sched_port}") 
+        self.frontend.bind(f"ipc:///tmp/kt-{main_args.sched_port}.sock")
 
         # 创建内部的 DEALER 套接字，用于与工作线程通信
-        self.backend = self.context.socket(zmq.DEALER)
-        self.backend.bind("inproc://backend")
+        #self.backend = self.context.socket(zmq.DEALER)
+        #self.backend.bind("inproc://backend")
 
     # 启动调度器
     def run_scheduler(self):
@@ -47,12 +47,14 @@ class SchedulerServer:
     # 处理客户端请求
     def start_proxy(self):
         # 使用 ZMQ 的内置代理，将前端请求分发给后端工作线程
-        zmq.proxy(self.frontend, self.backend)
+        #zmq.proxy(self.frontend, self.backend)
+        self.worker_routine()
 
     # 工作线程处理请求
     def worker_routine(self):
-        worker = self.context.socket(zmq.REP)
-        worker.connect("inproc://backend")
+        #worker = self.context.socket(zmq.REP)
+        #worker.connect("inproc://backend")
+        worker = self.frontend
         while True:
             try:
                 # 接收客户端请求
@@ -124,7 +126,7 @@ class SchedulerServer:
             threading.Thread(target=self.run_scheduler, daemon=True).start()
 
             # 启动工作线程
-            for _ in range(10):  # 根据需要调整线程数
+            for _ in range(0):  # 根据需要调整线程数
                 threading.Thread(target=self.worker_routine, daemon=True).start()
 
             # 启动代理，开始监听请求
@@ -138,7 +140,7 @@ class SchedulerServer:
     def stop_rpc_service(self):
         self.stop_scheduler()
         self.frontend.close()
-        self.backend.close()
+        #self.backend.close()
         self.context.term()
 
 def start_server(settings, main_args):
@@ -149,7 +151,7 @@ def start_server(settings, main_args):
 # Add async client for webserver
 class SchedulerClient:
     def __init__(self, sched_port):
-        address=f'tcp://localhost:{sched_port}'
+        address=f'ipc:///tmp/kt-{sched_port}.sock'
         self.address = address
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
