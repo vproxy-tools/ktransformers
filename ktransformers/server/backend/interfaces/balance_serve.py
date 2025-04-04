@@ -84,7 +84,7 @@ async def chat_stream(queue: asyncio.Queue, tokenizer: AutoTokenizer):
 def fill_generated_tokens(query_updates: list[sched_ext.QueryUpdate], generated_tokens: torch.Tensor, query_manager: QueryManager = None):
     #print(len(query_updates), generated_tokens.size(0), generated_tokens)
     for i in range(generated_tokens.size(0)):
-        print(generated_tokens[i].item())
+        #print(generated_tokens[i].item())
         query_updates[i].generated_token = generated_tokens[i].item()
         if not query_manager.query_map[query_updates[i].id].is_prefill:
             pos = query_updates[i].active_position
@@ -234,9 +234,17 @@ class Engine:
     
     def loop(self):
 
-        next_batch = None   
+        next_batch = None
+        idle_count = 0 # 超过一定数量则进行sleep
 
         while True:
+            if idle_count > 100000:
+                time.sleep(0.1)
+            if len(self.updates) == 0:
+                idle_count += 1
+            else:
+                idle_count = 0
+
             self.batch = next_batch
             if self.batch is not None:
                 self.model_runner.run(self.batch, self.query_manager)
@@ -262,7 +270,7 @@ class Engine:
             
             if self.batch is not None:
                 self.model_runner.sync()
-                print(f"Model execution time (GPU): {self.model_runner.model_time:.3f} ms, {1000/self.model_runner.model_time:.3f} tokens/s")
+                #print(f"Model execution time (GPU): {self.model_runner.model_time:.3f} ms, {1000/self.model_runner.model_time:.3f} tokens/s")
                 # if self.rank == 0:
                 
                 generated_tokens, probs = self.sampling( self.model_runner.output)
@@ -412,7 +420,7 @@ class BalanceServeInterface(BackendInterfaceBase):
             except queue.Empty:
                 # print("no new token")
                 # await asyncio.sleep(1)
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
     def tokenize_prompt(self, prompt: str):
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.args.device)
         return input_ids
