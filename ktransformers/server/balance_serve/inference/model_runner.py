@@ -181,11 +181,11 @@ class ModelRunner:
             for i in range(len(batch.decode_mini_batches)):
                 batch_size += len(batch.decode_mini_batches[i])
                 num_tokens += len(batch.decode_mini_batches[i])
-                print(f'decode_batch_i: {len(batch.decode_mini_batches[i])},')
+                #print(f'decode_batch_i: {len(batch.decode_mini_batches[i])},')
 
             for i in range(len(batch.prefill_mini_batches)):
                 num_tokens += batch.prefill_mini_batches[i][2]
-                print(f'prefill_batch_i: {batch.prefill_mini_batches[i][2]},')
+                #print(f'prefill_batch_i: {batch.prefill_mini_batches[i][2]},')
 
 
 
