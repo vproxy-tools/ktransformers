@@ -6,6 +6,8 @@ Author       : Boxin Zhang, Azure-Tang
 Version      : 0.1.0
 Copyright (c) 2024 by KVCache.AI, All Rights Reserved. 
 '''
+import os
+import random
 import torch
 from torch import nn
 import itertools
@@ -23,19 +25,25 @@ import socket
 warm_uped = False
 
 def get_free_ports(n: int, continue_prot: list):
-    sockets = []
+    #sockets = []
     ports = []
     for _ in range(n):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("", 0)) 
-        port = s.getsockname()[1]
-        if port in continue_prot:
-            s.close()
-            continue
-        ports.append(port)
-        sockets.append(s)
-    for s in sockets:
-        s.close()
+        #s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        #s.bind(("", 0))
+        #port = s.getsockname()[1]
+        #if port in continue_prot:
+        #    s.close()
+        #    continue
+        while True:
+            rr = random.randint(10000, 65535)
+            if os.path.exists(f'/tmp/kt-{rr}.sock'):
+                continue
+            ports.append(rr)
+            break
+        #ports.append(port)
+        #sockets.append(s)
+    #for s in sockets:
+    #    s.close()
     return ports
 
 def get_compute_capability(device:torch.device = None):
