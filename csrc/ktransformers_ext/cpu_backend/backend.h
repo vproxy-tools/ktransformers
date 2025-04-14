@@ -75,6 +75,7 @@ class Backend {
     void do_work_stealing_job(int, std::function<void(int)>,
                               std::function<void(int)>,
                               std::function<void(int)>);
+    void set_phase(int phase); // 0: all cores, 1: prefill, 2: decode
     static thread_local int numa_node;
     static thread_local int steal_from;
     static thread_local int steal_to;
@@ -97,8 +98,10 @@ class Backend {
     std::function<void(int)> compute_func_;
     std::function<void(int)> finalize_func_;
     std::vector<std::thread> workers_;
+    int phase_ = 0; // 0: all cores, 1: prefill, 2: decode
 
     void process_tasks(int);
     void worker_thread(int);
+    bool thread_is_available(int);
 };
 #endif

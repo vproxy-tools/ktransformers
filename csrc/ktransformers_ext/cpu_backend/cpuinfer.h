@@ -80,6 +80,10 @@
      void sync_with_cuda_stream(intptr_t user_cuda_stream) {
          cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)this);
      }
+
+     void set_phase(int phase) { // 0: all cores, 1: prefill, 2: decode
+         backend_->set_phase(phase);
+     }
  
     public:
      Backend* backend_;

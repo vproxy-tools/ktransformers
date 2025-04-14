@@ -31,6 +31,7 @@ from ktransformers.server.balance_serve.inference.query_manager import QueryMana
 from ktransformers.server.balance_serve.inference.forward_batch import ForwardBatchInput, ForwardBatchOutput
 from ktransformers.server.balance_serve.sched_rpc import SchedulerClient
 from ktransformers.server.balance_serve.settings import sched_ext
+from ktransformers.operators.cpuinfer import CPUInfer
 from torch.multiprocessing import Queue
 import torch.multiprocessing as mp
 from multiprocessing.synchronize import Event
@@ -262,7 +263,7 @@ class Engine:
             next_batch = self.sched_client.update_last_batch(self.updates)
             if next_batch.query_ids == []:
                 next_batch = None
-            self.pub_socket.send_pyobj(next_batch)  
+            # self.pub_socket.send_pyobj(next_batch) # FIXME: no one consumes pub_socket for now
 
             if next_batch is not None:
                 self.query_manager.add_query(next_batch)
@@ -276,6 +277,12 @@ class Engine:
                 generated_tokens, probs = self.sampling( self.model_runner.output)
                 
                 self.updates = self.query_manager.update(self.batch)
+                if self.updates:
+                    for u in self.updates:
+                        if u.is_prefill == True:
+                            CPUInfer.cpuinfer.set_phase(1) # prefill
+                        else:
+                            CPUInfer.cpuinfer.set_phase(2) # decode
                 fill_generated_tokens(self.updates, generated_tokens, self.query_manager)
             else:
                 self.updates = []

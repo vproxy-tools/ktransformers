@@ -646,7 +646,8 @@ PYBIND11_MODULE(cpuinfer_ext, m) {
         .def("submit", &CPUInfer::submit)
         .def("submit_with_cuda_stream", &CPUInfer::submit_with_cuda_stream)
         .def("sync", &CPUInfer::sync)
-        .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream);
+        .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream)
+        .def("set_phase", &CPUInfer::set_phase);
 
     auto linear_module = m.def_submodule("linear");
     py::class_<LinearConfig>(linear_module, "LinearConfig")
