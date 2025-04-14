@@ -4,31 +4,43 @@
 
 ## 注意点
 
+1. 运行前需要编译`core_info.c`：`cd custom && make && cd ../`
+1. 必须cd到ktransformers工程所在路径再运行（和官方文档一致，只不过因为代码里写死了动态链接库的相对路径，所以这一项变成了强制要求）
 1. 只支持Linux
-2. 优化主要在`USE_NUMA`的基础上进行，只有持久化巨页在non-NUMA上做了实现
-3. 因为平台固定下来后，最优性能配置不会变化，所以目前代码写得比较死，比如`core_info.h`会编译到代码里而非单独的配置文件
-4. 模型内存会使用巨页并被持久化，这样进程可以快速启动。请确保巨页文件系统已挂载到`/dev/hugepages`（ubuntu默认就会挂载到这个位置）并且确保启动ktransformers的用户有权限操作该路径
+1. 优化主要在`USE_NUMA`的基础上进行，只有持久化巨页在non-NUMA上做了实现
+1. 因为平台固定下来后，最优性能配置不会变化，所以目前代码写得比较死，比如`core_info.c`编译为动态链接库而非单独的配置文件
+1. 模型内存会使用巨页并被持久化，这样进程可以快速启动。请确保巨页文件系统已挂载到`/dev/hugepages`（ubuntu默认就会挂载到这个位置）并且确保启动ktransformers的用户有权限操作该路径（`sudo chmod 777 /dev/hugepages`）
 
 ## 配置
 
-### core\_info.h
+### core\_info.c
 
-位于`ktransformers/ktransformers_ext/cpu_backend/core_info.h`。
+位于`custom/core_info.c`。
 
-可使用脚本`./scripts/generate-core-info.py`生成`core_info.h`。  
+可使用脚本`./scripts/generate-core-info.py`生成`core_info.c`。  
 脚本默认会为`cpu 0`预留末尾的3个核心，同时占用`cpu 1`的所有核心，用于非`llama.cpp`线程的处理。
 
-如果你的GPU位于`numa1`上，则建议为`cpu 1`预留3个核心：`--gpu-numa=1`。
+如果你的GPU位于`numa1`上，则可以指定参数，为`cpu 1`预留3个核心而非`cpu 0`：`--gpu-numa=1`。
 
 core\_info.h也可以手动配置。
 
-* `worker_thread_idle_threshold`: llama.cpp worker空循环多少轮后进入sleep；建议设置为`CPU Hz数 / 10`
+* `worker_thread_idle_threshold`: cpu worker空循环多少轮后进入sleep；建议设置为`CPU Hz数 / 10`
 * `thread_id_to_numa`: 线程id到numa id的映射，用于绑定numa。其数组下标为thread\_id，从0开始，到`--cpu_infer - 2`结束（`--cpu_infer - 1`是`llama.cpp`线程的数量）
 * `thread_id_to_core`: 线程id到cpu core id的映射，用于绑核。
+* `prefill_core_enabled`: 在prefill阶段，指定线程是否启用
+* `decode_core_enabled`: 在decode阶段，指定线程是否启用
 * `thread_id_to_steal_from`: 最新提交可以忽略，但如果开启work steal，则需要配置。该项指每个线程应当从哪个线程id开始steal work
 * `thread_id_to_steal_to`: 最新提交可以忽略，但如果开启work steal，则需要配置。该项指每个线程的work steal到哪个线程id为止（不包括指定的线程id）
 
+修改后，只需编译该c文件为动态链接库即可，不需要完整编译ktransformers。
+
+编译方式：`cd custom && make && cd ..`
+
+注意，加载动态链接库使用了相对路径。启动ktransformers时，需要cd到ktransformers工程所在的路径。
+
 ### /tmp/kt\_per\_numa\_huge\_mem
+
+非必选。
 
 每个numa分配的巨页大小，单位为字节。默认值写死在代码里，是`375G`巨页（适配于Q4，而Q8每个numa需要不到`650G`）
 
@@ -37,6 +49,8 @@ echo 697932185600 > /tmp/kt_per_numa_huge_mem
 ```
 
 ### /tmp/kt\_force\_think\_prefix
+
+非必选。
 
 开启`--force_think`后才会生效。
 
@@ -141,10 +155,10 @@ done
 
 ### 6. 配置巨页文件系统权限
 
-为了让当前用户可以操作巨页文件系统，可以把`/dev/hugepages`的owner改为当前用户：
+为了让当前用户可以操作巨页文件系统，可以把`/dev/hugepages`权限设置为`777`：
 
 ```shell
-sudo chown ${当前用户} /dev/hugepages
+sudo chmod 777 /dev/hugepages
 ```
 
 ## 运行
@@ -152,20 +166,24 @@ sudo chown ${当前用户} /dev/hugepages
 在上述配置完成，正确重启机器，编译安装好ktransformers之后，执行：
 
 ```shell
+numactl --cpunodebind=0 --interleave=0 \
 env LD_PRELOAD=${libmimalloc.so的完整路径} MIMALLOC_VERBOSE=1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 \
-numactl --interleave=0 \
-ktransformers \
+python ktransformers/server/main.py \
 	--model_path ${模型元数据路径} \
 	--gguf_path  ${gguf文件所在目录} \
+	--optimize_config_path ktransformers/optimize/optimize_rules/DeepSeek-V3-Chat-serve.yaml \
 	--cpu_infer  ${系统总核心数 + 1 - 3} \
 	--max_new_tokens 32768 \
 	--cache_lens     32768 \
+	--chunk_size     64 \
+	--max_batch_size 4 \
+	--backend_type balance_serve \
 	--force_think \
 	--web False
 ```
 
-如果你的GPU位于`numa 1`上，那么`--interleave=0`调整为`--interleave=1`。  
-如果你是手动修改的cpu\_info.h，那么`--cpu_infer`需要相应设置。注意`cpu_infer - 1`才是`llama.cpp`线程数。   
+如果你的GPU位于`numa 1`上，那么`--cpunodebind=0 --interleave=0`调整为`--cpunodebind=1 --interleave=1`。  
+如果你是手动修改的cpu\_info.c，那么`--cpu_infer`需要相应进行设置。注意`cpu_infer - 1`才是CPU worker线程数。   
 
 ## 观测
 
