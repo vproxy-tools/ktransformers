@@ -239,7 +239,7 @@ class Engine:
         idle_count = 0 # 超过一定数量则进行sleep
 
         while True:
-            if idle_count > 100000:
+            if idle_count > 5000000:
                 time.sleep(0.1)
             if len(self.updates) == 0:
                 idle_count += 1
