@@ -11,7 +11,7 @@ def build_socket_id_range(socket, gpu_numa):
         r = reversed(r)
     return r
 
-def print_tid_comment(content, tid, gpu_numa, socket_topo, cores, s):
+def print_tid_comment(content, tid, gpu_numa, socket_topo, s):
     content += '/* '
     cores = socket_topo[s]['cores']
     for c in cores:
@@ -74,6 +74,22 @@ def main(args):
         if v not in socket_topo:
             socket_topo[v] = {'cores': []}
         socket_topo[v]['cores'].append(c)
+    for c in cpu_topo:
+        with open(f'/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list') as f:
+            siblings = f.read().strip().split(',')
+            if len(siblings) > 2:
+                print(f'Invalid thread siblings list {siblings}, expecting at most 2 elements')
+                return 1
+            if len(siblings) == 0:
+                print(f'Invalid thread siblings list {siblings}, no thread exists')
+                return 1
+            if len(siblings) == 2:
+                cpu_topo[c]['smt'] = {
+                    int(siblings[0].strip()): int(siblings[1].strip()),
+                    int(siblings[1].strip()): int(siblings[0].strip()),
+                }
+            else:
+                cpu_topo[c]['smt'] = { int(siblings[0].strip()): int(siblings[0].strip()) }
 
     for s in range(0, len(socket_topo)):
         if s not in socket_topo:
@@ -93,95 +109,134 @@ def main(args):
     print(f'gpu on numa {gpu_numa}')
     print(f'cpu_topo = {json.dumps(cpu_topo)}')
     print(f'socket_topo = {json.dumps(socket_topo)}')
+    print('---------')
+    print()
 
     content = ''
-    content += '#ifndef _CORE_INFO_H_\n'
-    content += '#define _CORE_INFO_H_\n'
-    content += '\n'
-    content += f'static long worker_thread_idle_threshold = {int(freq / 10)}; // cpu Hz / 10\n'
-    content += '\n'
-    content += 'static int thread_id_to_numa[] = {\n'
     tid = 0
+    content += 'static int _kt_thread_id_to_core[] = {\n'
     for s in build_socket_id_range(socket_topo, gpu_numa):
         cores = socket_topo[s]['cores']
-        content, tid = print_tid_comment(content, tid, gpu_numa, socket_topo, cores, s)
-        content += '   '
-        for c in cores:
-            if cores.index(c) >= len(cores) - 3:
-                if gpu_numa == s:
-                    continue
-            content += f'{cpu_topo[c]["socket"]}'
-            if cores.index(c) != len(cores) - 1 or s != len(socket_topo) - 1:
-                content += ','
-            content += ' '
-        content += '\n'
-    content += '};\n' # thread_id_to_numa
-    content += '\n'
-    content += 'static int thread_id_to_core[] = {\n'
-    tid = 0
-    for s in build_socket_id_range(socket_topo, gpu_numa):
-        cores = socket_topo[s]['cores']
-        content, tid = print_tid_comment(content, tid, gpu_numa, socket_topo, cores, s)
+        content, tid = print_tid_comment(content, tid, gpu_numa, socket_topo, s)
         content += '   '
         for c in cores:
             if cores.index(c) >= len(cores) - 3:
                 if gpu_numa == s:
                     continue
             content += f'{c}'
-            if cores.index(c) != len(cores) - 1 or s != len(socket_topo) - 1:
-                content += ','
+            content += ','
             if c < 10:
                 content += ' '
         content += '\n'
-    content += '};\n' # thread_id_to_core
+    content += '};\n' # _kt_thread_id_to_core
+
     content += '\n'
-    content += 'static int thread_id_to_steal_from[] = {\n'
     tid = 0
+    content += 'static int _kt_prefill_core_enabled[] = {\n'
     for s in build_socket_id_range(socket_topo, gpu_numa):
-        first = tid
         cores = socket_topo[s]['cores']
-        content, tid = print_tid_comment(content, tid, gpu_numa, socket_topo, cores, s)
+        content, tid = print_tid_comment(content, tid, gpu_numa, socket_topo, s)
         content += '   '
         for c in cores:
             if cores.index(c) >= len(cores) - 3:
                 if gpu_numa == s:
                     continue
-            content += f'{first}'
-            if cores.index(c) != len(cores) - 1 or s != len(socket_topo) - 1:
-                content += ','
-            if first < 10:
-                content += ' '
+            if cpu_topo[c]['smt'][c] < c:
+                content += '0'
+            else:
+                content += '1'
+            content += ', '
         content += '\n'
-    content += '};\n' # thread_id_to_steal_from
+    content += '};\n' # _kt_prefill_core_enabled
+
     content += '\n'
-    content += 'static int thread_id_to_steal_to[] = {\n'
     tid = 0
+    content += 'static int _kt_decode_core_enabled[] = {\n'
     for s in build_socket_id_range(socket_topo, gpu_numa):
         cores = socket_topo[s]['cores']
-        content, tid = print_tid_comment(content, tid, gpu_numa, socket_topo, cores, s)
-        last = tid
+        content, tid = print_tid_comment(content, tid, gpu_numa, socket_topo, s)
         content += '   '
         for c in cores:
             if cores.index(c) >= len(cores) - 3:
                 if gpu_numa == s:
                     continue
-            content += f'{last}'
-            if cores.index(c) != len(cores) - 1 or s != len(socket_topo) - 1:
-                content += ','
-            if last < 10:
-                content += ' '
+            content += '1, '
         content += '\n'
-    content += '};\n' # thread_id_to_steal_to
+    content += '};\n' # _kt_decode_core_enabled
+
     content += '\n'
-    content += '#endif // _CORE_INFO_H_\n'
+    content += 'long kt_worker_thread_idle_threshold() {\n'
+    content += f'    return {int(freq / 10)}; // cpu Hz / 10\n'
+    content += '}\n'
+
+    content += '\n'
+    content += 'int kt_thread_id_to_numa(int thread_id) {\n'
+    beg_tid = 0
+    for s in build_socket_id_range(socket_topo, gpu_numa):
+        cores = socket_topo[s]['cores']
+        end_tid = beg_tid + len(cores) - 1
+        if beg_tid == 0:
+            end_tid -= 3
+        content += '    if (' + str(beg_tid) + ' <= thread_id && thread_id <= ' + str(end_tid) + ') {\n'
+        content += '        return ' + str(s) + ';\n'
+        content += '    }\n'
+        beg_tid = end_tid + 1
+    content += '    return 0; // should not reach here\n'
+    content += '}\n' # kt_thread_id_to_numa
+
+    content += '\n'
+    content += '''
+int kt_thread_id_to_core(int thread_id) {
+    return _kt_thread_id_to_core[thread_id];
+}
+
+int kt_prefill_core_enabled(int thread_id) {
+    return _kt_prefill_core_enabled[thread_id];
+}
+
+int kt_decode_core_enabled(int thread_id) {
+    return _kt_decode_core_enabled[thread_id];
+}
+'''.strip()
+    content += '\n'
+
+    content += '\n'
+    content += 'int kt_thread_id_to_steal_from(int thread_id) {\n'
+    beg_tid = 0
+    for s in build_socket_id_range(socket_topo, gpu_numa):
+        cores = socket_topo[s]['cores']
+        end_tid = beg_tid + len(cores) - 1
+        if beg_tid == 0:
+            end_tid -= 3
+        content += '    if (' + str(beg_tid) + ' <= thread_id && thread_id <= ' + str(end_tid) + ') {\n'
+        content += '        return ' + str(beg_tid) + ';\n'
+        content += '    }\n'
+        beg_tid = end_tid + 1
+    content += '    return 0; // should not reach here\n'
+    content += '}\n' # kt_thread_id_to_steal_from
+
+    content += '\n'
+    content += 'int kt_thread_id_to_steal_to(int thread_id) {\n'
+    beg_tid = 0
+    for s in build_socket_id_range(socket_topo, gpu_numa):
+        cores = socket_topo[s]['cores']
+        end_tid = beg_tid + len(cores) - 1
+        if beg_tid == 0:
+            end_tid -= 3
+        content += '    if (' + str(beg_tid) + ' <= thread_id && thread_id <= ' + str(end_tid) + ') {\n'
+        content += '        return ' + str(end_tid + 1) + ';\n'
+        content += '    }\n'
+        beg_tid = end_tid + 1
+    content += '    return ' + str(beg_tid) + '; // should not reach here\n'
+    content += '}\n' # kt_thread_id_to_steal_to
 
     print(content)
 
-    CORE_INFO_H_PATH = './csrc/ktransformers_ext/cpu_backend/core_info.h'
-    if not os.path.exists(CORE_INFO_H_PATH):
-        print(f'{CORE_INFO_H_PATH} does not exist. Please run this script on the root of the git directory')
+    CORE_INFO_C_PATH = './custom/core_info.c'
+    if not os.path.exists(CORE_INFO_C_PATH):
+        print(f'{CORE_INFO_C_PATH} does not exist. Please run this script on the root of the git directory')
         return 1
-    with open(CORE_INFO_H_PATH, 'w') as f:
+    with open(CORE_INFO_C_PATH, 'w') as f:
         f.write(content)
 
     return 0

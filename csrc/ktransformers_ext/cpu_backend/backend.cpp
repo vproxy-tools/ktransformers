@@ -53,6 +53,7 @@ std::atomic_bool* Backend::shlock = nullptr;
 #endif
 
 Backend::Backend(int max_thread_num) {
+    open_dylib();
     max_thread_num_ = max_thread_num;
 
 #if use_epoll || use_poll
@@ -93,7 +94,7 @@ fflush(stdout);
     for (int i = 0; i < max_thread_num_; i++) {
 #if numa_atomic && defined(USE_NUMA)
         struct kt_atomic* atomic;
-        if (thread_id_to_numa[i] == 0) {
+        if (thread_id_to_numa(i) == 0) {
             atomic = &numa0->atomics[i];
         } else {
             atomic = &numa1->atomics[i];
@@ -112,7 +113,7 @@ fflush(stdout);
     }
     for (int i = 1; i < max_thread_num_; i++) {
 #if numa_atomic && defined(USE_NUMA)
-        numa_set_preferred(thread_id_to_numa[i]);
+        numa_set_preferred(thread_id_to_numa(i));
 #endif
         workers_[i] = std::thread(&Backend::worker_thread, this, i);
     }
@@ -141,6 +142,20 @@ Backend::~Backend() {
 }
 
 int Backend::get_thread_num() { return max_thread_num_; }
+
+void Backend::set_phase(int phase) { // 0: prefill, 1: decode
+    phase_ = phase;
+}
+
+bool Backend::thread_is_available(int thread_id) {
+    if (phase_ == 0) { // all cores
+        return true;
+    } else if (phase_ == 1) { // prefill
+        return prefill_core_enabled(thread_id);
+    } else { // decode
+        return decode_core_enabled(thread_id);
+    }
+}
 
 void Backend::do_work_stealing_job(int task_num,
                                    std::function<void(int)> init_func,
@@ -175,9 +190,21 @@ fflush(stdout);
 #else
     thread_num_ = std::min(max_thread_num_, task_num);
 #endif
-    int base = task_num / thread_num_;
-    int remain = task_num % thread_num_;
+
+    int available_thread_num = 0;
+    for (int i = 0; i < thread_num_; ++i) {
+        if (thread_is_available(i)) {
+            ++available_thread_num;
+        }
+    }
+
+    int base = task_num / available_thread_num;
+    int remain = task_num % available_thread_num;
     thread_state_[0].end = base + (0 < remain);
+
+    if (!thread_is_available(0)) {
+        thread_state_[0].end = 0;
+    }
 
     // 为主线程设置 thread_local_id
     thread_local_id = 0;
@@ -189,10 +216,16 @@ fflush(stdout);
     }
 #endif
 
+    int ii = 0;
     for (int i = 1; i < thread_num_; i++) {
         thread_state_[i].curr->store(thread_state_[i - 1].end,
                                      std::memory_order_relaxed);
-        thread_state_[i].end = thread_state_[i - 1].end + base + (i < remain);
+        if (!thread_is_available(i)) {
+            thread_state_[i].end = thread_state_[i - 1].end;
+            continue;
+        }
+        ++ii;
+        thread_state_[i].end = thread_state_[i - 1].end + base + (ii < remain);
         thread_state_[i].status->store(ThreadStatus::WORKING,
                                        std::memory_order_release);
     }
@@ -200,14 +233,21 @@ fflush(stdout);
 #if use_epoll || use_poll
     uint64_t dummy = 1;
     for (int i = 1; i < thread_num_; i++) {
+        if (!thread_is_available(i)) {
+            continue;
+        }
         write(evfd[i], &dummy, 8);
     }
 #endif
 
     thread_state_[0].curr->store(0, std::memory_order_relaxed);
-    thread_state_[0].status->store(ThreadStatus::WORKING,
-                                   std::memory_order_release);
-    process_tasks(0);
+
+    if (thread_is_available(0)) {
+        thread_state_[0].status->store(ThreadStatus::WORKING,
+                                       std::memory_order_release);
+        process_tasks(0);
+    }
+
     for (int i = 1; i < thread_num_; i++) {
         while (thread_state_[i].status->load(std::memory_order_acquire) ==
                ThreadStatus::WORKING) {
@@ -227,7 +267,7 @@ void Backend::process_tasks(int thread_id) {
         pthread_setname_np(pthread_self(), thread_name);
 
 #ifdef USE_NUMA
-        numa_node = thread_id_to_numa[thread_id];
+        numa_node = thread_id_to_numa(thread_id);
         struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
         numa_bitmask_setbit(mask, numa_node);
         numa_bind(mask);
@@ -235,13 +275,13 @@ void Backend::process_tasks(int thread_id) {
         numa_node = 0;
 #endif
 
-        steal_from = thread_id_to_steal_from[thread_id];
-        steal_to = thread_id_to_steal_to[thread_id];
+        steal_from = thread_id_to_steal_from(thread_id);
+        steal_to = thread_id_to_steal_to(thread_id);
 
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
 
-        int cpuid = thread_id_to_core[thread_id];
+        int cpuid = thread_id_to_core(thread_id);
 
         CPU_SET(cpuid, &cpuset);
         sched_setaffinity(gettid(), sizeof(cpuset), &cpuset);
