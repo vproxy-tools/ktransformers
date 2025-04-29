@@ -60,7 +60,7 @@ def update_web_port(config_file: str):
 
 def mount_index_routes(app: FastAPI):
     project_dir = os.path.dirname(os.path.dirname(__file__))
-    web_dir = os.path.join(project_dir, "website/dist")
+    web_dir = os.path.join(project_dir, "website/public")
     web_config_file = os.path.join(web_dir, "config.js")
     update_web_port(web_config_file)
     if os.path.exists(web_dir):
