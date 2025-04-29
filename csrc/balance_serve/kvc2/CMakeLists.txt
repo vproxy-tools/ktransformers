@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 
+set(CMAKE_STRIP "/usr/bin/true") # force not to strip symbols
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
+
 find_program(GCC_COMPILER NAMES g++-13 g++-12 g++-11 g++ REQUIRED)
 set(CMAKE_CXX_COMPILER ${GCC_COMPILER})
 
