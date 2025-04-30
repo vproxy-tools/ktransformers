@@ -1280,6 +1280,10 @@ struct KVC2 : KVC2Interface {
     auto h = static_cast<DoubleCacheHandle*>(re.get());
     if (config.gpu_only) {
       auto total_block_count = div_up(estimated_length, NumTokenPerBlock);
+      SPDLOG_INFO("!! Before gpu_only_alloc_col: estimated_length={} NumTokenPerBlock={} total_block_count={}",
+                  estimated_length, NumTokenPerBlock, total_block_count);
+      printf("!! Before gpu_only_alloc_col: estimated_length=%d NumTokenPerBlock=%d total_block_count=%d\n",
+             estimated_length, NumTokenPerBlock, total_block_count);
       h->gpu_only_block_idx = gpu_cache->gpu_only_alloc_col(total_block_count);
       if (h->gpu_only_block_idx.empty()) {
         call_back(nullptr);

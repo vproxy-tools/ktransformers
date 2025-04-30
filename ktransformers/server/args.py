@@ -26,6 +26,7 @@ class ArgumentParser:
         parser.add_argument("--cpu_infer", type=int, default=self.cfg.cpu_infer)
         parser.add_argument("--backend_type", type=str, default=self.cfg.backend_type)
         parser.add_argument("--chunk_size", type=int, default=self.cfg.chunk_size)
+        parser.add_argument("--gpu_memory_size", type=int, default=self.cfg.gpu_memory_size)
 
         # model configs
         # parser.add_argument("--model_cache_lens", type=int, default=self.cfg.cache_lens)  # int?
@@ -137,8 +138,9 @@ class ArgumentParser:
         self.cfg.server_ip = args.host
         self.cfg.server_port = args.port
         self.cfg.user_force_think = args.force_think
-        
-        args.gpu_memory_size = 4*1024*1024*1024 # TODO: set this to the actual GPU memory size
+
+        if not args.gpu_memory_size:
+            args.gpu_memory_size = 4*1024*1024*1024
         self.cfg.gpu_memory_size = args.gpu_memory_size
         free_ports = get_free_ports(3, [args.port])
         args.sched_port = free_ports[0]

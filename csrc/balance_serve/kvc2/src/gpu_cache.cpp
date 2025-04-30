@@ -134,6 +134,11 @@ std::vector<size_t> GPUPageCache::gpu_only_alloc_col(size_t count) {
     }
   }
 
+  SPDLOG_INFO("!! GPUPageCache::gpu_only_alloc_col: count={} total_kvcache_pages={} actual_size={}",
+              count, config.total_kvcache_pages, re.size());
+  printf("!! GPUPageCache::gpu_only_alloc_col: count=%d total_kvcache_pages=%d actual_size=%d\n",
+         count, config.total_kvcache_pages, re.size());
+
   if (re.size() == count) {
     for (auto at : re) {
       gpu_only_occupations[at] = true;

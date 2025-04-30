@@ -200,10 +200,9 @@ class Config(metaclass=Singleton):
         self.chunk_size = cfg["attn"]["chunk_size"]
         self.memory_gpu_only = cfg["kvc2"]["gpu_only"]
         self.cache_lens = ((self.cache_lens + self.page_size - 1) // self.page_size) * self.page_size
-        self.gpu_memory_size = 2*576*61*self.cache_lens
+        self.gpu_memory_size = cfg.get("gpu_memory_size")
         self.utilization_percentage = 1.0 #cfg["kvc2"]["utilization_percentage"]
         self.cpu_memory_size_GB = cfg["kvc2"]["cpu_memory_size_GB"]
         # only support 2 prefill task
         self.max_prefill_batch_size = 2
         self.max_decode_batch_size = self.max_batch_size - self.max_prefill_batch_size 
-
