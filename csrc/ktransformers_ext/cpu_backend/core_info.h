@@ -25,6 +25,9 @@ static fn_thread_id_to_steal_from thread_id_to_steal_from = nullptr;
 typedef int (*fn_thread_id_to_steal_to)(int thread_id);
 static fn_thread_id_to_steal_to thread_id_to_steal_to = nullptr;
 
+typedef int (*fn_work_stealing_enabled)(int thread_id);
+static fn_work_stealing_enabled work_stealing_enabled = nullptr;
+
 static inline void open_dylib() {
     if (libcore_info == nullptr) {
         void* handle = dlopen("./custom/libcore_info.so", RTLD_NOW | RTLD_LOCAL);
@@ -82,6 +85,13 @@ static inline void open_dylib() {
             exit(1);
         }
         thread_id_to_steal_to = (fn_thread_id_to_steal_to)sym;
+
+        sym = dlsym(handle, "kt_work_stealing_enabled");
+        if (sym == nullptr) {
+            fprintf(stderr, "cannot find kt_work_stealing_enabled");
+            exit(1);
+        }
+        work_stealing_enabled = (fn_work_stealing_enabled)sym;
 
         libcore_info = handle;
     }

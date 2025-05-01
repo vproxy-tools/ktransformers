@@ -230,6 +230,11 @@ int kt_decode_core_enabled(int thread_id) {
     content += '    return ' + str(beg_tid) + '; // should not reach here\n'
     content += '}\n' # kt_thread_id_to_steal_to
 
+    content += '\n'
+    content += 'int kt_work_stealing_enabled(int thread_id) {\n'
+    content += '    return 0;\n'
+    content += '}\n' # kt_work_stealing_enabled
+
     print(content)
 
     CORE_INFO_C_PATH = './custom/core_info.c'

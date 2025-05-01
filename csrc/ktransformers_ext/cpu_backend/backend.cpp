@@ -157,6 +157,9 @@ bool Backend::thread_is_available(int thread_id) {
     }
 }
 
+static int prefill_enabled_cores_num;
+static int decode_enabled_cores_num;
+
 void Backend::do_work_stealing_job(int task_num,
                                    std::function<void(int)> init_func,
                                    std::function<void(int)> compute_func,
@@ -192,9 +195,24 @@ fflush(stdout);
 #endif
 
     int available_thread_num = 0;
-    for (int i = 0; i < thread_num_; ++i) {
-        if (thread_is_available(i)) {
-            ++available_thread_num;
+    if (phase_ == 0) { // all cores
+        available_thread_num = thread_num_;
+    } else if (phase_ == 1) { // prefill
+        available_thread_num = prefill_enabled_cores_num;
+    } else { // decode
+        available_thread_num = decode_enabled_cores_num;
+    }
+
+    if (available_thread_num == 0) {
+        for (int i = 0; i < thread_num_; ++i) {
+            if (thread_is_available(i)) {
+                ++available_thread_num;
+            }
+        }
+        if (phase_ == 1) { // prefill
+            prefill_enabled_cores_num = available_thread_num;
+        } else { // decode
+            decode_enabled_cores_num = available_thread_num;
         }
     }
 
@@ -304,7 +322,7 @@ fflush(stdout);
         }
         compute_func_(task_id);
     }
-#if 0
+if (work_stealing_enabled(thread_id)) {
     int steal_total = steal_to - steal_from;
     for (int t_offset = 1; t_offset < steal_total; t_offset++) {
         int t_i = (thread_id - steal_from + t_offset) % steal_total + steal_from;
@@ -321,7 +339,7 @@ fflush(stdout);
             compute_func_(task_id);
         }
     }
-#endif // work steal
+}
     if (finalize_func_ != nullptr) {
         finalize_func_(thread_id);
     }

@@ -55,3 +55,7 @@ int kt_thread_id_to_steal_to(int thread_id) {
     else
         return 45;
 }
+
+int kt_work_stealing_enabled(void) {
+    return 0;
+}
