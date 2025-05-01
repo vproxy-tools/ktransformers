@@ -10,6 +10,7 @@
 1. 优化主要在`USE_NUMA`的基础上进行，只有持久化巨页在non-NUMA上做了实现
 1. 因为平台固定下来后，最优性能配置不会变化，所以目前代码写得比较死，比如`core_info.c`编译为动态链接库而非单独的配置文件
 1. 模型内存会使用巨页并被持久化，这样进程可以快速启动。请确保巨页文件系统已挂载到`/dev/hugepages`（ubuntu默认就会挂载到这个位置）并且确保启动ktransformers的用户有权限操作该路径（`sudo chmod 777 /dev/hugepages`）
+1. KT0.3版本开始需要手动指定kvcache占用显存的大小，这里增加了一个参数`--gpu_memory_size`，目前配置比较麻烦，见`gpu_memory_size`一节
 
 ## 配置
 
@@ -169,12 +170,14 @@ sudo chmod 777 /dev/hugepages
 numactl --cpunodebind=0 --interleave=0 \
 env LD_PRELOAD=${libmimalloc.so的完整路径} MIMALLOC_VERBOSE=1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 \
 python ktransformers/server/main.py \
+	--architectures ${DeepseekV3ForCausalLM} \
 	--model_path ${模型元数据路径} \
 	--gguf_path  ${gguf文件所在目录} \
 	--optimize_config_path ktransformers/optimize/optimize_rules/DeepSeek-V3-Chat-serve.yaml \
 	--cpu_infer  ${系统总核心数 + 1 - 3} \
-	--max_new_tokens 32768 \
-	--cache_lens     32768 \
+	--gpu_memory_size 2147483648 \
+	--max_new_tokens 28000 \
+	--cache_lens     28000 \
 	--chunk_size     64 \
 	--max_batch_size 4 \
 	--backend_type balance_serve \
@@ -184,6 +187,28 @@ python ktransformers/server/main.py \
 
 如果你的GPU位于`numa 1`上，那么`--cpunodebind=0 --interleave=0`调整为`--cpunodebind=1 --interleave=1`。  
 如果你是手动修改的cpu\_info.c，那么`--cpu_infer`需要相应进行设置。注意`cpu_infer - 1`才是CPU worker线程数。   
+
+## gpu\_memory\_size和cache\_lens的取值
+
+这个选项用于控制rpc进程的显存占用。现在这个配置取值比较麻烦，需要首次对话后才能够确定配置是否可用。  
+配合本优化分支的持久巨页倒是好很多（重启时间基本在半分钟内），而官方版本调试起来就很折磨。。。
+
+首先随便选一个比较小的数值，比如2147483648（2G），启动KT。
+
+启动后使用`nvidia-smi`查看显存余量，如果还有较多余量，则修改`--gpu_memory_size`直到刚好占满显卡（稍微留一点余量）。
+
+我们先把`--max_new_tokens`和`--cache_lens`调成一样的数值，然后进行一次对话，并查看rpc.log：`~/.ktransformers/logs/rpc.log`，里面会有`!!`开头的日志：
+
+```
+!! Before gpu_only_alloc_col: estimated_length={} NumTokenPerBlock={} total_block_count={}
+!! GPUPageCache::gpu_only_alloc_col: count={} total_kvcache_pages={} actual_size={}
+```
+
+主要看`GPUPageCache::gpu_only_alloc_col`这一行，其中`count=`为所需的pages数量，`total_kvcache_pages=`可用的pages数量。可用数量是根据`--gpu_memory_size`确定的。前一步已经调好了。
+
+如果这里`count > total_kvcache_pages`，那么将无法进行推理。这个`count`是根据输入token数量和`max_new_tokens`确定的，如果count特别大，则调低`--max_new_tokens`和`--cache_lens`，如果`count`比`total_kvcache_pages`小很多，则调高`count`。用简单的比例关系算一下应该调到多少。
+
+调整完成后，可以适当调低`max_new_tokens`，以实现多并发。如果不需要多并发则直接使用即可。
 
 ## 观测
 
