@@ -1,0 +1,79 @@
+[Unit]
+Description=DeepSeek-V4-Flash SGLang server (ktransformers, RTX 4090D, all-CPU experts)
+Documentation=file:///home/wkgcass/ktransformers/DSv4Flash.md
+After=network.target
+# 若机器启用了 nvidia-persistenced，取消下面两行注释可避免冷启动时驱动未就绪
+# Requires=nvidia-persistenced.service
+# After=nvidia-persistenced.service
+
+# 崩溃自动拉起的限流：权重加载约 1 分钟、内存占用 150GB+，
+# 异常状态下无限重启会反复加载权重，故限制每天最多 12 次
+StartLimitIntervalSec=86400
+StartLimitBurst=12
+
+[Service]
+Type=simple
+User=wkgcass
+Group=wkgcass
+WorkingDirectory=/home/wkgcass/ktransformers
+
+# --- 必需环境变量（缺一不可，见 DSv4Flash.md 第 3 节）---
+Environment=SGLANG_DSV4_MODE=2604
+Environment=SGLANG_DSV4_2604_SUBMODE=2604B
+Environment=FLASHINFER_CUDA_ARCH_LIST=8.9
+Environment=TORCH_CUDA_ARCH_LIST=8.9+PTX
+
+# 思考模式默认开启（V4-Flash 出厂默认不思考，需显式开启；见 DSv4Flash.md 3.3 节）
+# 单请求可用 chat_template_kwargs {"thinking": false} 覆盖关闭
+Environment=SGLANG_ENABLE_THINKING=1
+
+# 子进程（scheduler / tokenizer manager）与 JIT 缓存需要 HOME 和 venv PATH
+Environment=HOME=/home/wkgcass
+Environment=PATH=/home/wkgcass/ktransformers/.venv/bin:/usr/local/bin:/usr/bin:/bin
+
+ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
+  --host 0.0.0.0 --port 30000 \
+  --model /var/deepseek-v4-flash/0731 \
+  --kt-weight-path /var/deepseek-v4-flash/0731 \
+  --kt-method MXFP4 \
+  --kt-num-gpu-experts 0 \
+  --kt-cpuinfer 44 \
+  --kt-threadpool-count 2 \
+  --kt-gpu-prefill-token-threshold 4096 \
+  --tensor-parallel-size 1 \
+  --context-length 131072 \
+  --attention-backend flashinfer \
+  --mem-fraction-static 0.90 \
+  --chunked-prefill-size 2048 \
+  --max-prefill-tokens 2048 \
+  --max-running-requests 1 \
+  --watchdog-timeout 1200 \
+  --disable-shared-experts-fusion \
+  --trust-remote-code \
+  --cuda-graph-bs 1 \
+  --cuda-graph-max-bs 1 \
+  --disable-radix-cache \
+  --skip-server-warmup \
+  --reasoning-parser deepseek-v4 \
+  --tool-call-parser deepseekv4
+
+# 崩溃后至少等 30s 再拉起（配合上面的 StartLimit 限流）
+Restart=on-failure
+RestartSec=30
+
+# 停止：先 SIGTERM 给调度器 120s 干净退出，超时连子进程一起 SIGKILL
+TimeoutStopSec=120
+KillMode=control-group
+
+# 大内存 / 多线程推理进程的常规放宽
+LimitMEMLOCK=infinity
+LimitSTACK=infinity
+LimitNOFILE=65536
+
+# 日志进 journald（journalctl -u ds4f -f 跟踪）
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ds4f
+
+[Install]
+WantedBy=multi-user.target
