@@ -657,6 +657,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         if NativeMoEWrapper._native_loader_instance is None:
             NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(method, weight_path)
         self.loader = NativeMoEWrapper._native_loader_instance
+        self._hp_tp_count = threadpool_count
 
         self.gate_weights = None
         self.up_weights = None
@@ -710,6 +711,63 @@ class NativeMoEWrapper(BaseMoEWrapper):
     ):
         raise NotImplementedError("RAWINT4 wrapper expects pre-quantized safetensor weights.")
 
+    def _hugepage_reuse_plan(self, physical_to_logical_map_cpu):
+        """Check the persistent hugepage weight cache for this MXFP4 layer.
+
+        Returns (group_size, backend_cls) when every NUMA marker validates and
+        the C++ side can reuse the resident weights, else None. Also exports
+        KT_HP_MODEL_STAMP / KT_HP_BACKEND_TAG so the C++ fingerprints agree.
+        """
+        from .loader import MXFP4SafeTensorLoader
+
+        try:
+            if not isinstance(self.loader, MXFP4SafeTensorLoader):
+                return None
+            group_size = None
+            for base in (
+                f"model.layers.{self.layer_idx}",
+                f"language_model.model.layers.{self.layer_idx}",
+                f"model.language_model.layers.{self.layer_idx}",
+            ):
+                for cand in self.loader._experts_prefix_candidates(base):
+                    key = f"{cand}.0.w1.scale"
+                    if self.loader.has_tensor(key):
+                        shape = self.loader.load_tensor(key).shape
+                        group_size = self.hidden_size // shape[1]
+                        break
+                if group_size:
+                    break
+            if not group_size:
+                return None
+            backend_cls = _select_mxfp4_backend()
+            if backend_cls is None:
+                return None
+
+            from .hugepage_cache import check_reusable, ensure_model_stamp
+
+            ensure_model_stamp(self.weight_path)
+            os.environ.setdefault("KT_HP_BACKEND_TAG", backend_cls.__name__)
+            tp_count = max(1, getattr(self, "_hp_tp_count", 1) or 1)
+            inter_tp = (
+                self.moe_intermediate_size // tp_count
+                if self.moe_intermediate_size % tp_count == 0
+                else self.moe_intermediate_size
+            )
+            if check_reusable(
+                self.layer_idx,
+                self.num_experts,
+                self.hidden_size,
+                inter_tp,
+                group_size,
+                4,
+                backend_cls.__name__,
+                physical_to_logical_map_cpu,
+            ):
+                return group_size, backend_cls
+        except Exception:
+            logger.debug("hugepage reuse check failed", exc_info=True)
+        return None
+
     def load_weights(self, physical_to_logical_map_cpu: torch.Tensor):
         import time
 
@@ -727,6 +785,39 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.loader = NativeMoEWrapper._native_loader_instance
 
         t0 = time.time()
+
+        # Persistent hugepage fast path (MXFP4): if every NUMA segment for this
+        # layer is already resident in the hugetlbfs cache and its markers
+        # validate, skip safetensors loading entirely — the C++ side just mmaps
+        # the already-faulted hugepages.
+        if self.method == "MXFP4":
+            hp_plan = self._hugepage_reuse_plan(physical_to_logical_map_cpu)
+            if hp_plan is not None:
+                group_size, backend_cls = hp_plan
+                moe_config = MOEConfig(
+                    self.num_experts,
+                    self.num_experts_per_tok,
+                    self.hidden_size,
+                    self.moe_intermediate_size,
+                    self.gpu_experts_mask.data_ptr(),
+                )
+                moe_config.layer_idx = self.layer_idx
+                moe_config.pool = self.cpu_infer.backend_
+                moe_config.max_len = self.chunked_prefill_size
+                moe_config.swiglu_limit = self.swiglu_limit
+                moe_config.quant_config.bits = 4
+                moe_config.quant_config.group_size = group_size
+                moe_config.quant_config.zero_point = False
+                self.moe = backend_cls(moe_config)
+                self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))
+                self.cpu_infer.sync()
+                NativeMoEWrapper._release_loader(layer_idx=self.layer_idx)
+                print(
+                    f"[NativeMoEWrapper Layer {self.layer_idx}] weights REUSED from persistent hugepages "
+                    f"(safetensors skipped), total {(time.time() - t0) * 1000:.1f}ms"
+                )
+                return
+
         _candidates = [
             f"model.layers.{self.layer_idx}",
             f"language_model.model.layers.{self.layer_idx}",

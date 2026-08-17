@@ -435,6 +435,16 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
     if (quant_config.group_size == 0 || quant_config.zero_point)
       throw std::runtime_error("MXFP4 MoE only support KGroup FP4.");
+    if (this->hugepage_reusable(physical_to_logical_map)) {
+      printf("[hugepage_weights] layer %d tp %d: weights reused from persistent hugepages, skip conversion\n",
+             config_.layer_idx, tp_part_idx);
+      return;
+    }
+    if (this->hp_active() && config_.gate_proj == nullptr)
+      throw std::runtime_error(
+          "persistent hugepage weight cache invalid for layer " + std::to_string(config_.layer_idx) +
+          "; python skipped safetensors loading but the hugepage marker did not validate. Remove " +
+          hugepage_weights::data_root() + " and " + hugepage_weights::meta_root() + ", then restart.");
     if (config_.gate_scale == nullptr) throw std::runtime_error("MXFP4 MoE only support load native weight.");
 
     int nth = T::recommended_nth(config_.intermediate_size);
@@ -482,6 +492,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                           (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
         },
         nullptr);
+
+    this->hugepage_commit(physical_to_logical_map);
   }
 
   static inline void fast_memcpy(void* __restrict dst, const void* __restrict src, size_t bytes) {
@@ -691,6 +703,21 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
     const uint64_t* physical_to_logical_map = (const uint64_t*)config.physical_to_logical_map;
 
     bool use_per_expert_ptrs = !config.gate_projs.empty();
+
+    // Fast path: every NUMA segment already carries valid weights in the
+    // persistent hugepage arena — skip staging and conversion entirely.
+    {
+      bool all_hp = true;
+      pool->dispense_backend()->do_numa_job([this, &all_hp, &config](int i) {
+        this->tps[i]->config_.physical_to_logical_map = config.physical_to_logical_map;
+        if (!this->tps[i]->hugepage_reusable()) all_hp = false;
+      });
+      if (all_hp) {
+        printf("[hugepage_weights] layer %d: all NUMA weights reused from persistent hugepages\n", config.layer_idx);
+        this->weights_loaded = true;
+        return;
+      }
+    }
 
     if (config.gate_projs.empty() && config.gate_scale == nullptr)
       throw std::runtime_error("MXFP4 MoE only supports Packed FP4 with KGroup Scale");

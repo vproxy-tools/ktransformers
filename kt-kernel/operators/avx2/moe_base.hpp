@@ -24,9 +24,11 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
+#include "../../cpu_backend/hugepage_weights.hpp"
 #include "../../cpu_backend/shared_mem_buffer.h"
 #include "../../cpu_backend/worker_pool.h"
 #include "../common.hpp"
@@ -65,6 +67,13 @@ class AVX2_MOE_BASE {
   std::vector<void*> owned_aligned_allocs_;
 
   size_t pool_count_ = 0;
+
+  // Persistent per-NUMA hugetlbfs backing for the resident expert weights
+  // (gate/up/down BufferB); nullptr when disabled — aligned_alloc is used then.
+  hugepage_weights::Segment hp_seg_;
+  size_t hp_gate_bytes_ = 0;
+  size_t hp_up_bytes_ = 0;
+  size_t hp_down_bytes_ = 0;
   size_t gate_up_ba_pool_bytes_ = 0;
   size_t gate_bc_pool_bytes_ = 0;
   size_t up_bc_pool_bytes_ = 0;
@@ -112,6 +121,19 @@ class AVX2_MOE_BASE {
     m_local_up_output_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
 
+    // Resident weight buffers (BufferB) come from the persistent per-NUMA
+    // hugepage arena when available; the whole layer is one 64-byte-sliced
+    // segment.
+    hp_gate_bytes_ = (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~(size_t)63;
+    hp_up_bytes_ = hp_gate_bytes_;
+    hp_down_bytes_ = (buffer_b_required_size(config_.hidden_size, config_.intermediate_size) + 63) & ~(size_t)63;
+    if (hugepage_weights::enabled()) {
+      const size_t total = config_.expert_num * (hp_gate_bytes_ + hp_up_bytes_ + hp_down_bytes_);
+      hp_seg_ = hugepage_weights::alloc(numa_node_of_cpu(sched_getcpu()), hugepage_key(), total,
+                                        hugepage_fingerprint(), hugepage_python_fingerprint());
+    }
+    uint8_t* hp_cursor = hp_seg_.ptr;
+
     for (size_t i = 0; i < config_.expert_num; i++) {
       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
       gate_bc_.push_back(make_buffer_c(config_.max_len, config_.intermediate_size, nullptr));
@@ -119,23 +141,35 @@ class AVX2_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
-      void* gate_bb_ptr = std::aligned_alloc(
-          64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+      if (hp_cursor != nullptr) {
+        gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, hp_cursor));
+        hp_cursor += hp_gate_bytes_;
+        up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, hp_cursor));
+        hp_cursor += hp_up_bytes_;
+        down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, hp_cursor));
+        hp_cursor += hp_down_bytes_;
+        continue;
+      }
+
+      void* gate_bb_ptr = std::aligned_alloc(64, hp_gate_bytes_);
       if (!gate_bb_ptr) throw std::runtime_error("aligned_alloc failed for gate BufferB");
       owned_aligned_allocs_.push_back(gate_bb_ptr);
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(
-          64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+      void* up_bb_ptr = std::aligned_alloc(64, hp_up_bytes_);
       if (!up_bb_ptr) throw std::runtime_error("aligned_alloc failed for up BufferB");
       owned_aligned_allocs_.push_back(up_bb_ptr);
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
-      void* down_bb_ptr = std::aligned_alloc(
-          64, (buffer_b_required_size(config_.hidden_size, config_.intermediate_size) + 63) & ~63ULL);
+      void* down_bb_ptr = std::aligned_alloc(64, hp_down_bytes_);
       if (!down_bb_ptr) throw std::runtime_error("aligned_alloc failed for down BufferB");
       owned_aligned_allocs_.push_back(down_bb_ptr);
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
+    }
+    if (hp_seg_.ptr != nullptr) {
+      printf("[hugepage_weights] layer %d tp %d: %zu bytes %s persistent hugepages (key=%s)\n", config_.layer_idx,
+             tp_part_idx, (size_t)config_.expert_num * (hp_gate_bytes_ + hp_up_bytes_ + hp_down_bytes_),
+             hp_seg_.reused ? "REUSED from" : "allocated in", hugepage_key().c_str());
     }
 
     pool_count_ = config_.max_len * config_.num_experts_per_tok + config_.expert_num * T::M_STEP;
@@ -498,6 +532,53 @@ class AVX2_MOE_BASE {
  protected:
   Derived* derived() { return static_cast<Derived*>(this); }
   const Derived* derived_const() const { return static_cast<const Derived*>(this); }
+
+  // ==========================================================================
+  // Persistent hugepage weight cache helpers (mirrors amx/moe_base.hpp)
+  // ==========================================================================
+
+  bool hp_active() const { return hp_seg_.ptr != nullptr; }
+
+  std::string hugepage_key() const {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "L%d_E%d_H%d_I%d_g%d_b%d", config_.layer_idx, config_.expert_num, config_.hidden_size,
+             config_.intermediate_size, config_.quant_config.group_size, config_.quant_config.bits);
+    return buf;
+  }
+
+  uint64_t hugepage_fingerprint() const {
+    std::string s = std::string("kt1|") + typeid(Derived).name() + "|" +
+                    hugepage_weights::env_or_empty("KT_HP_MODEL_STAMP") + "|" + hugepage_key() + "|" +
+                    std::to_string(hp_gate_bytes_) + "|" + std::to_string(hp_down_bytes_);
+    return hugepage_weights::fnv1a64_str(s);
+  }
+
+  uint64_t hugepage_python_fingerprint() const {
+    std::string s = std::string("kp1|") + hugepage_weights::env_or_empty("KT_HP_MODEL_STAMP") + "|" +
+                    hugepage_weights::env_or_empty("KT_HP_BACKEND_TAG") + "|" + hugepage_key();
+    return hugepage_weights::fnv1a64_str(s);
+  }
+
+  uint64_t hugepage_map_hash(const uint64_t* physical_to_logical_map) const {
+    if (physical_to_logical_map == nullptr) return 0;
+    return hugepage_weights::fnv1a64(physical_to_logical_map, sizeof(uint64_t) * config_.expert_num);
+  }
+
+ public:
+  bool hugepage_reusable(const uint64_t* physical_to_logical_map = nullptr) const {
+    if (!hp_active() || !hp_seg_.reused) return false;
+    char expect[48];
+    snprintf(expect, sizeof(expect), "map=%016llx",
+             (unsigned long long)hugepage_map_hash(physical_to_logical_map != nullptr ? physical_to_logical_map
+                                                                                     : (const uint64_t*)config_.physical_to_logical_map));
+    return hp_seg_.map_line == expect;
+  }
+
+ protected:
+  void hugepage_commit(const uint64_t* physical_to_logical_map) {
+    if (!hp_active()) return;
+    hugepage_weights::commit(hp_seg_, hugepage_map_hash(physical_to_logical_map));
+  }
 
   static constexpr bool has_fused_prefill() {
     return requires(Derived& backend) { backend.fused_prefill_experts(0, 0); };

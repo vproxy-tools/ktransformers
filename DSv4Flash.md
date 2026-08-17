@@ -373,3 +373,47 @@ cd third_party/sglang && pip install --no-deps -e "./python"
 之后改 sglang 源码**只需重启服务、无需重装**（python 代码进程启动时重新 import）。
 代价：环境从"wheel 拷贝"变成"指向源码树的链接"，别人复现时行为不同；
 正式部署前建议切回 wheel 安装（按 7.1 重装即可覆盖回普通模式）。
+
+## 8. 内存侧权重持久巨页（persistent hugepages）
+
+DeepSeek-V4-Flash 的 CPU 侧常驻权重（MXFP4 路由专家，每个 NUMA 约 81 GiB）不再走
+`std::aligned_alloc` 堆分配，而是放在 **每个 NUMA 节点自己的持久化 hugetlbfs 文件** 中：
+
+- 数据文件：`/dev/hugepages/kt_weights/node{N}/weights.bin`（1 GiB 大页，节点内各层共用一个文件，
+  固定虚拟地址映射，扩容不搬移）；
+- 校验标记：`/var/lib/kt-hugepage-weights/node{N}/L{layer}_E{...}.done`（普通磁盘文件，记录
+  布局指纹 + physical→logical expert 映射指纹，全部通过才判定可复用）；
+- 进程退出后大页仍被这些文件占用（持久化）。重启加载时 Python 侧先核对标记，
+  命中则完全跳过 safetensors 读取（日志 `safetensors skipped`），C++ 侧直接 mmap 已驻留
+  大页（日志 `REUSED from persistent hugepages`），CPU 权重加载从约 20+ 秒降到毫秒级。
+
+改动文件：`kt-kernel/cpu_backend/hugepage_weights.hpp`（新增分配器）、
+`kt-kernel/operators/amx/{moe_base,fp4-moe}.hpp`（分配与复用钩子，本机实际运行路径）、
+`kt-kernel/operators/avx2/{moe_base,mxfp4-moe}.hpp`（镜像改动，编译验证）、
+`kt-kernel/python/utils/hugepage_cache.py`（新增）与 `kt-kernel/python/utils/amx.py`（复用快路径）。
+
+环境变量：`KT_HUGEPAGE_WEIGHTS=0` 关闭（回退堆分配）；`KT_HUGEPAGE_WEIGHT_DIR` /
+`KT_HUGEPAGE_WEIGHT_META_DIR` 可改目录。模型目录或 `config.json` 变化会自动使全部缓存失效。
+
+运维注意：
+- 模型更新后需手动 `rm -rf /var/lib/kt-hugepage-weights /dev/hugepages/kt_weights`（并重建属主
+  `wkgcass`），否则旧大页一直占用池子（每节点约 81 GiB）；
+- 大页池容量（当前 node0=300、node1=364 个 1 GiB 页）需 ≥ 常驻权重 + 其它大页用户；
+- 首次冷加载若中途崩溃，未写标记的层会在下次启动自动重写，无需人工干预。
+
+### 8.1 GPU 参数的持久巨页缓存
+
+回答一个常见问题：加载是**区分** GPU/CPU 参数的——路由专家（`layers.*.ffn.experts.*`，约 146 GiB）
+走 kt-kernel CPU 路径（8 节的 BufferB 巨页缓存），其余约 8.8 GiB GPU 参数（attention、dense、
+共享专家、embedding/lm_head、MTP）由 sglang `DefaultModelLoader` 从 safetensors 读取上 GPU。
+
+GPU 参数同样缓存到持久巨页：`third_party/sglang` 新增
+`sglang/srt/model_loader/gpu_hugepage_cache.py`，并接入 `weight_utils.py` 的
+`safetensors_weights_iterator`。首次加载时写入 **GPU 所在 NUMA 节点**的
+`/dev/hugepages/kt_weights/node{N}/gpu_weights.bin`（本机 4090D 在 node1，经
+`/sys/bus/pci/devices/<pci>/numa_node` 探测；探测不到时 fallback node0），manifest 在
+`/var/lib/kt-hugepage-weights/node{N}/gpu_weights.json`（按文件 size+mtime 校验）。
+重启后这些张量直接从驻留大页 `torch.frombuffer` 读出（`fill=0, served=8.79 GiB` 日志确认），
+不再读盘。改动 sglang 后需重装：
+`cd third_party/sglang && SGLANG_KT_VERSION=0.6.4 pip install --no-deps --no-build-isolation ./python`。
+`KT_HUGEPAGE_GPU_WEIGHTS=0` 可关闭。实测重启到就绪约 40 秒，推理输出正常。
