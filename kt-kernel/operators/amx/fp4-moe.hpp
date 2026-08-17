@@ -52,6 +52,50 @@ struct GemmKernel224MXFP4SmallKGroup {
       0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,   //  0..7  positive
       0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};  //  8..15 negative
 
+#if defined(__AVX512VBMI__) && defined(__AVX512BF16__)
+  // VBMI fast path: one 64-byte VPERMB turns 32 nibbles into 32 BF16 bytes.
+  // table[2i]   = bf16 low  byte of nibble i
+  // table[2i+1] = bf16 high byte of nibble i
+  alignas(64) static constexpr uint8_t fp4_bf16_vpermb_lut[64] = {
+      0x00, 0x00, 0x00, 0x3F, 0x80, 0x3F, 0xC0, 0x3F, 0x00, 0x40, 0x40, 0x40,
+      0x80, 0x40, 0xC0, 0x40, 0x00, 0x80, 0x00, 0xBF, 0x80, 0xBF, 0xC0, 0xBF,
+      0x00, 0xC0, 0x40, 0xC0, 0x80, 0xC0, 0xC0, 0xC0,
+      0x00, 0x00, 0x00, 0x3F, 0x80, 0x3F, 0xC0, 0x3F, 0x00, 0x40, 0x40, 0x40,
+      0x80, 0x40, 0xC0, 0x40, 0x00, 0x80, 0x00, 0xBF, 0x80, 0xBF, 0xC0, 0xBF,
+      0x00, 0xC0, 0x40, 0xC0, 0x80, 0xC0, 0xC0, 0xC0};
+  // per-128b-lane shuffle idx that duplicates each input byte into a 16-bit lane
+  alignas(32) static constexpr uint8_t fp4_dup_lo_idx[32] = {
+      0, 0, 2, 2, 4, 4, 6, 6, 8, 8, 10, 10, 12, 12, 14, 14,
+      0, 0, 2, 2, 4, 4, 6, 6, 8, 8, 10, 10, 12, 12, 14, 14};
+  // vpermb idx = 2*nibble + byte parity: table[2n]=bf16 low byte, table[2n+1]=high
+  alignas(64) static constexpr uint8_t fp4_seq01[64] = {
+      0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+      0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+      0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+      0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1};
+  // word permute idx matching the vpermb decode order: [v0,v2,...,v30 | v1,v3,...,v31]
+  alignas(64) static constexpr uint16_t fp4_act_perm_idx[32] = {
+      0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
+      1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31};
+
+  // Convert 16 packed FP4 bytes (32 values = 1 k_group) → 32 BF16 values (__m512i)
+  // Output column order: [BF16(lo[0]),BF16(hi[0]), ..., BF16(lo[15]),BF16(hi[15])]
+  __attribute__((always_inline)) static inline __m512i mxfp4_to_bf16_32(__m128i packed) {
+    const __m256i b16 = _mm256_cvtepu8_epi16(packed);  // byte j -> 16-bit lane j
+    const __m256i m = _mm256_set1_epi16(0x0F);
+    const __m256i lo16 = _mm256_and_si256(b16, m);
+    const __m256i hi16 = _mm256_and_si256(_mm256_srli_epi16(b16, 4), m);
+    const __m256i dup_idx = _mm256_load_si256((const __m256i*)fp4_dup_lo_idx);
+    const __m256i lo_dup = _mm256_shuffle_epi8(lo16, dup_idx);  // [lo0,lo0,lo1,lo1,...]
+    const __m256i hi_dup = _mm256_shuffle_epi8(hi16, dup_idx);
+    // nibble dup [n,n] -> table byte indices [2n, 2n+1]
+    const __m512i nib =
+        _mm512_inserti64x4(_mm512_castsi256_si512(lo_dup), hi_dup, 1);
+    const __m512i idx = _mm512_add_epi8(
+        _mm512_slli_epi16(nib, 1), _mm512_load_si512((const void*)fp4_seq01));
+    return _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)fp4_bf16_vpermb_lut));
+  }
+#else
   // Convert 16 packed FP4 bytes (32 values = 1 k_group) → 32 BF16 values (__m512i)
   // Output column order: [BF16(lo[0]),BF16(hi[0]), ..., BF16(lo[15]),BF16(hi[15])]
   __attribute__((always_inline)) static inline __m512i mxfp4_to_bf16_32(__m128i packed) {
@@ -84,6 +128,7 @@ struct GemmKernel224MXFP4SmallKGroup {
     __m256i q1 = _mm256_inserti128_si256(_mm256_castsi128_si256(p2), p3, 1);
     return _mm512_inserti64x4(_mm512_castsi256_si512(q0), q1, 1);
   }
+#endif  // __AVX512VBMI__ && __AVX512BF16__
 
   struct ActivationBF16 {
     __m512bh a;
@@ -94,7 +139,12 @@ struct GemmKernel224MXFP4SmallKGroup {
 #endif
 
     __attribute__((always_inline)) ActivationBF16(__m512bh a_) : a(a_) {
-#if !defined(__AVX512BF16__)
+#if defined(__AVX512VBMI__) && defined(__AVX512BF16__)
+      // match DequantizedWeight's vpermb element order [lo-nibbles | hi-nibbles]
+      // = [v0,v2,...,v30, v1,v3,...,v31]
+      a = (__m512bh)_mm512_permutexvar_epi16(
+          _mm512_load_si512((const void*)fp4_act_perm_idx), (__m512i)a_);
+#elif !defined(__AVX512BF16__)
       a_even = _mm512_castsi512_ps(_mm512_slli_epi32((__m512i)a_, 16));
       a_odd = _mm512_castsi512_ps(_mm512_and_si512((__m512i)a_, odd_mask));
 #endif
@@ -181,6 +231,17 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 acc3 = _mm512_setzero_ps();
 
         for (int g = 0; g < kg_count; g++) {
+          if ((g & 3) == 0) {
+            // 软件预取: 提前 1 cache line (64B = 4 组) 拉取权重与尺度
+            _mm_prefetch((const char*)(w0 + g + 16), _MM_HINT_T0);
+            _mm_prefetch((const char*)(w1 + g + 16), _MM_HINT_T0);
+            _mm_prefetch((const char*)(w2 + g + 16), _MM_HINT_T0);
+            _mm_prefetch((const char*)(w3 + g + 16), _MM_HINT_T0);
+            _mm_prefetch(s0 + g + 32, _MM_HINT_T0);
+            _mm_prefetch(s1 + g + 32, _MM_HINT_T0);
+            _mm_prefetch(s2 + g + 32, _MM_HINT_T0);
+            _mm_prefetch(s3 + g + 32, _MM_HINT_T0);
+          }
           const ActivationBF16 a(a_row[g]);
           const DequantizedWeight d0(w0[g]);
           const DequantizedWeight d1(w1[g]);
