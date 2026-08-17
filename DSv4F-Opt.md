@@ -105,22 +105,20 @@ vpermb 解码位级单测全过。
 （注：vpermb 首版有两处 bug——LUT i=8 项抄错、vpermb 参数顺序反了——靠输出质量检查+单测发现，
 已修正；教训是此类位操作改动必须有位级测试。）
 
-## 5. 生产启用方式（当前已生效）
+## 5. 生产启用方式
 
-代码在 venv 与仓库中，env 文件 `~/.config/sglang/env`：
+正式配置已显式写入仓库中的 **`ds4f.service`**（`--kt-cpuinfer 48` + 各 `Environment=` 行），
+安装到系统：
 ```
-SGLANG_OPT_FUSE_WQA_WKV=1
-SGLANG_OPT_USE_JIT_NORM=1
-SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1
-SGLANG_OPT_USE_FUSED_STORE_CACHE=1
-SGLANG_OPT_USE_OVERLAP_STORE_CACHE=1
-SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD=1
-SGLANG_KT_WOA_FP8_TRITON=1
-SGLANG_EXTRA_ARGS=--kt-cpuinfer 48
+sudo cp /home/wkgcass/ktransformers/ds4f.service /etc/systemd/system/ds4f.service
+sudo systemctl daemon-reload && sudo systemctl start ds4f
 ```
-- 回滚单项：删除对应行；回滚内核：`cd kt-kernel && git checkout <旧commit> && ./install.sh build`。
-- 等价的 unit 文件写法（若想显式化）：在 `/etc/systemd/system/ds4f.service` 加
-  `Environment=SGLANG_...=1` 各行并把 `--kt-cpuinfer 44` 改 48。
+`~/.config/sglang/env` 保留同名 KEY=VALUE 作为兜底（unit 未含对应行时才生效，
+语义为 setdefault；进程显式环境变量 > unit > 该文件）。
+- 回滚单项：注释 unit 中对应 `Environment=` 行（或删除兜底文件对应行）；
+  回滚内核：`cd kt-kernel && git checkout <旧commit> && ./install.sh build`。
+- 说明：代码侧（venv 内已装）不依赖 env 文件也可运行——`SGLANG_KT_WOA_FP8_TRITON=0`
+  时 wo_a 回退 bf16 einsum，其余 SGLANG_OPT_* 默认关闭。
 
 ## 6. 未做的后续机会
 - ue8m0 scale 以 uint8 存储（当前转 float32 存，占 MoE 权重带宽 ~17%）+ 整数指数加法应用

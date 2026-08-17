@@ -7,9 +7,9 @@ After=network.target
 # After=nvidia-persistenced.service
 
 # 崩溃自动拉起的限流：权重加载约 1 分钟、内存占用 150GB+，
-# 异常状态下无限重启会反复加载权重，故限制每天最多 12 次
+# 异常状态下无限重启会反复加载权重，故限制每天最多 500 次
 StartLimitIntervalSec=86400
-StartLimitBurst=12
+StartLimitBurst=500
 
 [Service]
 Type=simple
@@ -27,6 +27,19 @@ Environment=TORCH_CUDA_ARCH_LIST=8.9+PTX
 # 单请求可用 chat_template_kwargs {"thinking": false} 覆盖关闭
 Environment=SGLANG_ENABLE_THINKING=1
 
+# --- decode 性能优化（详见 DSv4F-Opt.md；23.4 -> ~30 tok/s 的来源）---
+# FP8 wo_a Triton GEMV（SM89 无 deep_gemm 时的 FP8 路径，显存 +1.44GB）
+Environment=SGLANG_KT_WOA_FP8_TRITON=1
+# wq_a+wkv 融合为单 GEMM；q 头 RMSNorm jit 内核
+Environment=SGLANG_OPT_FUSE_WQA_WKV=1
+Environment=SGLANG_OPT_USE_JIT_NORM=1
+# kv/compressor/indexer 旁路流 + 融合/重叠 KV 存储
+Environment=SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1
+Environment=SGLANG_OPT_USE_FUSED_STORE_CACHE=1
+Environment=SGLANG_OPT_USE_OVERLAP_STORE_CACHE=1
+# routed_scaling_factor 折入共享专家相加
+Environment=SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD=1
+
 # 子进程（scheduler / tokenizer manager）与 JIT 缓存需要 HOME 和 venv PATH
 Environment=HOME=/home/wkgcass
 Environment=PATH=/home/wkgcass/ktransformers/.venv/bin:/usr/local/bin:/usr/bin:/bin
@@ -37,7 +50,7 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --kt-weight-path /var/deepseek-v4-flash/0731 \
   --kt-method MXFP4 \
   --kt-num-gpu-experts 0 \
-  --kt-cpuinfer 44 \
+  --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --kt-gpu-prefill-token-threshold 4096 \
   --tensor-parallel-size 1 \
