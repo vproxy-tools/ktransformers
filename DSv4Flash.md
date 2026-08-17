@@ -417,3 +417,55 @@ GPU 参数同样缓存到持久巨页：`third_party/sglang` 新增
 不再读盘。改动 sglang 后需重装：
 `cd third_party/sglang && SGLANG_KT_VERSION=0.6.4 pip install --no-deps --no-build-isolation ./python`。
 `KT_HUGEPAGE_GPU_WEIGHTS=0` 可关闭。实测重启到就绪约 40 秒，推理输出正常。
+
+## 9. DSpark / 推测解码（speculative decoding）支持情况
+
+**结论：当前栈（ktransformers + sglang-kt 0.6.4）不支持 DSpark，通用 EAGLE/MTP 替代路径
+也走不通（2026-08-17 实测），暂无可用使用方式。**
+
+### 9.1 调查结论
+
+1. **checkpoint 素材齐备**：`/var/deepseek-v4-flash/0731` 的 `config.json` 自带 DSpark
+   元数据：`dspark_block_size=5`、`dspark_markov_rank=256`、
+   `dspark_target_layer_ids=[40,41,42]`、`dspark_noise_token_id=128799`、
+   `num_nextn_predict_layers=1`；权重含完整 3 层 draft（`mtp.0/1/2.*`，结构与主层相同，
+   含 256 专家 MoE）和 DSpark 马尔可夫头（`mtp.2.markov_head.markov_w1/w2`）。
+2. **sglang-kt 无 DSpark 实现**：整个代码库（源码与 venv 安装副本）没有任何 dspark
+   引用。社区的 DSpark 部署基于定制 `dspark-vllm` 镜像（如 DGX Spark 双机 vLLM TP=2
+   方案），与本机的 ktransformers CPU 专家栈不兼容。
+3. **通用 EAGLE/MTP 路径实测失败**：以下参数启动（整卡显存充足时）：
+   ```
+   --speculative-algorithm EAGLE \
+   --speculative-draft-model-path /var/deepseek-v4-flash/0731 \
+   --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3
+   ```
+   draft 模型（`deepseek_v4_nextn`）权重校验报错：
+   `Some weights are not initialized: {model.e_proj.weight, model.h_proj.weight,
+   model.enorm.weight, model.hnorm.weight, ...}`。原因：draft 模型期望 MTP 适配层挂在
+   `model.e_proj/...` 顶层命名，而本 checkpoint 的 `mtp.*` 布局经
+   `deepseek_v4.py::remap_weight_name_to_dpsk_hf_format` 映射后带 `model.layers.43.*`
+   前缀，两边不匹配——sglang-kt 对该 checkpoint 布局的 nextn 适配是缺口。
+4. **显存**：目标 + draft 共需额外约 2~3GB 显存（draft 的 GPU 侧权重）；生产
+   `--mem-fraction-static 0.90` 下有富余，不是障碍。
+
+### 9.2 若未来要启用（移植工作量估计）
+
+本机 decode 两侧都是带宽/延迟型瓶颈（GPU ~440GB/s 显存墙 + CPU MoE ~240µs/层），
+推测解码的 verify 一次前向读同样多权重可裁决多个 token，理论收益大（DSpark 官称
+单用户加速 60%~85%）——值得做但需要：
+
+1. 修 sglang-kt 的 nextn 权重命名适配（`mtp.*` → draft 模型参数名，涉及
+   `remap_weight_name_to_dpsk_hf_format` 的 nextn 分支与 `deepseek_v4_nextn` 的期望
+   命名对齐，可能还需处理 draft 层内 attn/ffn 的层号映射）；
+2. draft 模型的 MoE 接入 kt CPU 专家路径（draft 层同样有 256 专家，`kt-method MXFP4`
+   对 draft 的行为需验证）；
+3. verify 批次（bs×draft_tokens）的 CUDA graph 形状适配（当前 `--cuda-graph-bs 1`）;
+4. DSpark 本体（置信度调度 + 半自回归块生成 + markov 头）需等上游 sglang/vLLM 实现，
+   或整体切换到 dspark-vllm 定制栈（放弃 ktransformers CPU 专家方案，需大显存 GPU）。
+
+启用后的预期参数形态（修好适配后）：
+```
+--speculative-algorithm EAGLE --speculative-num-steps 2-4 \
+--speculative-eagle-topk 1 --speculative-num-draft-tokens 3-5
+```
+（DSpark 原生 block_size=5。）
