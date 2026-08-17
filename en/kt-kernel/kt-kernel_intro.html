@@ -1,0 +1,977 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>For kt-kernel - Ktransformers</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../../searchindex-0184dfb7.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../../toc-16789068.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Ktransformers</h1>
+
+                    <div class="right-buttons">
+                        <a href="../../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/ktransformers" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/ktransformers/edit/main/doc/en/kt-kernel/kt-kernel_intro.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="kt-kernel"><a class="header" href="#kt-kernel">KT-Kernel</a></h1>
+<p>High-performance kernel operations for KTransformers, featuring CPU-optimized MoE inference with AMX, AVX, KML and blis (amd library) support.</p>
+<ul>
+<li><a href="#note">Note</a></li>
+<li><a href="#features">Features</a></li>
+<li><a href="#installation">Installation</a>
+<ul>
+<li><a href="#option-1-install-from-pypi-recommended-for-most-users">Option 1: Install from PyPI (Recommended for Most Users)</a></li>
+<li><a href="#option-2-install-from-source-for-local-use-or-custom-builds">Option 2: Install from Source (For Local Use or Custom Builds)</a></li>
+</ul>
+</li>
+<li><a href="#verification">Verification</a></li>
+<li><a href="#kt-cli-overview">KT CLI Overview</a></li>
+<li><a href="#integration-with-sglang">Integration with SGLang</a>
+<ul>
+<li><a href="#installation-steps">Installation Steps</a></li>
+<li><a href="#complete-example-qwen3-30b-a3b">Complete Example: Qwen3-30B-A3B</a></li>
+<li><a href="#kt-kernel-parameters">KT-Kernel Parameters</a></li>
+</ul>
+</li>
+<li><a href="#direct-python-api-usage">Direct Python API Usage</a>
+<ul>
+<li><a href="#advanced-options">Advanced Options</a></li>
+<li><a href="#manual-configuration-advanced">Manual Configuration (Advanced)</a></li>
+</ul>
+</li>
+<li><a href="#build-configuration">Build Configuration</a>
+<ul>
+<li><a href="#manual-installation-without-installsh">Manual Installation (Without install.sh)</a></li>
+</ul>
+</li>
+<li><a href="#error-troubleshooting">Error Troubleshooting</a>
+<ul>
+<li><a href="#cuda-not-found">CUDA Not Found</a></li>
+<li><a href="#hwloc-not-found">hwloc Not Found</a></li>
+</ul>
+</li>
+<li><a href="#weight-quantization">Weight Quantization</a></li>
+<li><a href="#before-commit">Before Commit!</a></li>
+</ul>
+<h2 id="note"><a class="header" href="#note">Note</a></h2>
+<p><strong>Current Support Status:</strong></p>
+<ul>
+<li>✅ <strong>Native Precision with AVX512/AMX</strong>: Supported with AVX512 CPUs in <code>FP8</code>, <code>BF16</code> and <code>RAWINT4</code> format - <a href="https://github.com/kvcache-ai/ktransformers/blob/main/doc/en/kt-kernel/Native-Precision-Tutorial.md">Guide</a></li>
+<li>✅ <strong>Intel CPUs with AMX</strong>: Fully supported (using weights converted to INT4/INT8 format)</li>
+<li>✅ <strong>Universal CPU (llamafile backend)</strong>: Supported (using GGUF-format weights)</li>
+<li>✅ <strong>AMD CPUs with BLIS</strong>: Supported (for int8 prefill &amp; decode) - <a href="https://github.com/kvcache-ai/ktransformers/blob/main/doc/en/kt-kernel/amd_blis.md">Guide</a></li>
+</ul>
+<p><strong>KT-CLI</strong></p>
+<p>We are developing a simpler way to use KTransformers. Check out the <a href="https://github.com/kvcache-ai/ktransformers/blob/main/doc/en/kt-kernel/kt-cli.md">KT-CLI Guide</a> for more details.</p>
+<h2 id="features"><a class="header" href="#features">Features</a></h2>
+<ul>
+<li><strong>CPU-Optimized MoE Kernels</strong>: High-throughput MoE expert kernels optimized for instruction sets.</li>
+<li><strong>AVX512 Native Precision Backend</strong>: FP8 / BF16 / INT4 native MoE backend for AVX512-capable servers.</li>
+<li><strong>AMX INT4/INT8 Backend</strong>: INT4 / INT8 quantized expert inference backend for AMX-capable servers.</li>
+<li><strong>Llamafile CPU Backend</strong>: AVX2/AVX512-based MoE backend built on Llamafile for universal CPU deployment.</li>
+<li><strong>NUMA-Aware Execution</strong>: Thread pool and memory layout designed for multi-socket / multi-NUMA machines.</li>
+</ul>
+<h2 id="installation"><a class="header" href="#installation">Installation</a></h2>
+<h3 id="option-1-install-from-pypi-recommended-for-most-users"><a class="header" href="#option-1-install-from-pypi-recommended-for-most-users">Option 1: Install from PyPI (Recommended for Most Users)</a></h3>
+<p>Install the latest version with a single command:</p>
+<pre><code class="language-bash">pip install kt-kernel
+</code></pre>
+<blockquote>
+<p><strong>Note</strong>: Check the <a href="https://pypi.org/project/kt-kernel/#history">latest version on PyPI</a></p>
+</blockquote>
+<p><strong>Features:</strong></p>
+<ul>
+<li>✅ <strong>Automatic CPU detection</strong>: Detects your CPU and loads the optimal kernel variant</li>
+<li>✅ <strong>CPU multi-variant support</strong>: Includes AMX, AVX512 (Base/VNNI/VBMI/BF16), and AVX2 variants</li>
+<li>✅ <strong>CUDA support included</strong>: GPU acceleration for NVIDIA GPUs (SM 80, 86, 89, 90)</li>
+<li>✅ <strong>No compilation needed</strong>: Pre-built wheels for Python 3.10, 3.11, 3.12</li>
+<li>✅ <strong>Static CUDA runtime</strong>: No CUDA toolkit installation required</li>
+<li>✅ <strong>Works on CPU-only systems</strong>: CUDA features automatically disabled when GPU not available</li>
+</ul>
+<p><strong>Requirements:</strong></p>
+<ul>
+<li>Python 3.10, 3.11, or 3.12</li>
+<li>Linux x86-64 (manylinux_2_17 compatible)</li>
+<li>CPU with AVX2 support (Intel Haswell 2013+, AMD Zen+)</li>
+<li>Optional: NVIDIA GPU with compute capability 8.0+ for CUDA features</li>
+</ul>
+<h4 id="cuda-installation-gpu-acceleration"><a class="header" href="#cuda-installation-gpu-acceleration">CUDA Installation (GPU Acceleration)</a></h4>
+<p>For NVIDIA GPU-accelerated inference:</p>
+<pre><code class="language-bash">pip install kt-kernel
+</code></pre>
+<p><strong>Features:</strong></p>
+<ul>
+<li>✅ <strong>Multi-architecture support</strong>: Single wheel supports SM 80/86/89/90 (Ampere, Ada, Hopper)</li>
+<li>✅ <strong>Static CUDA runtime</strong>: No CUDA toolkit installation required</li>
+<li>✅ <strong>Broad compatibility</strong>: Works with CUDA 11.8+ and 12.x drivers</li>
+<li>✅ <strong>PyTorch compatible</strong>: Works with any PyTorch CUDA variant (cu118, cu121, cu124)</li>
+</ul>
+<p><strong>Requirements:</strong></p>
+<ul>
+<li>Python 3.10, 3.11, or 3.12</li>
+<li>Linux x86-64 (manylinux_2_17 compatible)</li>
+<li>NVIDIA GPU with compute capability 8.0+ (Ampere or newer)
+<ul>
+<li>✅ Supported: A100, RTX 3000/4000 series, H100</li>
+<li>❌ Not supported: V100, P100, GTX 1000/2000 series (too old)</li>
+</ul>
+</li>
+<li>NVIDIA driver with CUDA 11.8+ or 12.x support (no CUDA toolkit needed)</li>
+</ul>
+<p><strong>GPU Compatibility Matrix:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>GPU Architecture</th><th>Compute Capability</th><th>Supported</th><th>Example GPUs</th></tr>
+</thead>
+<tbody>
+<tr><td>Hopper</td><td>9.0</td><td>✅</td><td>H100, H200</td></tr>
+<tr><td>Ada Lovelace</td><td>8.9</td><td>✅</td><td>RTX 4090, 4080, 4070</td></tr>
+<tr><td>Ampere</td><td>8.6</td><td>✅</td><td>RTX 3090, 3080, 3070, 3060</td></tr>
+<tr><td>Ampere</td><td>8.0</td><td>✅</td><td>A100, A30</td></tr>
+<tr><td>Turing</td><td>7.5</td><td>❌</td><td>RTX 2080, T4</td></tr>
+<tr><td>Volta</td><td>7.0</td><td>❌</td><td>V100</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>CUDA Driver Compatibility (for GPU features):</strong></p>
+<ul>
+<li>CUDA 11.8, 11.9, 12.0-12.6+: Full support</li>
+<li>CUDA 11.0-11.7: Not supported (upgrade driver or use CPU-only)</li>
+</ul>
+<p><strong>CPU Variants Included:</strong></p>
+<p>The wheel includes 6 optimized variants that are <strong>automatically selected at runtime</strong> based on your CPU:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variant</th><th>CPU Support</th><th>Performance</th><th>Auto-Selected When</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>AMX</strong></td><td>Intel Sapphire Rapids+ (2023+)</td><td>⚡⚡⚡ Best</td><td>AMX instructions detected</td></tr>
+<tr><td><strong>AVX512+BF16</strong></td><td>Ice Lake server, Zen 4+ (2021+)</td><td>⚡⚡⚡ Excellent</td><td>AVX512 + BF16 detected</td></tr>
+<tr><td><strong>AVX512+VBMI</strong></td><td>Ice Lake client (2019+)</td><td>⚡⚡ Great</td><td>AVX512 + VBMI detected</td></tr>
+<tr><td><strong>AVX512+VNNI</strong></td><td>Cascade Lake+ (2019+)</td><td>⚡⚡ Great</td><td>AVX512 + VNNI detected</td></tr>
+<tr><td><strong>AVX512 Base</strong></td><td>Skylake-X+ (2017+)</td><td>⚡⚡ Good</td><td>AVX512 base detected</td></tr>
+<tr><td><strong>AVX2</strong></td><td>Haswell+ (2013+), AMD Zen+</td><td>⚡ Good</td><td>Fallback for maximum compatibility</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Verify installation:</strong></p>
+<pre><code class="language-python">import kt_kernel
+
+# Check which CPU variant was loaded
+print(f"CPU variant: {kt_kernel.__cpu_variant__}")
+print(f"Version: {kt_kernel.__version__}")
+
+# Check CUDA support
+from kt_kernel import kt_kernel_ext
+cpu_infer = kt_kernel_ext.CPUInfer(4)
+has_cuda = hasattr(cpu_infer, 'submit_with_cuda_stream')
+print(f"CUDA support: {has_cuda}")
+
+print("✓ kt-kernel installed successfully!")
+</code></pre>
+<p><strong>Environment Variables:</strong></p>
+<pre><code class="language-bash"># Override automatic CPU detection (for testing or debugging)
+export KT_KERNEL_CPU_VARIANT=avx2  # Force specific variant
+
+# Enable debug output to see detection process
+export KT_KERNEL_DEBUG=1
+python -c "import kt_kernel"
+</code></pre>
+<hr>
+<h3 id="option-2-install-from-source-for-local-use-or-custom-builds"><a class="header" href="#option-2-install-from-source-for-local-use-or-custom-builds">Option 2: Install from Source (For Local Use or Custom Builds)</a></h3>
+<p>Build from source for local installation or when you need AMD (BLIS), ARM (KML), or custom CUDA versions.</p>
+<h4 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h4>
+<p>First, initialize git submodules and create a conda environment:</p>
+<pre><code class="language-bash">git submodule update --init --recursive
+conda create -n kt-kernel python=3.11 -y
+conda activate kt-kernel
+</code></pre>
+<h4 id="quick-installation-recommended"><a class="header" href="#quick-installation-recommended">Quick Installation (Recommended)</a></h4>
+<p>Simply run the install script - it will auto-detect your CPU and optimize for best performance:</p>
+<pre><code class="language-bash">./install.sh
+</code></pre>
+<p><strong>What happens automatically:</strong></p>
+<ul>
+<li>Auto-detects CPU capabilities (AMX, AVX512_VNNI, AVX512_BF16)</li>
+<li>Installs system dependencies (<code>cmake</code>, <code>libhwloc-dev</code>, <code>pkg-config</code>)</li>
+<li>Builds optimized binary for <strong>your CPU only</strong> (using <code>-march=native</code>)</li>
+<li><strong>Software fallbacks</strong>: Automatically enabled for CPUs without VNNI/BF16</li>
+</ul>
+<p><strong>Optional: Two-step installation</strong></p>
+<pre><code class="language-bash">./install.sh deps   # Install dependencies only
+./install.sh build  # Build and install kt-kernel
+</code></pre>
+<p><strong>CPU Requirements by Backend:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Backend</th><th>Minimum CPU Requirement</th><th>Example CPUs</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>LLAMAFILE</strong></td><td>AVX2</td><td>Intel Haswell (2013+), AMD Zen+</td><td>Universal compatibility</td></tr>
+<tr><td><strong>RAWINT4</strong></td><td>AVX512F + AVX512BW</td><td>Intel Skylake-X (2017+), Ice Lake, Cascade Lake</td><td>Software fallbacks for VNNI/BF16</td></tr>
+<tr><td><strong>AMXINT4/INT8</strong></td><td>AMX</td><td>Intel Sapphire Rapids (2023+)</td><td>Best performance, requires AMX hardware</td></tr>
+<tr><td><strong>FP8</strong></td><td>AVX512F + AVX512BW + AVX512_BF16 + AVX512_VBMI</td><td>Intel Cooper Lake (2020+), Sapphire Rapids (2023+); AMD Zen 4+ (e.g., EPYC 9355)</td><td>Native Precision (e.g., DeepSeek V3.2, MiniMax M2.1)</td></tr>
+<tr><td><strong>BF16</strong></td><td>AVX512F + AVX512BW + AVX512_BF16</td><td>Intel Cooper Lake (2020+), Sapphire Rapids (2023+); AMD Zen 4+ (e.g., EPYC 9355)</td><td>Native Precision (e.g., Qwen3-235B-A22B, GLM-4.7)</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Software Fallback Support (AVX512 backends):</strong></p>
+<ul>
+<li>✅ VNNI fallback: Uses AVX512BW instructions</li>
+<li>✅ BF16 fallback: Uses AVX512F instructions</li>
+<li>✅ Older AVX512 CPUs (Skylake-X, Cascade Lake) can run RAWINT4 with fallbacks</li>
+</ul>
+<p>⚠️ <strong>Portability Note:</strong> The default build is optimized for your specific CPU and may not work on different/older CPUs. For portable builds or binary distribution, see <a href="#manual-configuration-advanced">Manual Configuration</a> below.</p>
+<p>⚠️ <strong>AMD BLIS backend users:</strong> See <a href="https://github.com/kvcache-ai/ktransformers/issues/1601">installation guide</a> for AMD-specific setup.</p>
+<h2 id="verification"><a class="header" href="#verification">Verification</a></h2>
+<p>After installation, verify that the CLI is working:</p>
+<pre><code class="language-bash">kt version
+</code></pre>
+<p>Expected output:</p>
+<pre><code>KTransformers CLI v0.x.x
+
+  Python:        3.11.x
+  Platform:      Linux 5.15.0-xxx-generic
+  CUDA:          12.x
+  kt-kernel:     0.x.x (amx)
+  sglang:        0.x.x
+</code></pre>
+<p>You can also verify the Python module directly:</p>
+<pre><code class="language-bash">python -c "from kt_kernel import KTMoEWrapper; print('✓ kt-kernel installed successfully')"
+</code></pre>
+<h2 id="kt-cli-overview"><a class="header" href="#kt-cli-overview">KT CLI Overview</a></h2>
+<p>The <code>kt</code> command-line tool provides a unified interface for running and managing KTransformers models:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>kt run &lt;model&gt;</code></td><td>Start model inference server with auto-optimized parameters</td></tr>
+<tr><td><code>kt chat</code></td><td>Interactive chat with a running model server</td></tr>
+<tr><td><code>kt model</code></td><td>Manage models and storage paths</td></tr>
+<tr><td><code>kt doctor</code></td><td>Diagnose environment issues and check system compatibility</td></tr>
+<tr><td><code>kt config</code></td><td>Manage CLI configuration</td></tr>
+<tr><td><code>kt version</code></td><td>Show version information</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Quick Start Example:</strong></p>
+<pre><code class="language-bash"># Start a model server (auto-detects hardware and applies optimal settings)
+kt run m2
+
+# In another terminal, chat with the model
+kt chat
+
+# Check system compatibility
+kt doctor
+</code></pre>
+<p>Run <code>kt --help</code> for more options, or <code>kt &lt;command&gt; --help</code> for command-specific help.</p>
+<h2 id="integration-with-sglang"><a class="header" href="#integration-with-sglang">Integration with SGLang</a></h2>
+<p>KT-Kernel can be used standalone via <a href="#direct-python-api-usage">Direct Python API</a> or integrated with SGLang for production deployment. This section describes SGLang integration to enable CPU-GPU heterogeneous inference, where “hot” experts run on GPU and “cold” experts run on CPU for optimal resource utilization.</p>
+<h3 id="installation-steps"><a class="header" href="#installation-steps">Installation Steps</a></h3>
+<h4 id="1-install-sglang"><a class="header" href="#1-install-sglang">1. Install SGLang</a></h4>
+<p>Install the kvcache-ai fork of SGLang (required for kt-kernel support):</p>
+<pre><code class="language-bash"># Option A: One-click install (from ktransformers root, installs sglang + kt-kernel)
+./install.sh
+
+# Option B: pip install
+pip install kt-kernel sglang-kt
+
+# Option C: From source (editable mode)
+git clone --recursive https://github.com/kvcache-ai/ktransformers.git
+cd ktransformers
+pip install -e "third_party/sglang/python[all]"
+</code></pre>
+<blockquote>
+<p><strong>Important:</strong> Use <code>sglang-kt</code> (kvcache-ai fork), not the official <code>sglang</code> package. If you have the official version installed, uninstall it first: <code>pip uninstall sglang -y</code></p>
+</blockquote>
+<h4 id="2-prepare-weights"><a class="header" href="#2-prepare-weights">2. Prepare Weights</a></h4>
+<p>You need both GPU weights and CPU-side expert weights for heterogeneous inference. The exact format depends on the backend:</p>
+<p><strong>GPU Weights (for all backends):</strong><br>Use the model weights required by SGLang for GPU inference (for example, the original or already-quantized model directory from Hugging Face).</p>
+<p><strong>CPU Weights (AMX backend: <code>AMXINT4</code> / <code>AMXINT8</code>):</strong>
+Quantize weights to AMX-optimized INT4/INT8 format using the provided script:</p>
+<pre><code class="language-bash">python scripts/convert_cpu_weights.py \
+  --input-path /path/to/model \
+  --input-type bf16 \
+  --output /path/to/cpu-weights \
+  --quant-method int8  # or int4 or moe_int8 (for amd now) 
+</code></pre>
+<ul>
+<li><code>--input-path</code>: Path to GPU-side original weights</li>
+<li><code>--input-type</code>: Depends on your GPU weights type (<code>fp8</code>, <code>fp16</code>, or <code>bf16</code>)</li>
+</ul>
+<p>In SGLang integration, <code>--kt-weight-path</code> should point to this converted CPU weights directory.</p>
+<p><strong>Supported input formats:</strong> FP8, FP16, BF16 → INT4/INT8.</p>
+<p><strong>CPU Weights (LLAMAFILE backend: <code>LLAMAFILE</code>):</strong>
+LLAMAFILE uses pre-quantized <strong>GGUF</strong> weights on the CPU side directly, without running <code>convert_cpu_weights.py</code>. You need to:</p>
+<ul>
+<li>Download a GGUF model directly from the web (e.g., GGUF repos on Hugging Face / Modelscope);</li>
+<li>In SGLang integration, use that GGUF directory as <code>--kt-weight-path</code>.
+KT-Kernel supports multiple GGUF quantization formats such as <code>Q4_KM</code>, <code>Q4_K</code>, <code>Q5_K</code>, etc. Choose based on your latency and accuracy requirements.</li>
+</ul>
+<h4 id="3-launch-sglang-server"><a class="header" href="#3-launch-sglang-server">3. Launch SGLang Server</a></h4>
+<p>Start the SGLang server with your normal SGLang parameters, and add the following KT-Kernel specific parameters to enable CPU-GPU heterogeneous inference:</p>
+<p><strong>KT-Kernel Parameters to Add:</strong></p>
+<ul>
+<li><code>--kt-method</code>: Backend method (AMXINT4, AMXINT8, or LLAMAFILE)</li>
+<li><code>--kt-weight-path</code>: Path to the converted CPU weights</li>
+<li><code>--kt-cpuinfer</code>: Number of CPU inference threads (set to physical cores)</li>
+<li><code>--kt-threadpool-count</code>: Number of thread pools (set to NUMA node count)</li>
+<li><code>--kt-num-gpu-experts</code>: Number of experts to keep on GPU</li>
+<li><code>--kt-max-deferred-experts-per-token</code>: Deferred experts for pipelined execution</li>
+</ul>
+<p>Example:</p>
+<pre><code class="language-bash">python -m sglang.launch_server \
+  [your normal SGLang parameters...] \
+  --kt-method AMXINT8 \
+  --kt-weight-path /path/to/cpu-weights \
+  --kt-cpuinfer 64 \
+  --kt-threadpool-count 2 \
+  --kt-num-gpu-experts 32 \
+  --kt-max-deferred-experts-per-token 2
+</code></pre>
+<p>See <a href="#kt-kernel-parameters">KT-Kernel Parameters</a> section below for detailed parameter tuning guidelines.</p>
+<h3 id="complete-example-qwen3-30b-a3b"><a class="header" href="#complete-example-qwen3-30b-a3b">Complete Example: Qwen3-30B-A3B</a></h3>
+<p>This example demonstrates the full workflow from downloading weights to launching the server, showing <strong>Native backend</strong>, <strong>AMX backend</strong> and <strong>LLAMAFILE backend</strong> options.</p>
+<p><strong>Hardware Configuration:</strong></p>
+<ul>
+<li><strong>GPU</strong>: NVIDIA RTX 4090 24GB</li>
+<li><strong>CPU</strong>: 2x Intel Xeon Gold 6454S (64 physical cores total, 128 threads, 2 NUMA nodes)</li>
+<li><strong>Model</strong>: <a href="https://huggingface.co/Qwen/Qwen3-30B-A3B">Qwen3-30B-A3B</a></li>
+</ul>
+<p><strong>How to verify your system configuration:</strong></p>
+<pre><code class="language-bash"># Check CPU configuration
+lscpu | grep -E "^CPU\(s\)|Thread\(s\) per core|Socket\(s\)|NUMA node\(s\)"
+# Expected output example:
+CPU(s):                                  128
+Thread(s) per core:                      2
+Socket(s):                               2
+NUMA node(s):                            2
+# → Physical cores = CPU(s) / Thread(s) per core = 128 / 2 = 64
+</code></pre>
+<p><strong>Parameter Rationale:</strong></p>
+<ul>
+<li><code>--kt-cpuinfer 64</code>: Set to physical cores (64), not hyperthreads (128)</li>
+<li><code>--kt-threadpool-count 2</code>: 2 NUMA nodes detected (dual-socket system)</li>
+<li><code>--kt-num-gpu-experts 32</code>: With 24GB GPU memory, we can fit ~32 experts on GPU for this model (varies by model architecture and actual memory usage)</li>
+<li><code>--kt-max-deferred-experts-per-token 2</code>: Enable pipelined execution; allows CPU to process next batch while GPU completes current batch</li>
+<li><code>--kt-gpu-prefill-token-threshold 2048</code>: Use layerwise prefill strategy when token count exceeds 2048 (for native backends only)</li>
+</ul>
+<hr>
+<h4 id="option-a-native-backend-bf16"><a class="header" href="#option-a-native-backend-bf16">Option A: Native Backend (BF16)</a></h4>
+<p>For AVX512 CPUs with BF16 support.</p>
+<p><strong>Step 1: Download model weights</strong></p>
+<pre><code class="language-bash"># Install huggingface-cli if not already installed
+pip install huggingface-hub
+# Download model from Hugging Face  
+huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir /mnt/data/models/Qwen3-30B-A3B
+</code></pre>
+<p><strong>Step 2: Launch SGLang server</strong></p>
+<pre><code class="language-bash">python -m sglang.launch_server \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --model /mnt/data/models/Qwen3-30B-A3B \
+    --kt-weight-path /mnt/data/models/Qwen3-30B-A3B \
+    --kt-cpuinfer 64 \
+    --kt-threadpool-count 2 \
+    --kt-num-gpu-experts 32 \
+    --kt-method BF16 \
+    --attention-backend flashinfer \
+    --trust-remote-code \
+    --mem-fraction-static 0.80 \
+    --chunked-prefill-size 16384 \
+    --max-running-requests 4 \
+    --served-model-name Qwen3 \
+    --enable-mixed-chunk \
+    --tensor-parallel-size 1 \
+    --enable-p2p-check \
+    --disable-shared-experts-fusion \
+    --kt-gpu-prefill-token-threshold 4096 \
+    --kt-enable-dynamic-expert-update
+</code></pre>
+<hr>
+<h4 id="option-b-amx-backend-amxint8"><a class="header" href="#option-b-amx-backend-amxint8">Option B: AMX Backend (AMXINT8)</a></h4>
+<p>For Intel CPUs with AMX instruction set support.</p>
+<p><strong>Step 1: Download model weights</strong></p>
+<pre><code class="language-bash"># Install huggingface-cli if not already installed
+pip install huggingface-hub
+
+# Download model from Hugging Face
+huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir /mnt/data/models/Qwen3-30B-A3B
+</code></pre>
+<p><strong>Step 2: Convert to CPU weights (AMXINT8)</strong></p>
+<pre><code class="language-bash">python scripts/convert_cpu_weights.py \
+  --input-path /mnt/data/models/Qwen3-30B-A3B \
+  --input-type bf16 \
+  --output /mnt/data/models/Qwen3-30B-A3B-INT8 \
+  --quant-method int8
+</code></pre>
+<p><strong>Step 3: Launch SGLang server</strong></p>
+<pre><code class="language-bash">python -m sglang.launch_server \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --model /mnt/data/models/Qwen3-30B-A3B \
+  --trust-remote-code \
+  --mem-fraction-static 0.92 \
+  --chunked-prefill-size 4096 \
+  --served-model-name Qwen3-30B-A3B \
+  --enable-mixed-chunk \
+  --kt-method AMXINT8 \
+  --kt-weight-path /mnt/data/models/Qwen3-30B-A3B-INT8 \
+  --kt-cpuinfer 64 \
+  --kt-threadpool-count 2 \
+  --kt-num-gpu-experts 32 \
+  --kt-max-deferred-experts-per-token 2
+</code></pre>
+<hr>
+<h4 id="option-c-llamafile-backend-gguf"><a class="header" href="#option-c-llamafile-backend-gguf">Option C: LLAMAFILE Backend (GGUF)</a></h4>
+<p>For universal CPUs (no AMX required), using pre-quantized GGUF weights directly.</p>
+<p><strong>Step 1: Download GPU weights (original model)</strong></p>
+<pre><code class="language-bash">pip install huggingface-hub
+
+huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir /mnt/data/models/Qwen3-30B-A3B
+</code></pre>
+<p><strong>Step 2: Download CPU weights (GGUF format)</strong></p>
+<pre><code class="language-bash">huggingface-cli download Qwen/Qwen3-30B-A3B-GGUF Qwen3-30B-A3B-Q4_K_M.gguf \
+  --local-dir /mnt/data/models/Qwen3-30B-A3B-Q4_K_M
+</code></pre>
+<p><strong>Step 3: Launch SGLang server</strong></p>
+<pre><code class="language-bash">python -m sglang.launch_server \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --model /mnt/data/models/Qwen3-30B-A3B \
+  --trust-remote-code \
+  --mem-fraction-static 0.92 \
+  --chunked-prefill-size 4096 \
+  --served-model-name Qwen3-30B-A3B \
+  --enable-mixed-chunk \
+  --kt-method LLAMAFILE \
+  --kt-weight-path /mnt/data/models/Qwen3-30B-A3B-Q4_K_M \
+  --kt-cpuinfer 64 \
+  --kt-threadpool-count 2 \
+  --kt-num-gpu-experts 32 \
+  --kt-max-deferred-experts-per-token 2
+</code></pre>
+<h3 id="kt-kernel-parameters"><a class="header" href="#kt-kernel-parameters">KT-Kernel Parameters</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Parameter</th><th>Description</th><th>Example Value</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--kt-method</code></td><td>CPU inference backend method</td><td><code>AMXINT4</code>, <code>AMXINT8</code>, <code>RAWINT4</code>, <code>FP8</code>, <code>FP8_PERCHANNEL</code>, <code>BF16</code> or <code>LLAMAFILE</code></td></tr>
+<tr><td><code>--kt-weight-path</code></td><td>Path to quantized CPU weights</td><td><code>/path/to/cpu-weights</code></td></tr>
+<tr><td><code>--kt-cpuinfer</code></td><td>Number of CPU inference threads</td><td><code>64</code> (adjust based on CPU cores)</td></tr>
+<tr><td><code>--kt-threadpool-count</code></td><td>Number of thread pools for parallel execution</td><td><code>2</code> (typically 1-4)</td></tr>
+<tr><td><code>--kt-num-gpu-experts</code></td><td>Number of experts to keep on GPU</td><td><code>32</code> (remaining experts go to CPU)</td></tr>
+<tr><td><code>--kt-max-deferred-experts-per-token</code></td><td>Number of experts per token to defer for pipelined execution</td><td><code>2</code> (0 to disable, 1-4 recommended)</td></tr>
+<tr><td><code>--kt-gpu-prefill-token-threshold</code></td><td>Token count threshold for prefill strategy (native backend only)</td><td>~<code>1024-4096</code></td></tr>
+<tr><td><code>--kt-enable-dynamic-expert-update</code></td><td>Enable dynamic expert placement updates during prefill based on actual routing statistics</td><td>(flag, no value needed)</td></tr>
+<tr><td><code>--kt-expert-placement-strategy</code></td><td>Strategy for initial GPU expert placement</td><td><code>uniform</code>, <code>frequency</code>, <code>front-loading</code>, or <code>random</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Parameter Guidelines:</strong></p>
+<ul>
+<li>
+<p><strong><code>kt-method</code></strong>: Choose based on your CPU and weight format:</p>
+<ul>
+<li><code>AMXINT4</code>: Best performance on AMX CPUs with INT4 quantized weights (May cause huge accuracy drop for some models, e.g., Qwen3-30B-A3B)</li>
+<li><code>AMXINT8</code>: Higher accuracy with INT8 quantized weights on AMX CPUs</li>
+<li><code>RAWINT4</code>: Native INT4 weights shared by CPU and GPU (currently supports Kimi-K2-Thinking model). See <a href="../doc/en/kt-kernel/Kimi-K2-Thinking-Native.html">Kimi-K2-Thinking Native Tutorial</a> for details.</li>
+<li><code>FP8</code>, <code>FP8_PERCHANNEL</code>: FP8 weights shared by CPU and GPU</li>
+<li><code>BF16</code>: BF16 weights shared by CPU and GPU</li>
+<li><code>LLAMAFILE</code>: GGUF-based backend</li>
+</ul>
+</li>
+<li>
+<p><strong><code>kt-cpuinfer</code></strong>: Set to the number of <strong>physical CPU cores</strong> (not hyperthreads).</p>
+<ul>
+<li>Check physical cores: <code>lscpu | grep -E "^CPU\(s\)|Thread\(s\) per core"</code></li>
+<li>Physical cores = CPU(s) / Thread(s) per core</li>
+<li>Example: If CPU(s)=128 and Thread(s) per core=2, then physical cores = 64</li>
+<li><strong>Important</strong>: Do NOT set to hyperthread count - this will degrade performance</li>
+</ul>
+</li>
+<li>
+<p><strong><code>kt-threadpool-count</code></strong>: Set to the number of <strong>NUMA nodes</strong>.</p>
+<ul>
+<li>Check NUMA count: <code>lscpu | grep "NUMA node(s)"</code></li>
+<li>Or use: <code>numactl --hardware | grep "available"</code></li>
+<li><strong>Note</strong>: NUMA node count is NOT necessarily the number of physical CPUs
+<ul>
+<li>It represents memory domains, which may be divided within a single CPU or across multiple CPUs</li>
+<li>Use the NUMA node count from <code>lscpu</code>, regardless of physical CPU count</li>
+</ul>
+</li>
+<li>Typical values: 1-2 for single-socket, 2-4 for dual-socket systems</li>
+<li>This enables better memory bandwidth utilization across NUMA domains</li>
+</ul>
+</li>
+<li>
+<p><strong><code>kt-num-gpu-experts</code></strong>: Determine based on GPU memory and profiling:</p>
+<ul>
+<li>More GPU experts = lower latency but higher GPU memory usage (May cause OOM)</li>
+</ul>
+</li>
+<li>
+<p><strong><code>kt-max-deferred-experts-per-token</code></strong>: Enables pipelined execution:</p>
+<ul>
+<li><code>0</code>: Synchronous execution (simpler, higher latency)</li>
+<li><code>1-4</code>: Deferred execution (recommended range; good latency/quality balance, requires tuning)</li>
+<li><code>5-7</code>: Highest latency reduction but may introduce noticeable accuracy loss; use with care</li>
+</ul>
+</li>
+<li>
+<p><strong><code>kt-gpu-prefill-token-threshold</code></strong> (FP8 and RAWINT4 only): Controls prefill strategy for native FP8 and INT4 inference:</p>
+<ul>
+<li><strong>≤ threshold</strong>: Uses hybrid CPU+GPU prefill. No extra VRAM needed, but performance degrades slowly as token count increases.</li>
+<li><strong>&gt; threshold</strong>: Uses layerwise GPU prefill. Performance scales better with longer sequences, but requires one MoE layer extra VRAM (e.g., ~9GB+ for Kimi-K2-Thinking and ~3.6GB for MiniMax-M2.1).</li>
+<li>Only applicable when <code>--kt-method RAWINT4</code> or <code>--kt-method FP8</code> is used.</li>
+</ul>
+</li>
+<li>
+<p><strong><code>kt-enable-dynamic-expert-update</code></strong>: Enables dynamic expert placement updates during inference.</p>
+<ul>
+<li>During layerwise prefill, the system collects actual routing statistics and redistributes GPU experts accordingly.</li>
+<li>Requires <code>--kt-gpu-prefill-token-threshold</code> to be set, and prefill length must be ≥ the threshold value.</li>
+<li>Particularly effective at lower GPU expert ratios (10%-70%), where it can significantly outperform static strategies.</li>
+<li>See <a href="../doc/en/kt-kernel/experts-sched-Tutorial.html">Expert Scheduling Tutorial</a> for benchmarks and details.</li>
+</ul>
+</li>
+<li>
+<p><strong><code>kt-expert-placement-strategy</code></strong>: Determines which experts are placed on GPU at server startup.</p>
+<ul>
+<li><code>uniform</code>: Distributes GPU experts evenly across all MoE layers. Default option, no prior statistics needed.</li>
+<li><code>frequency</code>: Places the most frequently activated experts on GPU. Best performance when activation statistics are available; requires <code>--init-expert-location</code> pointing to a <code>.pt</code> statistics file.</li>
+<li><code>front-loading</code>: Fills GPU experts from the first MoE layer onwards.</li>
+<li><code>random</code>: Randomly selects experts with a fixed seed (42).</li>
+<li>See <a href="../doc/en/kt-kernel/experts-sched-Tutorial.html">Expert Scheduling Tutorial</a> for strategy comparison.</li>
+</ul>
+</li>
+</ul>
+<h2 id="direct-python-api-usage"><a class="header" href="#direct-python-api-usage">Direct Python API Usage</a></h2>
+<p>For standalone usage without SGLang, you can use KT-Kernel directly via Python API:</p>
+<pre><code class="language-python">from kt_kernel import KTMoEWrapper
+
+# Initialize the MoE wrapper
+wrapper = KTMoEWrapper(
+    layer_idx=0,
+    num_experts=8,
+    num_experts_per_tok=2,
+    hidden_size=4096,
+    moe_intermediate_size=14336,
+    num_gpu_experts=2,
+    cpuinfer_threads=32,
+    threadpool_count=2,
+    weight_path="/path/to/weights",
+    chunked_prefill_size=512,
+    method="AMXINT4"  # Options: "AMXINT4", "AMXINT8", "LLAMAFILE"
+)
+
+# Load weights (from disk - pre-quantized)
+wrapper.load_weights(physical_to_logical_map)
+
+# Or load weights from tensors (online quantization)
+wrapper.load_weights_from_tensors(gate_proj, up_proj, down_proj, physical_to_logical_map)
+
+# Run inference
+output = wrapper.forward(hidden_states, topk_ids, topk_weights, cuda_stream)
+
+# Or use async API for better performance
+wrapper.submit_forward(hidden_states, topk_ids, topk_weights, cuda_stream)
+# ... do other work ...
+output = wrapper.sync_forward(hidden_states, cuda_stream)
+</code></pre>
+<h3 id="advanced-options"><a class="header" href="#advanced-options">Advanced Options</a></h3>
+<pre><code class="language-python"># Initialize with additional options
+wrapper = KTMoEWrapper(
+    layer_idx=0,
+    num_experts=8,
+    num_experts_per_tok=2,
+    hidden_size=4096,
+    moe_intermediate_size=14336,
+    num_gpu_experts=2,
+    cpuinfer_threads=32,
+    threadpool_count=2,
+    weight_path="/path/to/weights",
+    chunked_prefill_size=512,
+    method="AMXINT4",
+    cpu_save=False,  # Keep weights in CPU memory after loading
+    max_deferred_experts_per_token=0  # Number of experts to defer (for pipelined execution)
+)
+
+# Pre-allocate buffers for specific batch sizes (improves performance)
+KTMoEWrapper.set_capture_batch_sizes([1, 2, 4, 8, 16])
+
+# Query captured batch sizes
+batch_sizes = KTMoEWrapper.get_capture_batch_sizes()
+
+# Clear buffer cache to free memory
+KTMoEWrapper.clear_buffer_cache()
+</code></pre>
+<h3 id="manual-configuration-advanced"><a class="header" href="#manual-configuration-advanced">Manual Configuration (Advanced)</a></h3>
+<p>For portable builds, binary distribution, or cross-machine deployment, you need to manually specify target instruction sets:</p>
+<pre><code class="language-bash"># General distribution (works on any AVX512 CPU from 2017+)
+export CPUINFER_CPU_INSTRUCT=AVX512
+export CPUINFER_ENABLE_AMX=OFF
+./install.sh build --manual
+
+# Maximum compatibility (works on any CPU from 2013+)
+export CPUINFER_CPU_INSTRUCT=AVX2
+export CPUINFER_ENABLE_AMX=OFF
+./install.sh build --manual
+
+# Modern CPUs only (Ice Lake+, Zen 4+)
+export CPUINFER_CPU_INSTRUCT=FANCY
+export CPUINFER_ENABLE_AMX=OFF
+./install.sh build --manual
+</code></pre>
+<p><strong>Optional: Override VNNI/BF16 detection</strong></p>
+<pre><code class="language-bash"># Force enable/disable VNNI and BF16 (for testing fallbacks)
+export CPUINFER_ENABLE_AVX512_VNNI=OFF
+export CPUINFER_ENABLE_AVX512_BF16=OFF
+./install.sh
+</code></pre>
+<p>See <code>./install.sh --help</code> for all available options.</p>
+<hr>
+<h2 id="build-configuration"><a class="header" href="#build-configuration">Build Configuration</a></h2>
+<h3 id="manual-installation-without-installsh"><a class="header" href="#manual-installation-without-installsh">Manual Installation (Without install.sh)</a></h3>
+<p>If you prefer manual installation without the <code>install.sh</code> script:</p>
+<h4 id="1-install-system-dependencies"><a class="header" href="#1-install-system-dependencies">1. Install System Dependencies</a></h4>
+<p><strong>Prerequisites:</strong></p>
+<ul>
+<li><code>cmake</code> (recommended: <code>conda install -y cmake</code>)</li>
+<li><code>libhwloc-dev</code> and <code>pkg-config</code></li>
+</ul>
+<h4 id="2-set-build-configuration"><a class="header" href="#2-set-build-configuration">2. Set Build Configuration</a></h4>
+<p><strong>Core Options:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Options</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>CPUINFER_CPU_INSTRUCT</code></td><td><code>NATIVE</code>, <code>AVX512</code>, <code>AVX2</code>, <code>FANCY</code></td><td>CPU instruction set to use</td></tr>
+<tr><td><code>CPUINFER_ENABLE_AMX</code></td><td><code>ON</code>, <code>OFF</code></td><td>Enable Intel AMX support</td></tr>
+<tr><td><code>CPUINFER_BUILD_TYPE</code></td><td><code>Release</code>, <code>Debug</code>, <code>RelWithDebInfo</code></td><td>Build type (default: <code>Release</code>)</td></tr>
+<tr><td><code>CPUINFER_PARALLEL</code></td><td>Number</td><td>Parallel build jobs (default: auto-detect)</td></tr>
+<tr><td><code>CPUINFER_VERBOSE</code></td><td><code>0</code>, <code>1</code></td><td>Verbose build output (default: <code>0</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Instruction Set Details:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Target CPUs</th><th>Use Case</th></tr>
+</thead>
+<tbody>
+<tr><td><strong><code>NATIVE</code></strong></td><td>Your specific CPU only</td><td>Local builds (best performance, <strong>default</strong>)</td></tr>
+<tr><td><strong><code>AVX512</code></strong></td><td>Skylake-X, Ice Lake, Cascade Lake, Zen 4+</td><td>General distribution</td></tr>
+<tr><td><strong><code>AVX2</code></strong></td><td>Haswell (2013) and newer</td><td>Maximum compatibility</td></tr>
+<tr><td><strong><code>FANCY</code></strong></td><td>Ice Lake+, Zen 4+</td><td>Modern CPUs with full AVX512 extensions</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Example Configurations:</strong></p>
+<pre><code class="language-bash"># Local use - maximum performance (default behavior)
+export CPUINFER_CPU_INSTRUCT=NATIVE
+export CPUINFER_ENABLE_AMX=ON  # or OFF
+
+# Distribution build - works on any AVX512 CPU
+export CPUINFER_CPU_INSTRUCT=AVX512
+export CPUINFER_ENABLE_AMX=OFF
+
+# Maximum compatibility - works on CPUs since 2013
+export CPUINFER_CPU_INSTRUCT=AVX2
+export CPUINFER_ENABLE_AMX=OFF
+
+# Debug build
+export CPUINFER_BUILD_TYPE=Debug
+export CPUINFER_VERBOSE=1
+</code></pre>
+<h4 id="3-build-and-install"><a class="header" href="#3-build-and-install">3. Build and Install</a></h4>
+<pre><code class="language-bash"># Editable installation (for development)
+pip install -e .
+
+# Standard installation
+pip install .
+</code></pre>
+<h2 id="error-troubleshooting"><a class="header" href="#error-troubleshooting">Error Troubleshooting</a></h2>
+<h3 id="cuda-not-found"><a class="header" href="#cuda-not-found">CUDA Not Found</a></h3>
+<pre><code> -- Looking for a CUDA compiler - NOTFOUND
+  CMake Error at CMakeLists.txt:389 (message):
+    KTRANSFORMERS_USE_CUDA=ON but CUDA compiler not found
+</code></pre>
+<p>Make sure you have the CUDA toolkit installed and <code>nvcc</code> is in your system PATH.</p>
+<p>Try <code>export CMAKE_ARGS="-D CMAKE_CUDA_COMPILER=$(which nvcc)"</code> and reinstall again.</p>
+<h3 id="hwloc-not-found"><a class="header" href="#hwloc-not-found">hwloc Not Found</a></h3>
+<p>Run <code>sudo apt install libhwloc-dev</code> if on a Debian-based system or build from source: https://www.open-mpi.org/projects/hwloc/.</p>
+<pre><code>wget https://download.open-mpi.org/release/hwloc/v2.12/hwloc-2.12.2.tar.gz
+tar -xzf hwloc-2.12.2.tar.gz
+cd hwloc-2.12.2
+./configure
+make
+sudo make install
+</code></pre>
+<h2 id="weight-quantization"><a class="header" href="#weight-quantization">Weight Quantization</a></h2>
+<p>For AMX backends (<code>AMXINT4</code> / <code>AMXINT8</code>), CPU-side experts must be converted to AMX-friendly INT4/INT8 format using the provided script:</p>
+<pre><code class="language-bash">python scripts/convert_cpu_weights.py \
+  --input-path /path/to/model \
+  --input-type bf16 \
+  --output /path/to/output \
+  --quant-method int4
+</code></pre>
+<p><strong>Supported formats:</strong> FP8, FP16, BF16 → INT4/INT8</p>
+<p>For LLAMAFILE backend (<code>LLAMAFILE</code>), CPU-side experts are loaded directly from <strong>GGUF</strong> weights. You do <strong>not</strong> need to run the AMX conversion script; instead, download a GGUF model from the web (e.g., a GGUF repo on Hugging Face) and point <code>weight_path</code> / SGLang <code>--kt-weight-path</code> (or <code>--model</code> when appropriate) to that GGUF directory. KT-Kernel supports multiple GGUF quantization types such as <code>Q4_KM</code>, <code>Q4_K</code>, <code>Q5_K</code>, etc.</p>
+<hr>
+<p>For detailed documentation, advanced options, and low-memory mode, see <a href="scripts/README.html">scripts/README.md</a>.</p>
+<h2 id="before-commit"><a class="header" href="#before-commit">Before Commit!</a></h2>
+<p>Commit messages should follow the Conventional Commits specification: https://www.conventionalcommits.org/</p>
+<p>Please format your code before committing:</p>
+<pre><code class="language-shell">cmake -B build
+cd build
+make format
+</code></pre>
+<p>You may need a newer clang-format (at least version 18). In a conda environment:</p>
+<pre><code class="language-shell">conda install -c conda-forge clang-format=18
+rm -rf build
+</code></pre>
+<p>It’s also recommended to install black for Python code formatting:</p>
+<pre><code class="language-shell">conda install black
+</code></pre>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../../index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../../en/SFT/KTransformers-Fine-Tuning_User-Guide.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../../index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../../en/SFT/KTransformers-Fine-Tuning_User-Guide.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+        <script src="../../ace-2a3cd908.js"></script>
+        <script src="../../mode-rust-2c9d5c9a.js"></script>
+        <script src="../../editor-16ca416c.js"></script>
+        <script src="../../theme-dawn-4493f9c8.js"></script>
+        <script src="../../theme-tomorrow_night-9dbe62a9.js"></script>
+
+        <script src="../../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../../mark-09e88c2c.min.js"></script>
+        <script src="../../searcher-09f2665d.js"></script>
+
+        <script src="../../clipboard-1626706a.min.js"></script>
+        <script src="../../highlight-abc7f01d.js"></script>
+        <script src="../../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>
