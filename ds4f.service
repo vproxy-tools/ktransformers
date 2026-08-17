@@ -30,6 +30,8 @@ Environment=SGLANG_ENABLE_THINKING=1
 # --- decode 性能优化（详见 DSv4F-Opt.md；23.4 -> ~30 tok/s 的来源）---
 # FP8 wo_a Triton GEMV（SM89 无 deep_gemm 时的 FP8 路径，显存 +1.44GB）
 Environment=SGLANG_KT_WOA_FP8_TRITON=1
+# FP8 lm_head GEMV（词表 129280×4096 读取减半，显存 +0.53GB）
+Environment=SGLANG_KT_FP8_LMHEAD=1
 # wq_a+wkv 融合为单 GEMM；q 头 RMSNorm jit 内核
 Environment=SGLANG_OPT_FUSE_WQA_WKV=1
 Environment=SGLANG_OPT_USE_JIT_NORM=1

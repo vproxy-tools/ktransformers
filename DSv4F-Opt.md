@@ -6,10 +6,10 @@
 
 ## 1. 成果
 
-| 指标 | 基线 | 优化后 | 提升 |
-|---|---|---|---|
-| 单流 decode 吞吐（稳态，256 token，忽略前 16） | 23.36 tok/s | **≈30.0 tok/s** | **+28%** |
-| 每 token 延迟 | 42.8 ms | ≈33.4 ms | −22% |
+| 指标 | 基线 | 第一轮后 | 第二轮后 | 累计提升 |
+|---|---|---|---|---|
+| 单流 decode 吞吐（稳态，256 token，忽略前 16） | 23.36 tok/s | 30.0 tok/s | **31.2 tok/s** | **+33.6%** |
+| 每 token 延迟 | 42.8 ms | 33.4 ms | 32.1 ms | −25% |
 
 测量脚本：`bench_decode.py <max_tokens> <runs> [port]`（流式，排除首 token 与预热）。
 所有"每层/每步"数据来自 torch profiler（`/start_profile`，仅统计相邻 decode graph launch 之间的区间）
@@ -82,7 +82,19 @@ CPU 侧：MoE 内核冷/热只差 6% → 非纯带宽瓶颈，受 FP4→BF16 解
 ### 3.5 `--kt-cpuinfer 44→48`（~+0.3 tok/s）
 每 NUMA 22→24 线程（见 §2.3 扫描；勿超 24，SMT 反降）。
 
-### 3.6 env 覆盖机制（使上述无需改 unit 文件）
+### 3.6 FP8 lm_head GEMV（第二轮，~+1.3 tok/s）
+- 问题：lm_head [129280, 4096] bf16（tie_word_embeddings=False，独立权重）每 token
+  读 1.06GB → cublas GEMV 2.27ms/token（grid 32320，profiler 单 kernel 最大项）。
+- 改动：`logits_processor.py::_compute_lm_head` 加 `SGLANG_KT_FP8_LMHEAD=1` 分支：
+  `woa_fp8_triton.build_lmhead_fp8` 在首次 eager 前向（内存 profiling，早于图捕获）
+  分块在 CPU 上量化为 FP8 [128,128] 块（峰值显存只增最终 0.53GB），decode T≤4 走
+  `fp8_lmhead_gemv`（复用 wo_a kernel 的 G=1 特例），否则回退 bf16 matmul。
+- 结果：2.27→~1.2ms/token。质量验证：八大行星/56/6300 公里/巴黎/光速 299,792,458 米
+  均正确。注意两个实现坑：① stash 构建不能放在 T≤4 条件内（捕获前唯一的 eager 前向
+  T 很大，否则 stash 永远建不成、图内永久回退）；② 不能整体 `.float()` 量化（2GB
+  临时显存会 OOM，需分块 CPU 量化）。
+
+### 3.7 env 覆盖机制（使上述无需改 unit 文件）
 - `sglang/srt/environ.py`：import 时读 `$SGLANG_ENV_FILE` 或 `~/.config/sglang/env`，
   KEY=VALUE 逐行 `os.environ.setdefault`（显式环境变量 > 文件 > 默认）。
 - `sglang/launch_server.py`：`SGLANG_EXTRA_ARGS` 追加到 argv 尾部（argparse 后者胜），
@@ -98,6 +110,8 @@ CPU 侧：MoE 内核冷/热只差 6% → 非纯带宽瓶颈，受 FP4→BF16 解
 | + N=1536 配置 + 48 线程 | 28.27 |
 | + §3.2（vpermb+预取，修正表错误后） | 29.69 |
 | 最终（复测） | 30.02 |
+| 第二轮：+ FP8 lm_head（修正 stash 构建时机与 OOM 后） | 30.84 |
+| 第二轮最终（实验复测 / 生产 30000） | 30.65 / **31.20** |
 
 正确性验证：太阳系八大行星介绍正确；`12×11=132`、`长江约6300公里`；
 3431-token 长上下文 prefill（走 mat-mat 修改路径）答案正确（合成数据答案 "0,0"）；
@@ -120,12 +134,22 @@ sudo systemctl daemon-reload && sudo systemctl start ds4f
 - 说明：代码侧（venv 内已装）不依赖 env 文件也可运行——`SGLANG_KT_WOA_FP8_TRITON=0`
   时 wo_a 回退 bf16 einsum，其余 SGLANG_OPT_* 默认关闭。
 
-## 6. 未做的后续机会
-- ue8m0 scale 以 uint8 存储（当前转 float32 存，占 MoE 权重带宽 ~17%）+ 整数指数加法应用
-  ——需改 BufferB 布局与巨页缓存指纹。
-- GEMV 8 行分组提高每线程 MLP；scale 与权重交错布局消除独立 scale 流。
+## 6. 第二轮试验记录与未做的后续机会
+
+第二轮额外试验（均已实测）：
+- `--num-continuous-decode-steps 4`：29.79 vs 29.59 tok/s，噪声内，无效（overlap 调度器
+  已隐藏调度开销），已回退。
+- GEMV 8 行分组（提高每线程 MLP）：242-248µs vs 4 行 240µs，寄存器压力抵消收益，已回退。
+- 剩余 gemv 群（compressor/线性注意力旁路流，~1.9ms/步求和）：实测与主流并发执行，
+  暴露成本远小于求和；但它们的带宽抢占使 wq_b 服务内 93µs vs 离线 75µs。
+
+未做的后续机会：
+- ue8m0 scale 以 uint8 存储（省 15% MoE 字节）——但 MoE 实为延迟/MLP-bound（热冷差 6%），
+  预期收益有限；需改 BufferB 布局与巨页缓存指纹。
+- 旁路流 gemv（bf16/fp32 cublas GemmEx）换 Triton GEMV，减少与主流的带宽抢占。
 - ratio-0 的第 0/1 层 wo_a 仍未走 FP8 路径（~0.3 ms/token）。
-- 本机 systemd `StartLimitBurst=12/天` 已用 11 次，当日仅剩 1 次自动重启额度。
+- CPU MoE ~235µs/层平台期：需 scale-权重交错布局或 SNC 级调优才能突破。
+- systemd StartLimitBurst 已改为 500（运维调整）。
 
 ## 7. 相关文件
 - 基准：`bench_decode.py`；线程占用：`thread_util.py`；profiler 分析：`analyze_prof*.py`
