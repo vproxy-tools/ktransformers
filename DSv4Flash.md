@@ -153,7 +153,9 @@ Step 2（架构环境变量仍按上文 8.9 设置）。实测首请求 11.3 tok
 | 全局默认开（本服务已启用） | 启动环境变量 `SGLANG_ENABLE_THINKING=1` | 已写入 `ds4f.service` |
 | 单请求开启 | 请求体加 `"chat_template_kwargs": {"thinking": true}` | 不设环境变量时的开启方式 |
 | 单请求关闭 | `"chat_template_kwargs": {"thinking": false}` | 覆盖环境变量的全局默认 |
-| 推理强度 | `"reasoning_effort": "high"` 或 `"max"` | 只接受这两个值；默认 low（无前缀注入）。也可用环境变量 `SGLANG_REASONING_EFFORT` |
+| 推理强度 | `"reasoning_effort": "low"/"medium"/"high"/"xhigh"/"max"` | 按官方文档映射：low→low（简洁思考前缀），medium/xhigh→high，high→high（默认档），max→max（最大强度前缀）。也可用环境变量 `SGLANG_REASONING_EFFORT` |
+| 官方开关写法 | `"thinking": {"type": "enabled"}` 或 `{"type": "disabled"}` | 与 `chat_template_kwargs.thinking` 等效，对齐 api-docs.deepseek.com |
+| Anthropic 风格 | `"reasoning": {"effort": "none"}` / `{"effort": "max"}` | effort=none 关思考；也接受 `"enabled": true/false` |
 
 开启后的请求示例（`reasoning_content` 为思考过程，`content` 为最终答案）：
 
