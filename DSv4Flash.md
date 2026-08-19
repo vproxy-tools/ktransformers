@@ -496,15 +496,23 @@ bucket，把 raw→full 升级移到图外按步执行（同一组纯 GPU 构建
 `deepseek_v4_backend.py`（out_graph TARGET_VERIFY 分支）+ `environ.py`。
 run_dspark.sh 已默认导出。
 
-**验证（2026-08-19，ctx=131072 + 池 135168）**：probe CLEAN；bench 5/5 PASS；
-长上下文增长探针（20/96/104/112/120K 单会话，含远程暗号回忆）全过（见
-grow_probe.py）。性能：同机 A/B（当日有 QEMU 虚机抢 CPU）图内 27.8 vs 图外
-28.2 tok/s——**修复零回退**；当日绝对值 ~27-28 与历史 39.6 的差距全部来自
-虚机竞争（虚机停后可复测）。
+**验证（2026-08-19，ctx=131072 + 池 135168 + chunk 512）**：probe CLEAN；
+bench 5/5 PASS（32.8 tok/s）；长上下文增长探针单会话 19.5K / 109K /
+**125,211 token 三级全 PASS**（位置 ~10 埋的远程暗号在 125K 上下文仍可回忆、
+新数学题正确、零复读；第四级 ~134K 超出 131072 被 400 拒绝，属预期）。
+性能：同机 A/B（当日有 QEMU 虚机抢 CPU）图内 27.8 vs 图外 28.2 tok/s——
+**修复零回退**；当日绝对值 ~27-33 与历史 39.6 的差距全部来自虚机竞争
+（虚机停后可复测）。另：>100K 的 prefill 需 chunk 512 + expandable_segments
+（513 页宽 gather 峰值），已写入 run_dspark.sh / ds4f.service。
 
 ### 9.4 验证与工具
 
 - 正确性/吞吐：`bench_dspark.py`（5 提示词贪心）；快速探针：`probe_dspark.py`
   （数学/翻译/重复词检测，退出码 0=干净）。
-- 实验实例：`run_dspark.sh` / `stop_dspark.sh`（30001 端口，CTXLEN 环境变量
-  可覆盖 context；`EAGER=1` 回退无损 eager）。
+- 长上下文：`grow_probe.py`（单会话逐级加长 20/96/112/120K，含位置 ~10 埋的
+  远程暗号回忆、新数学题、重复度检测；`--stages=` 可自定义）。
+- ctx 阈值二分：`bisect_ctx.sh CTX1 CTX2 ...`（逐 ctx 重启+短探针，判
+  CLEAN/CORRUPT；损坏与实际序列长度无关时尤其快）。
+- 实验实例：`run_dspark.sh`（30001 端口，CTXLEN/MAXTOK/MEMFRAC/PREFILL/
+  EAGER 环境变量可覆盖；`EAGER=1` 回退无损 eager）；`stop_sglang.sh` 安全
+  清理所有 sglang 进程（避免 pkill 自匹配）。
