@@ -74,21 +74,28 @@ python -c "from transformers import DeepseekV4Config; print('ok')"   # transform
 
 ## 3. 启动命令（RTX 4090D / SM_89 适配版）
 
-### 3.1 本机调优配置（长上下文 / 单并发，日常使用）
+### 3.1 本机调优配置（DSpark 投机解码 + cuda graph，日常使用）
+
+2026-08-19 起生产切换到 DSpark 投机解码栈（sglang `dspark-kt` 分支，详见第 9 节）。
+启动命令与 `ds4f.service` 一致：
 
 ```bash
 cd /home/wkgcass/ktransformers
-source .venv/bin/activate
-
-# 必需的两个 DSV4 变量（本分支 sglang-kt 硬性要求，不设第一个直接 NotImplementedError）
-export SGLANG_DSV4_MODE=2604          # 0731 模型 rope factor=16、无 qk_nope_head_dim 字段 → 2604 模式
-export SGLANG_DSV4_2604_SUBMODE=2604B # V4-Flash MXFP4 路径的 SwiGLU clamp=10.0，须与 --kt-method MXFP4 搭配
 
 # 架构变量：文档示例是 5090(SM_120)，4090/4090D 要改成 8.9
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST="8.9+PTX"
 
-python -m sglang.launch_server \
+# 思考模式默认开启（fork 时代的 SGLANG_ENABLE_THINKING 已废弃）
+export SGLANG_DEFAULT_THINKING=1
+
+# DSpark + SM89 回退栈必需（缺一不可，见 DSv4F-Opt.md §7）
+export SGLANG_RAGGED_VERIFY_MODE=static
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
+export SGLANG_OPT_USE_TOPK_V2=0
+export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
+
+/var/deepseek-v4-flash/venvs/dspark/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --model /var/deepseek-v4-flash/0731 \
   --kt-weight-path /var/deepseek-v4-flash/0731 \
@@ -96,44 +103,46 @@ python -m sglang.launch_server \
   --kt-num-gpu-experts 0 \
   --kt-cpuinfer 44 \
   --kt-threadpool-count 2 \
-  --kt-gpu-prefill-token-threshold 4096 \
   --tensor-parallel-size 1 \
-  --context-length 131072 \
+  --context-length 110592 \
   --attention-backend flashinfer \
-  --mem-fraction-static 0.90 \
+  --mem-fraction-static 0.60 \
   --chunked-prefill-size 2048 \
   --max-prefill-tokens 2048 \
   --max-running-requests 1 \
   --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \
   --trust-remote-code \
-  --cuda-graph-bs 1 \
-  --cuda-graph-max-bs 1 \
   --disable-radix-cache \
   --skip-server-warmup \
+  --speculative-algorithm DSPARK \
   --reasoning-parser deepseek-v4 \
   --tool-call-parser deepseekv4
 ```
 
-2026-08-17 实测：约 **46 秒**就绪（0 GPU 专家省去权重 swizzle），显存约 **32.2GB / 48GB**，
-解码 **19.6 tok/s**（128 token，含首 token 延迟），中英文生成与 reasoning/tool-call 解析均正常。
+2026-08-19 实测（DSpark + cuda graph，soak 2479 token）：**39.6 tok/s** 持续
+（峰值 49.8，accept 2.2-3.8），比无投机基线 26.0 **+52%**；显存约 30.7GB / 48GB，
+就绪约 80~90s（巨页权重缓存命中时）。
 
-参数说明：
+参数说明（与旧栈的差异）：
 
 | 参数 | 值 | 说明 |
 |---|---|---|
-| `--kt-num-gpu-experts 0` | 全部 256 专家驻留 CPU（双 NUMA 线程池） | 0 GPU 专家时不要加 `--kt-enable-dynamic-expert-update`（无意义） |
-| `--kt-cpuinfer 44` | CPU 推理线程数 | 48 物理核留 4 核给系统 |
-| `--context-length 131072` | 长上下文 | **必须是 page_size(256) 的倍数**（131070 这类非整页数会被向下取整浪费页，虽然能跑） |
-| `--mem-fraction-static 0.90` | 静态显存占比 | KV 池按需分配，调高不占便宜；0.95 会在长 prompt 分块 prefill 时挤压 workspace，有 OOM 风险 |
-| `--reasoning-parser deepseek-v4` / `--tool-call-parser deepseekv4` | 输出解析器 | 两个名字均已在注册表中（注意写法不同：一个带 `-` 一个不带） |
+| `--speculative-algorithm DSPARK` | 0731 自带 draft（`mtp.0.*`） | 无需 draft path；**不要用 EAGLE**（9.1 节） |
+| `--context-length 110592` | **108K，不能再大** | DSpark verify 在 >111K 下确定性损坏（9.3 节）；仍须是 page_size(256) 倍数 |
+| `--mem-fraction-static 0.60` | draft 权重 ~10.6GB 计入预算 | 0.90 会 graph 捕获失败 |
+| `--kt-cpuinfer 44` | DSpark 实测值 | 旧栈 48 未在新栈复验 |
+| cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §7.4）；前 2 步 verify 自动 eager 预热 |
+| 不再需要 | `SGLANG_DSV4_MODE/2604_SUBMODE` | 新栈从 config 读（swiglu_limit）；`--kt-gpu-prefill-token-threshold`、`--cuda-graph-bs 1` 也不再需要 |
 
 注意事项：
 
-- **长 prompt 首 token 延迟是分钟级**：131k 上下文 ÷ 2048 分块 ≈ 64 次前向，且专家全在 CPU。
-  常用长 prompt 可把 `--chunked-prefill-size` / `--max-prefill-tokens` 提到 4096 改善 TTFT
-  （代价是 prefill 显存峰值略升，mem-fraction-static 需相应留余量）。
-- `--max-running-requests 1` 与 `--cuda-graph-bs 1` 保持一致；要并发就同步调大并测显存。
+- **venv 是 `venvs/dspark` 且 sglang 为 editable**（指向 third_party/sglang 的
+  `dspark-kt` 分支检出）。运行期间不要切 sglang 分支；改分支=改生产代码。
+- **长 prompt 首 token 延迟是分钟级**：108K 上下文 ÷ 2048 分块 ≈ 54 次前向，
+  且专家全在 CPU（实测 4168-token prompt prefill+回答 14.8s）。
+- `--max-running-requests 1` 保持；要并发需同步评估 draft/显存后重测。
+- 旧栈（.venv + fork）保留可回滚，回滚步骤见 ds4f.service 文末注释块。
 
 ### 3.2 文档基准配置（备用参考，短上下文 / 双并发）
 
@@ -150,12 +159,15 @@ Step 2（架构环境变量仍按上文 8.9 设置）。实测首请求 11.3 tok
 
 | 方式 | 写法 | 说明 |
 |---|---|---|
-| 全局默认开（本服务已启用） | 启动环境变量 `SGLANG_ENABLE_THINKING=1` | 已写入 `ds4f.service` |
+| 全局默认开（本服务已启用） | 启动环境变量 `SGLANG_DEFAULT_THINKING=1` | 已写入 `ds4f.service`；输出侧的 `</think>` 切分依赖 dspark-kt 分支对 `serving_chat.py` 的补丁（explicit_thinking 探测模式下输出侧原本忽略该 env） |
 | 单请求开启 | 请求体加 `"chat_template_kwargs": {"thinking": true}` | 不设环境变量时的开启方式 |
 | 单请求关闭 | `"chat_template_kwargs": {"thinking": false}` | 覆盖环境变量的全局默认 |
 | 推理强度 | `"reasoning_effort": "low"/"medium"/"high"/"xhigh"/"max"` | 按官方文档映射：low→low（简洁思考前缀），medium/xhigh→high，high→high（默认档），max→max（最大强度前缀）。也可用环境变量 `SGLANG_REASONING_EFFORT` |
 | 官方开关写法 | `"thinking": {"type": "enabled"}` 或 `{"type": "disabled"}` | 与 `chat_template_kwargs.thinking` 等效，对齐 api-docs.deepseek.com |
 | Anthropic 风格 | `"reasoning": {"effort": "none"}` / `{"effort": "max"}` | effort=none 关思考；也接受 `"enabled": true/false` |
+
+> 注意：fork 时代的 `SGLANG_ENABLE_THINKING` 在新栈已废弃（新栈读
+> `SGLANG_DEFAULT_THINKING`，且输出侧切分要求上面提到的 serving_chat 补丁）。
 
 开启后的请求示例（`reasoning_content` 为思考过程，`content` 为最终答案）：
 
@@ -174,19 +186,10 @@ curl -s -X POST http://127.0.0.1:30000/v1/chat/completions \
 > 注意：手动方式（不经 systemd，直接跑 3.1 命令）需要自己 `export SGLANG_ENABLE_THINKING=1`
 > 才默认思考；systemd 方式由 service 文件注入，无需手动设置。
 
-### 可选：MTP 投机解码（约 1.2× 提速）
+### 投机解码
 
-在上述命令末尾追加：
-
-```bash
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --speculative-moe-runner-backend auto
-```
-
-（需额外设置 `SGLANG_FIX_MTP_HC_HIDDEN=1` 与 2604 模式配合，未在本机验证。）
+已启用 **DSpark**（第 9 节）：`--speculative-algorithm DSPARK` 一个参数，
+0731 自带 draft。**不要用 EAGLE/MTP**（draft 权重命名不匹配，见 9.1）。
 
 ## 4. 验证
 
@@ -309,6 +312,11 @@ nvidia-smi --query-gpu=memory.used --format=csv               # 确认显存归�
 
 > **与第 2 节的区别**：第 2 节是首次完整构建（`./install.sh`，带全部依赖和 extras）。
 > 本节是**改完代码后让改动生效**的正确姿势。两者不可混用——见下面的注意点 1。
+>
+> **2026-08-19 起**：生产栈 venv 是 `/var/deepseek-v4-flash/venvs/dspark`（不再
+> 是 `.venv`）。其中 sglang 是 editable 安装（改 `third_party/sglang` 源码只需
+> 重启服务）；kt-kernel 是拷贝安装（改后需按 7.2 重编并把产物同步进该 venv）。
+> 以下命令中的 venv 激活请按目标栈选择。
 
 ### 7.1 改 sglang-kt（third_party/sglang，纯 Python 包）
 
@@ -422,52 +430,58 @@ GPU 参数同样缓存到持久巨页：`third_party/sglang` 新增
 
 ## 9. DSpark / 推测解码（speculative decoding）支持情况
 
-**结论：当前栈（ktransformers + sglang-kt 0.6.4）不支持 DSpark，通用 EAGLE/MTP 替代路径
-也走不通（2026-08-17 实测），暂无可用使用方式。**
+**结论（2026-08-19 更新）：已支持并在生产启用。** sglang 换到主线基底 + kt 引擎
+移植的 `dspark-kt` 分支（third_party/sglang，基底 4ad990ba7），DSpark 投机解码
++ kt CPU 专家 + cuda graph 全部打通：**39.6 tok/s**（无投机基线 26.0，+52%；
+eager 模式 34.3）。`--speculative-algorithm DSPARK` 一个参数即可，0731 自带
+draft（`mtp.0.*`，4705 个权重键；config: block_size=5, markov_rank=256,
+target_layers=[40,41,42]）。**不要用 EAGLE**（见 9.1）。
 
-### 9.1 调查结论
+### 9.1 通用 EAGLE/MTP 路径仍不可用
 
-1. **checkpoint 素材齐备**：`/var/deepseek-v4-flash/0731` 的 `config.json` 自带 DSpark
-   元数据：`dspark_block_size=5`、`dspark_markov_rank=256`、
-   `dspark_target_layer_ids=[40,41,42]`、`dspark_noise_token_id=128799`、
-   `num_nextn_predict_layers=1`；权重含完整 3 层 draft（`mtp.0/1/2.*`，结构与主层相同，
-   含 256 专家 MoE）和 DSpark 马尔可夫头（`mtp.2.markov_head.markov_w1/w2`）。
-2. **sglang-kt 无 DSpark 实现**：整个代码库（源码与 venv 安装副本）没有任何 dspark
-   引用。社区的 DSpark 部署基于定制 `dspark-vllm` 镜像（如 DGX Spark 双机 vLLM TP=2
-   方案），与本机的 ktransformers CPU 专家栈不兼容。
-3. **通用 EAGLE/MTP 路径实测失败**：以下参数启动（整卡显存充足时）：
-   ```
-   --speculative-algorithm EAGLE \
-   --speculative-draft-model-path /var/deepseek-v4-flash/0731 \
-   --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3
-   ```
-   draft 模型（`deepseek_v4_nextn`）权重校验报错：
-   `Some weights are not initialized: {model.e_proj.weight, model.h_proj.weight,
-   model.enorm.weight, model.hnorm.weight, ...}`。原因：draft 模型期望 MTP 适配层挂在
-   `model.e_proj/...` 顶层命名，而本 checkpoint 的 `mtp.*` 布局经
-   `deepseek_v4.py::remap_weight_name_to_dpsk_hf_format` 映射后带 `model.layers.43.*`
-   前缀，两边不匹配——sglang-kt 对该 checkpoint 布局的 nextn 适配是缺口。
-4. **显存**：目标 + draft 共需额外约 2~3GB 显存（draft 的 GPU 侧权重）；生产
-   `--mem-fraction-static 0.90` 下有富余，不是障碍。
+`--speculative-algorithm EAGLE --speculative-draft-model-path ...` 启动后 draft
+模型（`deepseek_v4_nextn`）权重校验报错（`model.e_proj.weight` 等未初始化）：
+draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkpoint 的
+`mtp.*` 布局映射后带 `model.layers.43.*` 前缀。DSpark 路径不受影响（走
+`deepseek_v4_dspark` 专用模型，布局对齐）。
 
-### 9.2 若未来要启用（移植工作量估计）
+### 9.2 栈结构与关键修复
 
-本机 decode 两侧都是带宽/延迟型瓶颈（GPU ~440GB/s 显存墙 + CPU MoE ~240µs/层），
-推测解码的 verify 一次前向读同样多权重可裁决多个 token，理论收益大（DSpark 官称
-单用户加速 60%~85%）——值得做但需要：
+- venv：`/var/deepseek-v4-flash/venvs/dspark`（torch 2.11.0+cu128、flashinfer
+  cu12 系、sgl-kernel/sgl-deep-gemm cu129 索引；sglang editable 指向
+  third_party/sglang@`dspark-kt`，kt-kernel 以 torch 2.11 头文件重编）。
+  生产旧栈 `.venv`（fork）保留可回滚。
+- SM89 适配：sparse 注意力走 Triton 回退、索引器 logits 走 torch 回退、
+  topk v1、paged_mqa_metadata smem 钳制（详见 DSv4F-Opt.md §7）。
+- draft 保持纯 GPU（约 10.6GB，MEMFRAC 需 ≥0.60），target 专家全在 CPU。
+- **kt-kernel pinned-buffer 生命周期修复**（graph 损坏的根因）：CPU 专家的
+  pinned 中转 buffer 曾走单槽 temp 缓存，graph 捕获后任何 prefill 换槽都会
+  释放并被复用，replay 读写别人内存。修复后 graph 默认开启（DSv4F-Opt.md 7.4）。
+- **输出侧 thinking 切分补丁**（serving_chat.py）：V4 模板的
+  explicit_thinking 探测模式下，`SGLANG_DEFAULT_THINKING=1` 只影响 prompt 侧、
+  输出侧不切 `</think>`（全部落 content）。补丁让输出侧同样遵循
+  请求 > env 的优先级。
 
-1. 修 sglang-kt 的 nextn 权重命名适配（`mtp.*` → draft 模型参数名，涉及
-   `remap_weight_name_to_dpsk_hf_format` 的 nextn 分支与 `deepseek_v4_nextn` 的期望
-   命名对齐，可能还需处理 draft 层内 attn/ffn 的层号映射）；
-2. draft 模型的 MoE 接入 kt CPU 专家路径（draft 层同样有 256 专家，`kt-method MXFP4`
-   对 draft 的行为需验证）；
-3. verify 批次（bs×draft_tokens）的 CUDA graph 形状适配（当前 `--cuda-graph-bs 1`）;
-4. DSpark 本体（置信度调度 + 半自回归块生成 + markov 头）需等上游 sglang/vLLM 实现，
-   或整体切换到 dspark-vllm 定制栈（放弃 ktransformers CPU 专家方案，需大显存 GPU）。
+### 9.3 已知限制：context ≤ 110592（108K）
 
-启用后的预期参数形态（修好适配后）：
-```
---speculative-algorithm EAGLE --speculative-num-steps 2-4 \
---speculative-eagle-topk 1 --speculative-num-draft-tokens 3-5
-```
-（DSpark 原生 block_size=5。）
+DSpark verify 在 **context > 111K 时确定性损坏**（重复短语、accept 异常偏高、
+短序列也坏——按 context 静态分配的状态问题）。二分实测：
+
+| context | 结果 |
+|---|---|
+| 8192 / 32768 / 98304 / 106496 / **110592** | ✅ 干净（数学/翻译/散文/4k-token 长 prompt 全对） |
+| 111616 / 112640 / 114688 / 131072 | ❌ 损坏（重复短语，essay 重复 30-41 处） |
+
+生产取 **110592**（page 256 倍数 + 边界下留余量）。110592 下实测：bench 5/5
+PASS（33 tok/s，比 8192 配置的 38 略低——长上下文元数据开销）、4168-token
+prompt 理解正确、thinking 默认开且切分正常。排查记录：已排除 KV 池容量
+（三档 context 池都是 801536 token）、paged_mqa_metadata smem 钳制（batch 与
+context 无关）；根因待查（嫌疑：按 MAX_SEQ_LEN_FOR_CAPTURE=131072 派生的
+page-table/索引宽度在 verify 图捕获中的某处越界或错位），修复后可放开到 131072。
+
+### 9.4 验证与工具
+
+- 正确性/吞吐：`bench_dspark.py`（5 提示词贪心）；快速探针：`probe_dspark.py`
+  （数学/翻译/重复词检测，退出码 0=干净）。
+- 实验实例：`run_dspark.sh` / `stop_dspark.sh`（30001 端口，CTXLEN 环境变量
+  可覆盖 context；`EAGER=1` 回退无损 eager）。

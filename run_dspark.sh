@@ -47,7 +47,7 @@ exec python -m sglang.launch_server \
   --kt-cpuinfer "$KT_CPUINFER" \
   --kt-threadpool-count "$KT_TP_COUNT" \
   --tensor-parallel-size 1 \
-  --context-length 8192 \
+  --context-length "${CTXLEN:-110592}" \
   --attention-backend flashinfer \
   --mem-fraction-static "${MEMFRAC:-0.30}" \
   --chunked-prefill-size 2048 \
