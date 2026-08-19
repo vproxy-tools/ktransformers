@@ -424,6 +424,31 @@ DeepSeek-V4-Flash 的 CPU 侧常驻权重（MXFP4 路由专家，每个 NUMA 约
 - 大页池容量（当前 node0=300、node1=364 个 1 GiB 页）需 ≥ 常驻权重 + 其它大页用户；
 - 首次冷加载若中途崩溃，未写标记的层会在下次启动自动重写，无需人工干预。
 
+**2026-08-20 现状：缓存未接通（数据目录缺失）。** `/dev/hugepages`（hugetlbfs 挂载点）为
+root:root 755，8/19 08:58 虚机启动时挂载点被重建，`kt_weights/` 目录消失，普通用户无法
+自行创建 → C++ `hugepage_weights::enabled()` 静默回落堆分配（日志无任何 hugepage 行）。
+代码钩子本身完好（C++ alloc/commit/reuse + python `check_reusable` 快路径都在，与
+MXFP4 layerwise prefill 的 host 写出兼容——它读转换后的 BufferB）。重新接通只需 root 一次性：
+
+```bash
+sudo mkdir -p /dev/hugepages/kt_weights && sudo chown wkgcass:wkgcass /dev/hugepages/kt_weights
+# 陈旧标记已清理（2026-08-20）；下次启动冷加载约 1-2 分钟/全模型，之后 REUSED 秒级
+```
+
+目录建好后可先离线验证（不碰 GPU、可与生产共存，产物直接被服务器复用）：
+
+```bash
+cd /var/deepseek-v4-flash/venvs/dspark
+./bin/python /home/wkgcass/ktransformers/hp_weight_check.py 0   # 第一遍:冷(转换+commit)
+./bin/python /home/wkgcass/ktransformers/hp_weight_check.py 0   # 第二遍:热(打印 REUSED)
+```
+
+之后 ds4f 任意一次重启自然接通（冷一次，此后每次 REUSED、`load_weight` 显著缩短）。
+另：所有 kt-kernel MoE 基准脚本已在文件头强制 `KT_HUGEPAGE_WEIGHTS=0`——合成权重
+绝不写入持久 arena（任何一个 bench 跑一遍都会按 cursor 顺序覆盖真实层、打断全部
+marker 复用链，虽然下次启动会自愈但整轮冷加载）。若挂载点再次被重建（虚机重启），
+重复上面的 sudo 两步即可；即使忘了 sudo，启动也只是回落堆分配，不报错。
+
 ### 8.1 GPU 参数的持久巨页缓存
 
 回答一个常见问题：加载是**区分** GPU/CPU 参数的——路由专家（`layers.*.ffn.experts.*`，约 146 GiB）
@@ -520,3 +545,50 @@ bench 5/5 PASS（32.8 tok/s）；长上下文增长探针单会话 19.5K / 109K 
 - 实验实例：`run_dspark.sh`（30001 端口，CTXLEN/MAXTOK/MEMFRAC/PREFILL/
   EAGER 环境变量可覆盖；`EAGER=1` 回退无损 eager）；`stop_sglang.sh` 安全
   清理所有 sglang 进程（避免 pkill 自匹配）。
+
+### 9.5 SyncArgs 泄漏修复与图捕获 use-after-free 事故（2026-08-20）
+
+`kt-kernel/cpu_backend/cpuinfer.h` 的 `sync_with_cuda_stream()` 每次 `new SyncArgs`
+从不释放（实测 ~32 B/次 ≈ 生产 ~12 MB/h）。修复时踩过一个必须记录的坑：
+
+**第一版修复（回调里无条件 `delete args`）导致生产 SIGSEGV 崩溃循环。** 根因：
+decode/verify 的 cuda graph **捕获期间**也调用 `sync_with_cuda_stream`——
+`cudaLaunchHostFunc` 连同 `args` 指针被录成图内 host 节点，**每次图回放都用同一
+指针重跑回调**。首次回放 delete 后，第二次回放变成 use-after-free + double-free →
+堆损坏 → 主线程死在 `pthread_mutex_lock`（faulthandler 栈可见）。也就是说，原代码
+的"泄漏"里有一部分是**被捕获图的函数性需求**（args 必须永生）。
+
+**正确修复**（已部署 ds4f，三级验证通过）：启动时 `cudaStreamIsCapturing()` 探测——
+eager 一次性回调标记 `owned=true` 回调自删；捕获流标记 `owned=false` 永生（回放零分配，
+只在捕获时分配一次，量级为启动期常数）。验证：eager 1M 次 RSS 增长 -0.9 B/次
+（malloc_trim 后）；图 5000 次回放 × 4 节点无崩溃；生产 probe CLEAN + bench
+5/5 PASS 33.54 tok/s；MoE 微基准 M=1 227µs（基线 233µs）无回退。
+诊断要点：紧循环 RSS 读数含"已 free 未归还"的驻留页（纯 C 跨线程 malloc/free
+模式本身读出 ~28 B/次），**必须 malloc_trim 后再测**；CPU-only `sync()` 路径因
+指针不逃逸被编译器优化掉分配，泄漏只在 CUDA 路径。
+
+## 10. 旧栈 8 个 perf env 在新栈（dspark-kt）的复验（2026-08-20）
+
+旧栈（.venv / sglang-kt 主线基底）为性能设过 8 个 env。逐个在新栈代码审计 +
+可执行处实测后的结论——**一个都不要搬，4 个默认已开、2 个已废弃、2 个开启有害**：
+
+| 旧栈 env | 新栈状态 | 结论 |
+|---|---|---|
+| `SGLANG_OPT_FUSE_WQA_WKV=1` | `environ.py:1303` 默认 `EnvBool(True)` | 冗余，不设即开 |
+| `SGLANG_OPT_USE_JIT_NORM=1` | `environ.py:1316` 默认 `EnvBool(True)` | 冗余，不设即开 |
+| `SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1` | `environ.py:1317` 默认 `EnvBool(True)`（仅 HIP 分支强制关） | 冗余，不设即开 |
+| `SGLANG_OPT_USE_FUSED_STORE_CACHE=1` | `environ.py:1315` 默认 `EnvBool(True)` | 冗余，不设即开 |
+| `SGLANG_KT_WOA_FP8_TRITON=1` | 新栈无任何读取点（仅 environ.py 定义+docstring） | 已废弃 |
+| `SGLANG_OPT_USE_OVERLAP_STORE_CACHE=1` | 新栈无任何读取点 | 已废弃 |
+| `SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD=1` | 默认 False；新栈**无融合消费方**，=1 只是跳过 `output.mul_(rsf)` | **禁用**：模型 rsf=1.5，=1 会静默丢掉 ×1.5，三处 GPU MoE 路径（marlin/triton_kernels/trtllm）全部算错 |
+| `SGLANG_KT_FP8_LMHEAD=1` | 读取点在 `logits_processor.py:788`（head.weight BF16 129280×4096 满足条件） | **禁用**：见下 |
+
+`SGLANG_KT_FP8_LMHEAD` 实测细节（单元级，未动生产）：FP8 GEMV 内核数学正确
+（vs 手工反量化参照误差 0.037），T=1 提速 **1.96×**（2242→1143µs，读带宽减半），
+但 T=2 持平、T=4 反而 0.5×（einsum 按 T 逐行读权重），DSpark 下仅 draft 步受益。
+决定性否决点是 **stash 构建有数据竞争**：`build_lmhead_fp8` 的
+`weight[...].to("cpu", non_blocking=True)` 后立即在 CPU 上量化，同一权重两次构建
+产物**比特不同**且权重重建误差 ~0.007（健康 fp8 应为 ~0.0003，差 20×），会把
+logits 静默算坏。若未来要启用：先给 D2H 后补 `torch.cuda.synchronize()`，复测
+重建误差回到 ~2-3% 再说。旧栈当时开着此 env，质量影响未评估（存疑）。
+ds4f.service 回滚块中的旧栈 env 清单已同步加注（FUSE_RSF 标注禁止、两个废弃）。

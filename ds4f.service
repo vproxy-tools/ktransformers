@@ -43,12 +43,18 @@ Environment=SGLANG_OPT_USE_TOPK_V2=0
 # SM89: 索引器 logits 走 torch 回退（deep_gemm 是 SM90+）
 Environment=SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 
-# 旧栈的 8 个 perf env（SGLANG_KT_WOA_FP8_TRITON / SGLANG_KT_FP8_LMHEAD /
-# SGLANG_OPT_FUSE_WQA_WKV / SGLANG_OPT_USE_JIT_NORM /
-# SGLANG_OPT_USE_MULTI_STREAM_OVERLAP / SGLANG_OPT_USE_FUSED_STORE_CACHE /
-# SGLANG_OPT_USE_OVERLAP_STORE_CACHE / SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD）
-# 尚未在新栈验证，暂不启用；SGLANG_DSV4_MODE / SGLANG_DSV4_2604_SUBMODE /
-# SGLANG_ENABLE_THINKING 为 fork 专属，新栈不需要（见 DSv4F-Opt.md 7.5）。
+# 旧栈的 8 个 perf env 已于 2026-08-20 在新栈逐一复验（DSv4Flash.md §10）：
+#   4 个默认已开（FUSE_WQA_WKV / USE_JIT_NORM / USE_MULTI_STREAM_OVERLAP /
+#     USE_FUSED_STORE_CACHE，environ.py EnvBool(True)，无需设置）；
+#   2 个已废弃（SGLANG_KT_WOA_FP8_TRITON / SGLANG_OPT_USE_OVERLAP_STORE_CACHE，
+#     新栈无读取点）；
+#   2 个开启有害，禁止搬用：
+#     SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD=1 —— 新栈无融合消费方，会静默丢掉
+#       rsf=1.5（三处 GPU MoE 路径全部算错）；
+#     SGLANG_KT_FP8_LMHEAD=1 —— build_lmhead_fp8 存数据竞争，两次构建产物
+#       比特不同且权重重建误差 ~20×，会静默打坏 logits。
+# SGLANG_DSV4_MODE / SGLANG_DSV4_2604_SUBMODE / SGLANG_ENABLE_THINKING 为
+# fork 专属，新栈不需要（见 DSv4F-Opt.md 7.5）。
 
 # 子进程（scheduler / tokenizer manager）与 JIT 缓存需要 HOME 和 venv PATH
 Environment=HOME=/home/wkgcass
@@ -90,6 +96,9 @@ ExecStart=/var/deepseek-v4-flash/venvs/dspark/bin/python -m sglang.launch_server
 # --kt-gpu-prefill-token-threshold 与 --cuda-graph-bs 1 为旧栈参数，新栈不需要。
 
 # --- 回滚旧栈（如需）：恢复以下三处 ---
+# 注意（2026-08-20 复验）：以下旧栈 env 仅在旧栈自身有效；
+#   SGLANG_KT_FP8_LMHEAD 的 stash 构建竞争在新栈实测会算坏 logits
+#   （旧栈 torch 版本不同，但建议回滚后也先跑 probe_dspark.py 验证质量）。
 # Environment=PATH=/home/wkgcass/ktransformers/.venv/bin:/usr/local/bin:/usr/bin:/bin
 # 并恢复旧环境变量：SGLANG_DSV4_MODE=2604 / SGLANG_DSV4_2604_SUBMODE=2604B /
 #   SGLANG_ENABLE_THINKING=1 / SGLANG_KT_WOA_FP8_TRITON=1 / SGLANG_KT_FP8_LMHEAD=1 /
