@@ -225,21 +225,44 @@ kvcache-ai fork（基于 2 月主线）没有 DSpark，因此开新分支 **`dsp
 - DSpark(eager,static) 比无投机基线 **+32%**（34.3 vs 26.0 tok/s，5 提示词 1812
   token 总平均；decode 峰值 46 tok/s 出现在 accept 高的数学题上）。
 - 首请求含 Triton JIT 预热（~3-6 tok/s），稳态请以第二请求起算。
+- 2026-08-19 复验（`bench_dspark.py`，5 提示词 702 token）：eager+static 5/5 PASS、
+  输出正确，30.6 tok/s（该 prompt 集思考更短/accept 略低，非回退）。
 
-### 7.4 已知问题：verify 的 cuda-graph 回放损坏（SM89 回退栈）
+### 7.4 已知问题：verify 的 cuda-graph 回放损坏（SM89 回退栈，2026-08-19 二轮深挖）
 
-现象：开图时长生成出现系统性重复词（"散文 散文"），accept len 精确恒定 2.00
-（非真实分布）；关图后同样提示词完全正确、accept 2.9-3.3 正常波动。eager verify
-本身无损，故定位为**图回放数据依赖问题**而非算法问题。嫌疑：SM89 回退路径
-（Triton extra-key 注意力 / torch 索引器 / topk v1）中某宿主侧数据依赖在 capture
-时固化了过期值——这些特化分支只在 verify 图内首次执行（decode 图走的是
-HAS_EXTRA=False 特化、且经 eager 预热）。修复方向：verify 图捕获前对
-HAS_EXTRA=True 特化做 eager 预热；或对照 eager 逐张量 diff 回放输出。修好后预计
-~38-39 tok/s（再 +15%）。
+现象：开图时长生成出现系统性重复词（"散文 散文"），accept len 恒 2.00；关图后同样
+提示词完全正确。同进程 A/B（graph 先跑、结果 clone 后 eager 重跑同输入）证明：
+
+1. **graph 重放的数值计算完全正确**——logits 与 hidden_states 对 eager 逐位相等
+   （maxdiff=0.0000，连续 120+ 步）；以下每步状态也逐位一致（graph 后 vs eager 后
+   checksum 相同）：SWA KV、c4/c128 压缩 KV、全部注意力 metadata（seq_lens_casual/
+   swa_lens/page_table/swa_out_cache_loc，均随 replay 正确刷新）。
+2. **首个 verify（graph 或 eager 均是）返回的 hidden_states 是未初始化池内存**
+   （|x|≈2.9e5），commit_hidden 会把垃圾注入 draft KV——已加 workaround：前 2 步
+   verify 强制 eager 预热（`dspark_verify.py`，env `SGLANG_DSv4_VERIFY_EAGER_WARMUP`，
+   默认 2，`--disable-cuda-graph` 时自动失效）。修掉它之后首个请求完全正确。
+3. **残余 bug 与数值无关、确定性**：纯 graph 连续 replay 约 15-20 步后输出开始劣化
+   （token 重复、accept 掉到 1.0），两种配置下损坏输出逐字节相同；偶发原生段错误
+   （faulthandler 栈为纯 native 线程，无 python 帧——指向 kt C++ 线程池）。每步
+   跟一次 eager 重跑（副作用）即可永久保持正确 → 缺的不是计算而是**每步一次的
+   eager submit**。
+4. 已排除：draft 侧 graph（禁 draft 图后损坏不变）、kt 的 `_cpu_stream` 跨流
+   （`SGLANG_KT_HYBRID_NO_CPU_STREAM=1` 无效）、FP8 LUT、staging buffer 轮换、
+   metadata copy_ 链。
+
+结论：残余根因在 **kt-kernel C++ wrapper 的 replay 记账**——`kt_ep_wrapper.apply`
+的 CPU 专家 submit/sync 是宿主侧调用；纯 replay 期间 python 不执行，C++ 侧的每次
+submit 才推进的内部状态（任务队列/缓冲索引）在连续 replay 下与录制的 D2H/H2D
+不同步。修复需要 kt-kernel C++ 侧支持 replay 触发（或在 verify 步 graph 外重放
+submit），属 kt 内核工程，暂以 `--disable-cuda-graph` 规避（eager 无损）。修好后
+预计 ~38-39 tok/s（再 +15%）。调试技法（已从代码移除、此处留档）：同进程
+graph→clone→eager 三连对比；`_dbg_full_meta_list` 抓 graph 池内 metadata 张量
+replay 后读值；KV 池 uint8 checksum 对比。
 
 ### 7.5 后续机会
 
-- 修 verify 图回放 bug（见 7.4）。
+- 修 verify 图残余 bug：在 kt-kernel C++ wrapper 加 replay 触发路径（见 7.4 结论）。
+  修好 + KEEP_GRAPHS=1 实测对比。
 - 索引器 logits 从 torch 回退换 tilelang（`SGLANG_OPT_USE_TILELANG_INDEXER=1`，
   需验证 SM89 编译）——当前 torch 回退是 eager 路径的主要 GPU 开销之一。
 - 把主线自带的 SGLANG_OPT_FP8_WO_A_GEMM 等消费者级优化在 SM89 上验证开启，
@@ -254,5 +277,6 @@ HAS_EXTRA=True 特化做 eager 预热；或对照 eager 逐张量 diff 回放输
 - GPU 微基准：`bench_gpu_ops.py` / `bench_gpu_cold.py` / `scan_w8a8_cfg.py`
 - CPU MoE 微基准：`kt-kernel/bench/bench_fp4_moe_cold.py`（随机路由，L2 冷）
 - 实验实例脚本：`run_exp.sh` / `stop_exp.sh`（与生产并行，30001 端口，共享巨页权重缓存）
-- DSpark 实验：`run_dspark.sh` / `stop_dspark.sh`（30001 端口，venv-dspark）；
+- DSpark 实验：`run_dspark.sh` / `stop_dspark.sh`（30001 端口，venv-dspark；
+  `KEEP_GRAPHS=1` 开 graph 调试）；基准 `bench_dspark.py`（5 提示词贪心，校验+吞吐）；
   sglang 分支 `third_party/sglang@dspark-kt`

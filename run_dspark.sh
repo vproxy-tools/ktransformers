@@ -26,11 +26,16 @@ SPEC_ARGS=""
 if [ "${DSPARK:-0}" = "1" ]; then
     export SGLANG_RAGGED_VERIFY_MODE="${SGLANG_RAGGED_VERIFY_MODE:-static}"
     SPEC_ARGS="--speculative-algorithm DSPARK"
-    # graph replay corrupts verify on the SM89 fallback stack; eager is lossless
-    case " $EXTRA_ARGS " in
-        *" --disable-cuda-graph "*) ;;
-        *) EXTRA_ARGS="$EXTRA_ARGS --disable-cuda-graph" ;;
-    esac
+    # 默认禁 graph（安全）：kt CPU 专家 C++ wrapper 的 replay 记账在纯 graph
+    # 连续 replay 下确定性损坏输出（偶发原生段错误），详见 DSv4F-Opt.md §7.4。
+    # eager 无损 34.3 tok/s。KEEP_GRAPHS=1 开 graph 实验（前 2 步 verify 已有
+    # eager 预热 workaround，但长时间运行仍会劣化——仅调试用）。
+    if [ "${KEEP_GRAPHS:-0}" != "1" ]; then
+        case " $EXTRA_ARGS " in
+            *" --disable-cuda-graph "*) ;;
+            *) EXTRA_ARGS="$EXTRA_ARGS --disable-cuda-graph" ;;
+        esac
+    fi
 fi
 
 exec python -m sglang.launch_server \
