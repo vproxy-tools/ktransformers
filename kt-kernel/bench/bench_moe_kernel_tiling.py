@@ -18,6 +18,7 @@ Usage examples:
     --n_block_up_gate 256 --n_block_down 1024 --n_block 64 --m_block 320 --k_block 7168
 """
 import os
+os.environ.setdefault("KT_HUGEPAGE_WEIGHTS", "0")  # synthetic weights: never touch the persistent arena
 import sys
 import time
 import argparse

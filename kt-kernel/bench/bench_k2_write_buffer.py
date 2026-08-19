@@ -7,6 +7,7 @@ Uses two MOE instances that alternate writing to simulate realistic multi-layer 
 """
 import json
 import os
+os.environ.setdefault("KT_HUGEPAGE_WEIGHTS", "0")  # synthetic weights: never touch the persistent arena
 import platform
 import subprocess
 import sys

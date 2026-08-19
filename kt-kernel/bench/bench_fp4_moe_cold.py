@@ -15,6 +15,8 @@ import os
 import sys
 import time
 
+os.environ.setdefault("KT_HUGEPAGE_WEIGHTS", "0")  # synthetic weights: never touch the persistent arena
+
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "build"))

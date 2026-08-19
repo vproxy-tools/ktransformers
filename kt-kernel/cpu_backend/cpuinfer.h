@@ -98,23 +98,39 @@ class CPUInfer {
   struct SyncArgs {
     CPUInfer* cpuinfer;
     size_t allow_n_pending;
+    // Eager one-shot launches run the callback exactly once, so the callback
+    // frees its args. A launch into a CAPTURING stream records a host node
+    // that replays the SAME args pointer on every graph replay — those args
+    // must live forever (freeing them turns later replays into use-after-free
+    // and double-free, corrupting the heap).
+    bool owned;
   };
 
   static void sync_(void* sync_args) {
     SyncArgs* args = (SyncArgs*)sync_args;
     args->cpuinfer->task_queue_->sync(args->allow_n_pending);
+    if (args->owned) delete args;
   }
 
   void sync(size_t allow_n_pending = 0) {
-    SyncArgs* args = new SyncArgs{this, allow_n_pending};
-    sync_(args);
+    task_queue_->sync(allow_n_pending);
   }
 #ifndef KTRANSFORMERS_CPU_ONLY
   void sync_with_cuda_stream(intptr_t user_cuda_stream, size_t allow_n_pending = 0) {
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS) || \
     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA)
-    SyncArgs* args = new SyncArgs{this, allow_n_pending};
-    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)args);
+    cudaStream_t stream = (cudaStream_t)user_cuda_stream;
+    bool owned = false;
+#if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusNone) {
+      owned = true;
+    }
+#endif
+    SyncArgs* args = new SyncArgs{this, allow_n_pending, owned};
+    if (cudaLaunchHostFunc(stream, (cudaHostFn_t)&sync_, (void*)args) != cudaSuccess && owned) {
+      delete args; // launch failed; the callback will never run
+    }
 #endif
   }
 #endif

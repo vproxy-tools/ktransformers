@@ -11,6 +11,7 @@ Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
 """
 import argparse
 import os
+os.environ.setdefault("KT_HUGEPAGE_WEIGHTS", "0")  # synthetic weights: never touch the persistent arena
 import sys
 import time
 import json

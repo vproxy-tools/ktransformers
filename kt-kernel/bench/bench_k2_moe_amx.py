@@ -6,6 +6,7 @@ Benchmark AMX_K2_MOE_TP int4 path with packed weights and BF16 scales.
 import json
 import math
 import os
+os.environ.setdefault("KT_HUGEPAGE_WEIGHTS", "0")  # synthetic weights: never touch the persistent arena
 import platform
 import subprocess
 import sys
