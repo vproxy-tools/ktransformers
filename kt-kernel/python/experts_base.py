@@ -95,6 +95,12 @@ class KExpertsCPUBuffer:
         if batch_size in cls.capture_buffers:
             return cls.capture_buffers[batch_size]
         if batch_size == cls.temp_bs:
+            # The warmup (eager) run usually allocates this size already; the
+            # capture run then hits this early return with the SAME instance,
+            # so it must be promoted here too or the graph still bakes
+            # pointers into a freeable buffer (see comment below).
+            if torch.cuda.is_current_stream_capturing():
+                cls.capture_buffers[batch_size] = cls.temp_buffer
             return cls.temp_buffer
 
         input_tensor_cpu = [
@@ -135,7 +141,19 @@ class KExpertsCPUBuffer:
             bsz_tensor_cpu,
             output_gpu,
         )
-        if batch_size in cls.capture_bs:
+        # CUDA graphs bake raw pointers to these pinned buffers into their
+        # recorded D2H/H2D copies and cudaLaunchHostFunc host nodes. The
+        # single-slot temp cache below drops the last Python reference
+        # whenever a different batch size is requested (e.g. an eager
+        # prefill switching decode's small slots to a 2048-token chunk);
+        # the freed pinned blocks are then handed to the next same-size
+        # allocation, and graph replays read/write foreign live tensors
+        # (deterministic output corruption; unbounded expert ids read by
+        # the CPU task can also segfault native code). Any size first
+        # requested while a stream capture is active is graph-referenced:
+        # keep it alive forever. Prefill-sized (never captured) buffers
+        # still go through the one-slot temp cache.
+        if batch_size in cls.capture_bs or torch.cuda.is_current_stream_capturing():
             cls.capture_buffers[batch_size] = cur_buffer
         cls.temp_bs = batch_size
         cls.temp_buffer = cur_buffer
