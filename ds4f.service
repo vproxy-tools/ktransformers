@@ -32,6 +32,10 @@ Environment=SGLANG_DEFAULT_THINKING=1
 
 # --- DSpark + SM89 回退栈必需 ---
 Environment=SGLANG_RAGGED_VERIFY_MODE=static
+# 2026-08-19: verify 元数据图外构建（ctx>111.4K 图内录制会损坏生成，见 DSv4Flash.md 9.3）
+Environment=SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1
+# 2026-08-19: 131072（513 页宽）prefill 的 indexer gather 峰值需要小 chunk + 消碎片
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # SM89: deep_gemm (SM90+) 路径关闭，走 torch/triton 回退
 Environment=SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
 # SM89: topk v2 kernel 用线程块集群（SM90+ only）
@@ -61,12 +65,12 @@ ExecStart=/var/deepseek-v4-flash/venvs/dspark/bin/python -m sglang.launch_server
   --kt-cpuinfer 44 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
-  --context-length 110592 \
+  --context-length 131072 \
   --attention-backend flashinfer \
   --mem-fraction-static 0.60 \
-  --max-total-tokens 114688 \
-  --chunked-prefill-size 2048 \
-  --max-prefill-tokens 2048 \
+  --max-total-tokens 135168 \
+  --chunked-prefill-size 512 \
+  --max-prefill-tokens 512 \
   --max-running-requests 1 \
   --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \

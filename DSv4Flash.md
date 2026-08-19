@@ -104,12 +104,12 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
   --kt-cpuinfer 44 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
-  --context-length 110592 \
+  --context-length 131072 \
   --attention-backend flashinfer \
   --mem-fraction-static 0.60 \
-  --max-total-tokens 114688 \
-  --chunked-prefill-size 2048 \
-  --max-prefill-tokens 2048 \
+  --max-total-tokens 135168 \
+  --chunked-prefill-size 512 \
+  --max-prefill-tokens 512 \
   --max-running-requests 1 \
   --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \
@@ -123,16 +123,22 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 
 2026-08-19 实测（DSpark + cuda graph + KV 池右移）：**39.6 tok/s** 持续
 （峰值 49.8，accept 2.2-3.8），比无投机基线 26.0 **+52%**；显存约
-**24.5GB / 48GB**（`--max-total-tokens 114688` 右移 KV 池后；右移前 30.7GB），
-就绪约 80~90s（巨页权重缓存命中时）。
+**24.5GB / 48GB**（KV 池右移后；右移前 30.7GB），就绪约 80~90s（巨页权重
+缓存命中时）。同日放开到 131072（9.3 节修复，`--max-total-tokens 135168`），
+显存约 24.4GB。
+
+注意：当日本机有一台 QEMU 虚机（~119% CPU）在抢 CPU 专家核，当日所有
+吞吐实测都被压到 ~27-28 tok/s（开关修复前后同水平，即修复本身零回退）；
+上面的 39.6 是无虚机竞争时的数据。虚机停后可复测。
 
 参数说明（与旧栈的差异）：
 
 | 参数 | 值 | 说明 |
 |---|---|---|
 | `--speculative-algorithm DSPARK` | 0731 自带 draft（`mtp.0.*`） | 无需 draft path；**不要用 EAGLE**（9.1 节） |
-| `--context-length 110592` | **108K，不能再大** | DSpark verify 在 >111K 下确定性损坏（9.3 节）；仍须是 page_size(256) 倍数 |
-| `--max-total-tokens 114688` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 6.2GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
+| `--context-length 131072` | 模型上限 128K | 需 `SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1`（9.3 节修复，run_dspark.sh 已默认导出）；须是 page_size(256) 倍数 |
+| `--chunked-prefill-size 512` | 131072 必需 | 513 页宽下 torch indexer gather 的 prefill 瞬时峰值 ~17GB（2048 chunk）会 OOM；512 后峰值 ~4-7GB。须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。仅影响 prefill 速度，decode 不变；90K 以下 prompt 可用 1024 |
+| `--max-total-tokens 135168` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 ~6GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
 | `--mem-fraction-static 0.60` | draft 权重 ~10.6GB 计入预算 | 0.90 会 graph 捕获失败；池大小由 max-total-tokens 决定后此值仅作预算校验 |
 | `--kt-cpuinfer 44` | DSpark 实测值 | 旧栈 48 未在新栈复验 |
 | cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §7.4）；前 2 步 verify 自动 eager 预热 |
@@ -465,23 +471,36 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
   输出侧不切 `</think>`（全部落 content）。补丁让输出侧同样遵循
   请求 > env 的优先级。
 
-### 9.3 已知限制：context ≤ 110592（108K）
+### 9.3 已修复：verify 元数据图外构建，context 放开到 131072
 
-DSpark verify 在 **context > 111K 时确定性损坏**（重复短语、accept 异常偏高、
-短序列也坏——按 context 静态分配的状态问题）。二分实测：
+**症状（2026-08-18 发现）**：DSpark + cuda graph 下，`--context-length` 超过
+约 111.4K 后生成确定性损坏（重复短语、远程注意力劣化；实际序列长度无关——
+ctx=131072 下 4K 短 prompt 也坏）。二分边界：111360 ✅ / 111616 ❌。
 
-| context | 结果 |
-|---|---|
-| 8192 / 32768 / 98304 / 106496 / **110592** | ✅ 干净（数学/翻译/散文/4k-token 长 prompt 全对） |
-| 111616 / 112640 / 114688 / 131072 | ❌ 损坏（重复短语，essay 重复 30-41 处） |
+**排除项**（均实测）：实际序列长度（短 prompt 也坏）、KV 池容量（池 114688
+与 135168 都出现过干净/损坏组合）、page 宽度（111360 与 111616 同为 437 页）、
+draft 图（draft 图开 + verify eager = 干净）、verify 元数据数值（图回放后逐字段
+对比 eager 重建，page_table/swa/c4/c128/positions 全等）、压缩计划字节
+（plan_c/plan_w 全等）、两条元数据构建路径互比（raw 路径 vs _old 路径全等）。
 
-生产取 **110592**（page 256 倍数 + 边界下留余量）。110592 下实测：bench 5/5
-PASS（33 tok/s，比 8192 配置的 38 略低——长上下文元数据开销）、4168-token
-prompt 理解正确、thinking 默认开且切分正常。排查记录：已排除 KV 池容量
-（三档 context 池都是 801536 token；且右移池到 135168 后 131072 仍损坏——
-池尺寸不是协因）、paged_mqa_metadata smem 钳制（batch 与 context 无关）；
-根因待查（嫌疑：按 MAX_SEQ_LEN_FOR_CAPTURE=131072 派生的 page-table/索引
-宽度在 verify 图捕获中的某处越界或错位），修复后可放开到 131072。
+**根因（定位到机制层面）**：`SGLANG_PREP_IN_CUDA_GRAPH=1`（默认）把 verify 的
+raw→full 元数据构建（`make_forward_metadata_from_raw_verify` 一族 triton/torch
+算子）**录制进 verify cuda graph**。录制后所有可读产物都正确，但生成损坏——
+即损坏源于"构建被录制"这一形态本身（疑似捕获期内存池别名/算子时序效应，
+回放后值正确、前向中途被污染），在 req_to_token 宽度超过 ~437 页时触发。
+`SGLANG_PREP_IN_CUDA_GRAPH=0`（全局图外）可修但有 `.tolist()` CPU 同步。
+
+**修复**：新增 `SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1`——仅对 TARGET_VERIFY
+bucket，把 raw→full 升级移到图外按步执行（同一组纯 GPU 构建器，无 CPU 同步），
+图内只录模型层；draft decode 保持图内快速路径。改动：
+`deepseek_v4_backend.py`（out_graph TARGET_VERIFY 分支）+ `environ.py`。
+run_dspark.sh 已默认导出。
+
+**验证（2026-08-19，ctx=131072 + 池 135168）**：probe CLEAN；bench 5/5 PASS；
+长上下文增长探针（20/96/104/112/120K 单会话，含远程暗号回忆）全过（见
+grow_probe.py）。性能：同机 A/B（当日有 QEMU 虚机抢 CPU）图内 27.8 vs 图外
+28.2 tok/s——**修复零回退**；当日绝对值 ~27-28 与历史 39.6 的差距全部来自
+虚机竞争（虚机停后可复测）。
 
 ### 9.4 验证与工具
 
