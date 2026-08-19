@@ -127,9 +127,13 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 缓存命中时）。同日放开到 131072（9.3 节修复，`--max-total-tokens 135168`），
 显存约 24.4GB。
 
-注意：当日本机有一台 QEMU 虚机（~119% CPU）在抢 CPU 专家核，当日所有
-吞吐实测都被压到 ~27-28 tok/s（开关修复前后同水平，即修复本身零回退）；
-上面的 39.6 是无虚机竞争时的数据。虚机停后可复测。
+**吞吐口径澄清（2026-08-19 深夜复测）**：DSpark 下 tok/s = accept/周期，
+高度依赖提示词内容——数数类（高可预测）70.8 tok/s、bench 5 题混合
+32.5~35.1（ALL PASS）、单一散文题 soak ~28（该类内容 accept 仅 ~2.3）。
+机器本身无损：MXFP4 MoE 微基准 234.2µs/层，与 8/17 基线 233.5µs 逐微秒
+持平；GPU 时钟正常；QEMU 虚机（node0、~1.2 核）对 node1 专家核与 MoE
+无可测影响。不同日子的"持续 tok/s"差异主要来自 soak 提示词的 accept
+分布，而非性能回退。
 
 参数说明（与旧栈的差异）：
 
@@ -140,7 +144,7 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 | `--chunked-prefill-size 512` | 131072 必需 | 513 页宽下 torch indexer gather 的 prefill 瞬时峰值 ~17GB（2048 chunk）会 OOM；512 后峰值 ~4-7GB。须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。仅影响 prefill 速度，decode 不变；90K 以下 prompt 可用 1024 |
 | `--max-total-tokens 135168` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 ~6GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
 | `--mem-fraction-static 0.60` | draft 权重 ~10.6GB 计入预算 | 0.90 会 graph 捕获失败；池大小由 max-total-tokens 决定后此值仅作预算校验 |
-| `--kt-cpuinfer 44` | DSpark 实测值 | 旧栈 48 未在新栈复验 |
+| `--kt-cpuinfer 48` | 与旧栈一致 | 2026-08-19 复验：bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正 |
 | cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §7.4）；前 2 步 verify 自动 eager 预热 |
 | 不再需要 | `SGLANG_DSV4_MODE/2604_SUBMODE` | 新栈从 config 读（swiglu_limit）；`--kt-gpu-prefill-token-threshold`、`--cuda-graph-bs 1` 也不再需要 |
 

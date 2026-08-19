@@ -62,7 +62,7 @@ ExecStart=/var/deepseek-v4-flash/venvs/dspark/bin/python -m sglang.launch_server
   --kt-weight-path /var/deepseek-v4-flash/0731 \
   --kt-method MXFP4 \
   --kt-num-gpu-experts 0 \
-  --kt-cpuinfer 44 \
+  --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
   --context-length 131072 \

@@ -25,7 +25,7 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 # 2026-08-19 实测两者都必要；只影响长 prompt 的 prefill 速度，decode 不受影响。
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-export KT_CPUINFER="${KT_CPUINFER:-44}"
+export KT_CPUINFER="${KT_CPUINFER:-48}"
 export KT_TP_COUNT="${KT_TP_COUNT:-2}"
 
 SPEC_ARGS=""
