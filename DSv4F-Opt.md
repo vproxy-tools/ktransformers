@@ -172,8 +172,87 @@ sudo systemctl daemon-reload && sudo systemctl start ds4f
 - CPU MoE ~235µs/层平台期：需 scale-权重交错布局或 SNC 级调优才能突破。
 - systemd StartLimitBurst 已改为 500（运维调整）。
 
-## 7. 相关文件
+## 7. DSpark 投机解码（2026-08-19，主线 sglang 移植）
+
+### 7.1 背景与路线
+
+官方 DeepSeek-V4-Flash-0731 自带 DSpark draft head（config: `dspark_block_size=5`,
+`dspark_target_layer_ids=[40,41,42]`, `dspark_noise_token_id=128799`,
+`dspark_markov_rank=256`；权重在 `mtp.0.*`，4705 个键），target/draft 同源，只需
+`--speculative-algorithm DSPARK`。上游 sglang 主线（sgl-project）在 PR #30261 支持。
+
+kvcache-ai fork（基于 2 月主线）没有 DSpark，因此开新分支 **`dspark-kt`**
+（third_party/sglang）：基底取主线 4ad990ba7（2026-08-06，最后一个钉 torch 2.11 的
+提交，避开 cu13 依赖墙——驱动 550 只支持 CUDA 12.x），在其上：
+
+- **移植 fork 的 kt CPU 专家引擎**（4477 行 kt_ep_wrapper + mxfp4_deepseek +
+  v4_marlin/v4_triton_kernels + quant_method_registry + jit_kernel 包 +
+  linear_bf16_fp32 等），主线 V4 模型挂 `_try_kt_plugin` side-effect 注册。
+- **pick 我们 3 个仍有效的提交**：巨页缓存、perf pack（environ/4090D 调优 config/
+  woa_fp8_triton/EXTRA_ARGS 钩子）、FP8 lm_head GEMV。entrypoint 三个提交
+  （thinking env / reasoning_effort max / 官方对齐）被主线原生实现取代，丢弃
+  （主线有 SGLANG_DEFAULT_THINKING、REASONING_EFFORT_PROFILES preview/official）。
+- **SM89 适配**（主线假设 SM90+/SM120）：paged_mqa_metadata 128KB 动态共享内存按
+  设备 optin 上限钳制；sparse decode/prefill 注意力走 fork 的 Triton 回退
+  （debug_flash_mla_adapter）；索引器 logits 走 torch 回退；topk v1（v2 用
+  SM90 线程块集群）。
+- **DSpark draft 保持纯 GPU**：`build_draft_tp_worker` 包进
+  `speculative_kt_ep_disabled_context()`，draft 专家不上 CPU（约 10.6GB GPU）。
+
+### 7.2 环境
+
+- 独立 venv：`/var/deepseek-v4-flash/venvs/dspark`（torch 2.11.0+cu128、
+  flashinfer 0.6.15.post1[cu12]、sgl-kernel/sgl-deep-gemm 自 docs.sglang.ai
+  cu129 索引、transformers 5.12.1；sglang 与 kt-kernel 均 editable/本地构建）。
+  生产 `.venv` 完全不动。
+- 启停：`run_dspark.sh` / `stop_dspark.sh`（30001 端口）。`DSPARK=1` 开投机，
+  默认 `--disable-cuda-graph` + `SGLANG_RAGGED_VERIFY_MODE=static`（见 7.4）。
+  MEMFRAC：无投机 0.30，DSPARK 需 ≥0.60（draft 权重计入预算）。
+- 依赖分支状态：third_party/sglang 指针已记录在 optimize-latest（分支 `dspark-kt`，
+  venv 内 sglang 为 editable 安装）。kt-kernel 以 torch 2.11 头文件重编
+  （`pip install --no-build-isolation --no-deps .`）。注意：生产 ds4f 仍用
+  `.venv` 内的 fork 拷贝，不受此指针影响；从本分支全新构建会得到 dspark 实验栈。
+
+### 7.3 实测（greedy，5 提示词，30001 端口）
+
+| 配置 | 平均吞吐 | accept len / rate | 质量 |
+|---|---|---|---|
+| 主线基线（kt MXFP4，无投机，cuda graph） | 26.0 tok/s | — | 正确（3288 ✓、散文流畅） |
+| DSpark + cuda graph（ragged 默认） | 38.9 tok/s | 恒 2.00 / 0.20 | **损坏**（重复词） |
+| DSpark + cuda graph + static | ~38 tok/s | 恒 2.00 / 0.20 | **损坏** |
+| **DSpark + eager + static（推荐）** | **34.3 tok/s**（峰值 38-46） | **2.9-3.3 / 0.38-0.46** | **正确** |
+
+- DSpark(eager,static) 比无投机基线 **+32%**（34.3 vs 26.0 tok/s，5 提示词 1812
+  token 总平均；decode 峰值 46 tok/s 出现在 accept 高的数学题上）。
+- 首请求含 Triton JIT 预热（~3-6 tok/s），稳态请以第二请求起算。
+
+### 7.4 已知问题：verify 的 cuda-graph 回放损坏（SM89 回退栈）
+
+现象：开图时长生成出现系统性重复词（"散文 散文"），accept len 精确恒定 2.00
+（非真实分布）；关图后同样提示词完全正确、accept 2.9-3.3 正常波动。eager verify
+本身无损，故定位为**图回放数据依赖问题**而非算法问题。嫌疑：SM89 回退路径
+（Triton extra-key 注意力 / torch 索引器 / topk v1）中某宿主侧数据依赖在 capture
+时固化了过期值——这些特化分支只在 verify 图内首次执行（decode 图走的是
+HAS_EXTRA=False 特化、且经 eager 预热）。修复方向：verify 图捕获前对
+HAS_EXTRA=True 特化做 eager 预热；或对照 eager 逐张量 diff 回放输出。修好后预计
+~38-39 tok/s（再 +15%）。
+
+### 7.5 后续机会
+
+- 修 verify 图回放 bug（见 7.4）。
+- 索引器 logits 从 torch 回退换 tilelang（`SGLANG_OPT_USE_TILELANG_INDEXER=1`，
+  需验证 SM89 编译）——当前 torch 回退是 eager 路径的主要 GPU 开销之一。
+- 把主线自带的 SGLANG_OPT_FP8_WO_A_GEMM 等消费者级优化在 SM89 上验证开启，
+  以及我们移植的 SGLANG_KT_WOA_FP8_TRITON / SGLANG_KT_FP8_LMHEAD
+  （environ 已带开关，默认关）。
+- SPS 置信度调度表（`--speculative-dspark-sps-table-path`）离线构建。
+- 生产切换评估：dspark-kt 分支当前基线比生产 fork 新 6782 个主线提交，行为
+  差异（SWA 池、调度器、入口）需完整回归后再考虑替换 ds4f。
+
+## 8. 相关文件
 - 基准：`bench_decode.py`；线程占用：`thread_util.py`；profiler 分析：`analyze_prof*.py`
 - GPU 微基准：`bench_gpu_ops.py` / `bench_gpu_cold.py` / `scan_w8a8_cfg.py`
 - CPU MoE 微基准：`kt-kernel/bench/bench_fp4_moe_cold.py`（随机路由，L2 冷）
 - 实验实例脚本：`run_exp.sh` / `stop_exp.sh`（与生产并行，30001 端口，共享巨页权重缓存）
+- DSpark 实验：`run_dspark.sh` / `stop_dspark.sh`（30001 端口，venv-dspark）；
+  sglang 分支 `third_party/sglang@dspark-kt`
