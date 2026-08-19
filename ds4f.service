@@ -64,6 +64,7 @@ ExecStart=/var/deepseek-v4-flash/venvs/dspark/bin/python -m sglang.launch_server
   --context-length 110592 \
   --attention-backend flashinfer \
   --mem-fraction-static 0.60 \
+  --max-total-tokens 114688 \
   --chunked-prefill-size 2048 \
   --max-prefill-tokens 2048 \
   --max-running-requests 1 \
@@ -79,6 +80,9 @@ ExecStart=/var/deepseek-v4-flash/venvs/dspark/bin/python -m sglang.launch_server
 # cuda graph 默认开启（kt-kernel pinned-buffer 生命周期修复后正确且更快，
 # 39.6 vs 34.3 tok/s）；前 2 步 verify 由 dspark_verify.py 强制 eager 预热。
 # MEMFRAC 0.60：DSpark draft 权重（~10.6GB）计入显存预算，0.90 会捕获失败。
+# MAX-TOTAL-TOKENS 114688（= context 110592 + 4096 余量）：KV 池右移，
+# 30.7GB → 24.5GB（省 6.2GB），A/B 实测无性能差异（单请求用不满大池）。
+#   注意：覆盖 --context-length 时须同步调大此值（256 倍数）。
 # --kt-gpu-prefill-token-threshold 与 --cuda-graph-bs 1 为旧栈参数，新栈不需要。
 
 # --- 回滚旧栈（如需）：恢复以下三处 ---

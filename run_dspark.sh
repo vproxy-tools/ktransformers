@@ -38,6 +38,10 @@ if [ "${DSPARK:-0}" = "1" ]; then
     fi
 fi
 
+# 显存右移：单请求只需 CTXLEN+余量的 KV 池（0.60 mem-frac 默认会分到 ~801k
+# token，白占 ~6GB）。覆盖 CTXLEN 时记得同步调 MAXTOK（须为 256 倍数）。
+MAXTOK="${MAXTOK:-114688}"
+
 exec python -m sglang.launch_server \
   --host 127.0.0.1 --port 30001 \
   --model /var/deepseek-v4-flash/0731 \
@@ -50,6 +54,7 @@ exec python -m sglang.launch_server \
   --context-length "${CTXLEN:-110592}" \
   --attention-backend flashinfer \
   --mem-fraction-static "${MEMFRAC:-0.30}" \
+  --max-total-tokens "$MAXTOK" \
   --chunked-prefill-size 2048 \
   --max-prefill-tokens 2048 \
   --max-running-requests 1 \

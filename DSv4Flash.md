@@ -107,6 +107,7 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
   --context-length 110592 \
   --attention-backend flashinfer \
   --mem-fraction-static 0.60 \
+  --max-total-tokens 114688 \
   --chunked-prefill-size 2048 \
   --max-prefill-tokens 2048 \
   --max-running-requests 1 \
@@ -120,8 +121,9 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
   --tool-call-parser deepseekv4
 ```
 
-2026-08-19 实测（DSpark + cuda graph，soak 2479 token）：**39.6 tok/s** 持续
-（峰值 49.8，accept 2.2-3.8），比无投机基线 26.0 **+52%**；显存约 30.7GB / 48GB，
+2026-08-19 实测（DSpark + cuda graph + KV 池右移）：**39.6 tok/s** 持续
+（峰值 49.8，accept 2.2-3.8），比无投机基线 26.0 **+52%**；显存约
+**24.5GB / 48GB**（`--max-total-tokens 114688` 右移 KV 池后；右移前 30.7GB），
 就绪约 80~90s（巨页权重缓存命中时）。
 
 参数说明（与旧栈的差异）：
@@ -130,7 +132,8 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 |---|---|---|
 | `--speculative-algorithm DSPARK` | 0731 自带 draft（`mtp.0.*`） | 无需 draft path；**不要用 EAGLE**（9.1 节） |
 | `--context-length 110592` | **108K，不能再大** | DSpark verify 在 >111K 下确定性损坏（9.3 节）；仍须是 page_size(256) 倍数 |
-| `--mem-fraction-static 0.60` | draft 权重 ~10.6GB 计入预算 | 0.90 会 graph 捕获失败 |
+| `--max-total-tokens 114688` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 6.2GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
+| `--mem-fraction-static 0.60` | draft 权重 ~10.6GB 计入预算 | 0.90 会 graph 捕获失败；池大小由 max-total-tokens 决定后此值仅作预算校验 |
 | `--kt-cpuinfer 44` | DSpark 实测值 | 旧栈 48 未在新栈复验 |
 | cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §7.4）；前 2 步 verify 自动 eager 预热 |
 | 不再需要 | `SGLANG_DSV4_MODE/2604_SUBMODE` | 新栈从 config 读（swiglu_limit）；`--kt-gpu-prefill-token-threshold`、`--cuda-graph-bs 1` 也不再需要 |
@@ -475,9 +478,10 @@ DSpark verify 在 **context > 111K 时确定性损坏**（重复短语、accept 
 生产取 **110592**（page 256 倍数 + 边界下留余量）。110592 下实测：bench 5/5
 PASS（33 tok/s，比 8192 配置的 38 略低——长上下文元数据开销）、4168-token
 prompt 理解正确、thinking 默认开且切分正常。排查记录：已排除 KV 池容量
-（三档 context 池都是 801536 token）、paged_mqa_metadata smem 钳制（batch 与
-context 无关）；根因待查（嫌疑：按 MAX_SEQ_LEN_FOR_CAPTURE=131072 派生的
-page-table/索引宽度在 verify 图捕获中的某处越界或错位），修复后可放开到 131072。
+（三档 context 池都是 801536 token；且右移池到 135168 后 131072 仍损坏——
+池尺寸不是协因）、paged_mqa_metadata smem 钳制（batch 与 context 无关）；
+根因待查（嫌疑：按 MAX_SEQ_LEN_FOR_CAPTURE=131072 派生的 page-table/索引
+宽度在 verify 图捕获中的某处越界或错位），修复后可放开到 131072。
 
 ### 9.4 验证与工具
 
