@@ -9,7 +9,7 @@
 `dspark_markov_rank=256`；权重在 `mtp.0.*`，4705 个键），target/draft 同源，只需
 `--speculative-algorithm DSPARK`。上游 sglang 主线（sgl-project）在 PR #30261 支持。
 
-为此开分支 **`dspark-kt`**（third_party/sglang）：基底取主线 4ad990ba7（2026-08-06，最后一个钉 torch 2.11 的
+为此开分支 **`dspark-kt`**（third_party/sglang）：基底取主线 4ad990ba7（最后一个钉 torch 2.11 的
 提交，避开 cu13 依赖墙——驱动 550 只支持 CUDA 12.x），在其上：
 
 - **移植 kt CPU 专家引擎**（4477 行 kt_ep_wrapper + mxfp4_deepseek +
@@ -31,7 +31,7 @@
   cuda-python 13.3.1、transformers 5.12.1；sglang 为 editable、kt-kernel 为
   本地构建拷贝安装，~200 个包，完整清单以 `.venv/bin/pip freeze` 为准）。
 - 实验实例启停：`run_dspark.sh` / `stop_dspark.sh`（30001 端口，与生产同用 `.venv`）。`DSPARK=1` 开投机，
-  默认 cuda graph 开 + `SGLANG_RAGGED_VERIFY_MODE=static`（1.4 修复后正确且
+  默认 cuda graph 开 + `SGLANG_RAGGED_VERIFY_MODE=static`（修复后正确且
   更快；`EAGER=1` 回退无损 eager）。MEMFRAC：无投机 0.30，DSPARK 需 ≥0.60
   （draft 权重计入预算）。
 - 依赖分支状态：third_party/sglang 指针已记录在 optimize-latest（分支 `dspark-kt`，
@@ -47,7 +47,7 @@
 | 配置 | 平均吞吐 | accept len / rate | 质量 |
 |---|---|---|---|
 | 主线基线（kt MXFP4，无投机，cuda graph） | 26.0 tok/s | — | 正确（3288 ✓、散文流畅） |
-| DSpark + cuda graph（修复前） | 38.9 tok/s | 恒 2.00 / 0.20 | **损坏**（重复词，见 1.4） |
+| DSpark + cuda graph（修复前） | 38.9 tok/s | 恒 2.00 / 0.20 | **损坏**（重复词，见 §4） |
 | DSpark + eager + static | 34.3 tok/s（峰值 38-46） | 2.9-3.3 / 0.38-0.46 | 正确 |
 | **DSpark + cuda graph + static（修复后，推荐）** | **39.6 tok/s**（峰值 49.8） | **2.2-3.8 / 正常波动** | **正确** |
 
@@ -57,46 +57,13 @@
   （38.1 tok/s，该 prompt 集 thinking 较短）。
 - 首请求含 Triton JIT 预热（~3-6 tok/s），稳态请以第二请求起算。
 
-### 1.4 已修复：verify 的 cuda-graph 回放损坏（2026-08-19 二轮定位 + 修复）
-
-**根因（kt-kernel/python/experts_base.py `KExpertsCPUBuffer.get_buffer`）**：
-CPU 专家的 pinned 中转 buffer（input/ids/weights/output/bsz，共 5 类 × 2 slot）由
-单槽 temp 缓存管理——sglang 从不调用 `set_capture_batch_sizes`，`capture_bs` 为空，
-**所有尺寸都走 temp 路径**。CUDA graph 捕获时（verify 的 6/12/24… token 形状），
-录制的 D2H/H2D 拷贝与 `cudaLaunchHostFunc` host node（submit/sync_with_cuda_stream，
-CUDA 11.1+ 可捕获为 graph host node，replay 时由 driver 线程重新执行 CPU 专家计算）
-都烤死了这些 pinned 裸指针；此后任何一次**不同 batch size 的前向（如 prefill 的
-256/2048 chunk）换掉 temp 单槽**，graph 引用的实例失去最后 Python 引用而被 GC，
-pinned 块回到缓存分配器，被下一个同尺寸分配**精确复用**（已独立脚本实证地址重合）。
-replay 从此读写别人的活跃张量——专家 ID/权重变垃圾 → 确定性输出损坏（重复词、
-accept 掉 1.0）；垃圾 ID 无界 → C++ 专家表越界 → 原生段错误（栈无 python 帧）。
-任何一次 eager submit 重新分配同尺寸 buffer 落回同地址 → "每步 eager 重跑可治愈"
-的假象；请求 2 起（其 prefill 换槽后）必坏也与时间线吻合。
-
-**修复**：get_buffer 在 `torch.cuda.is_current_stream_capturing()` 为真期间分到
-（或命中 temp）的尺寸提升进 `capture_buffers` 永久保活；prefill 尺寸（从不捕获）
-仍走单槽 temp，内存零增长。修复后：多请求无劣化、4 项 soak 39.57 tok/s 全对、
-零段错误，graph 修复收益 +15%。
-
-**遗留的独立小问题（已有 workaround）**：首个 verify（graph 或 eager 均是）返回
-的 hidden_states 是未物化的输出 buffer（|x|≈2.9e5）；`dspark_verify.py` 前 2 步
-verify 强制 eager 预热（env `SGLANG_DSv4_VERIFY_EAGER_WARMUP`，默认 2）。
-
-**调试技法存档**（代码已清理）：同进程 graph→clone→eager 三连位对比；
-`_dbg_full_meta_list` 抓 graph 池内 metadata 张量 replay 后读值；KV 池 uint8
-checksum 对比；pinned 指针复用独立复现脚本。
-
-### 1.5 后续机会
+### 1.4 后续机会
 
 - 索引器 logits 从 torch 回退换 tilelang（`SGLANG_OPT_USE_TILELANG_INDEXER=1`，
   需验证 SM89 编译）——当前 torch 回退是 eager 路径的主要 GPU 开销之一。
 - 把主线自带的 SGLANG_OPT_FP8_WO_A_GEMM 等消费者级优化在 SM89 上验证开启
-  （SGLANG_KT_WOA_FP8_TRITON / SGLANG_KT_FP8_LMHEAD 已判定不可用，见 DSv4Flash.md 10）。
+  （SGLANG_KT_WOA_FP8_TRITON / SGLANG_KT_FP8_LMHEAD 已判定不可用，见 §4）。
 - SPS 置信度调度表（`--speculative-dspark-sps-table-path`）离线构建。
-- kt-kernel C++ 小修：`CPUInfer::sync_with_cuda_stream` 的 `new SyncArgs` 从不
-  delete（每层每步 16B 泄漏，长跑约 12MB/h）——**已修（2026-08-20，c082623）**：
-  eager 一次性回调自删、图捕获型 args 永生（无条件 delete 曾引发回放 use-after-free
-  崩溃循环，事故记录见 DSv4Flash.md 9.5）；回归测试 `tests/sync_leak_check.py`（见 3.6）。
 
 ## 2. 相关文件
 - 测试工具：全部在 `tests/`（探针/基准/巨页与泄漏回归等，见 §3）；
@@ -104,7 +71,7 @@ checksum 对比；pinned 指针复用独立复现脚本。
   `tests/scan_w8a8_cfg.py`；CPU MoE 微基准 `kt-kernel/bench/bench_fp4_moe*.py`
 - 实验实例：`run_dspark.sh` / `stop_dspark.sh`（30001 端口，`KEEP_GRAPHS=1` 开
   graph 调试）；基准 `tests/bench_dspark.py`；sglang 分支 `third_party/sglang@dspark-kt`
-- **测试工具全集（功能/前提/执行/清理/结果解读/通过分界）：见 §9**
+- **测试工具全集（功能/前提/执行/清理/结果解读/通过分界）：见 §3**
   —— 均在 `tests/`：`probe_dspark.py` / `bench_dspark.py` / `grow_probe.py` / `bisect_ctx.sh` /
   `hp_weight_check.py` / `sync_leak_check.py`；启动脚本留在仓库根：`run_dspark.sh`+`stop_sglang.sh`；
   `kt-kernel/bench/bench_fp4_moe*.py`
@@ -117,8 +84,7 @@ checksum 对比；pinned 指针复用独立复现脚本。
 默认超时 600–1200s；除特别注明外用系统 python3 即可（只依赖 urllib）。
 
 **GPU 独占规则（重要）**：生产 ds4f(30000) 与实验实例（run_dspark.sh，30001）**不能
-同时占 GPU**——2026-08-20 早晨生产部署时实验实例残留 24GB 显存，导致生产 OOM 崩溃
-循环 11 次。要跑实验（tests/bisect_ctx.sh / A/B 重启类），先停生产（`sudo systemctl stop
+同时占 GPU**——曾有实验实例残留 24GB 显存，导致生产部署时 OOM 崩溃循环。要跑实验（tests/bisect_ctx.sh / A/B 重启类），先停生产（`sudo systemctl stop
 ds4f`，或 kill 主进程靠 systemd 30s 后拉起、注意 StartLimitBurst 预算）；跑完把实验
 实例停干净再把生产拉回。探针/基准（不重启服务器）与生产共存没问题。
 
@@ -206,10 +172,9 @@ ds4f`，或 kill 主进程靠 systemd 30s 后拉起、注意 StartLimitBurst 预
 
 ### 3.6 `tests/sync_leak_check.py` —— SyncArgs 泄漏 / 图回放 UAF 回归
 
-- **功能**：双路回归 kt-kernel `CPUInfer::sync_with_cuda_stream` 的修复（DSv4Flash.md
-  9.5）：eager 路 100 万次调用后 malloc_trim RSS 增长应≈0；含 4 个 sync host 节点的
+- **功能**：双路回归 kt-kernel `CPUInfer::sync_with_cuda_stream` 的修复（背景见 §4）：eager 路 100 万次调用后 malloc_trim RSS 增长应≈0；含 4 个 sync host 节点的
   cuda graph 5000 次回放应无崩溃无增长（捕获型 args 永生、回放零分配）。
-- **前提**：GPU 可用（占用 <1.5GB，**与生产共存安全**）；dspark venv python（编译进
+- **前提**：GPU 可用（占用 <1.5GB，**与生产共存安全**）；仓库 `.venv` 的 python（编译进
   `.venv` 的 .so 才是被测对象——先按 DSv4Flash.md 7.2 重编并装入再测源码改动）。
 - **执行**：`$KT_ROOT/.venv/bin/python $KT_ROOT/tests/sync_leak_check.py`，~2 分钟。
 - **清理**：无需（纯本地进程）。
@@ -246,6 +211,119 @@ ds4f`，或 kill 主进程靠 systemd 30s 后拉起、注意 StartLimitBurst 预
 - **清理**：无需（jsonl 历史有意保留；脚本已强制 `KT_HUGEPAGE_WEIGHTS=0`，
   合成权重不会碰持久巨页 arena）。
 - **解读**：每行 `M=  N  per-iter= X us  tok/s=`；历史基线 M=1 ≈ **227–235µs**
-  （2026-08-17/19/20 三日一致）。
+  （多日复测一致）。
 - **通过分界**：M=1 落在历史 ±5% 内 = 机器/内核健康；显著偏高先查负载再查回归
   （对照 jsonl 里最近记录的 commit 定位改动）。
+
+## 4. 已修复问题档案（均已修复并验证，折叠备查）
+
+<details>
+<summary><b>DSpark verify 的 cuda-graph 回放损坏（两轮定位，均已修复）</b>——症状：graph 开启时输出损坏/段错误；现状：graph 默认开启且正确</summary>
+
+<b>第一轮：pinned 中转 buffer 生命周期（修复在 kt-kernel/python/experts_base.py `KExpertsCPUBuffer.get_buffer`）</b>
+
+CPU 专家的 pinned 中转 buffer（input/ids/weights/output/bsz，共 5 类 × 2 slot）由
+单槽 temp 缓存管理——sglang 从不调用 `set_capture_batch_sizes`，`capture_bs` 为空，
+**所有尺寸都走 temp 路径**。CUDA graph 捕获时（verify 的 6/12/24… token 形状），
+录制的 D2H/H2D 拷贝与 `cudaLaunchHostFunc` host node（submit/sync_with_cuda_stream，
+CUDA 11.1+ 可捕获为 graph host node，replay 时由 driver 线程重新执行 CPU 专家计算）
+都烤死了这些 pinned 裸指针；此后任何一次**不同 batch size 的前向（如 prefill 的
+256/2048 chunk）换掉 temp 单槽**，graph 引用的实例失去最后 Python 引用而被 GC，
+pinned 块回到缓存分配器，被下一个同尺寸分配**精确复用**（已独立脚本实证地址重合）。
+replay 从此读写别人的活跃张量——专家 ID/权重变垃圾 → 确定性输出损坏（重复词、
+accept 掉 1.0）；垃圾 ID 无界 → C++ 专家表越界 → 原生段错误（栈无 python 帧）。
+任何一次 eager submit 重新分配同尺寸 buffer 落回同地址 → "每步 eager 重跑可治愈"
+的假象；请求 2 起（其 prefill 换槽后）必坏也与时间线吻合。
+
+修复：get_buffer 在 `torch.cuda.is_current_stream_capturing()` 为真期间分到
+（或命中 temp）的尺寸提升进 `capture_buffers` 永久保活；prefill 尺寸（从不捕获）
+仍走单槽 temp，内存零增长。修复后：多请求无劣化、4 项 soak 39.57 tok/s 全对、
+零段错误，graph 收益 +15%。
+
+调试技法存档（代码已清理）：同进程 graph→clone→eager 三连位对比；
+`_dbg_full_meta_list` 抓 graph 池内 metadata 张量 replay 后读值；KV 池 uint8
+checksum 对比；pinned 指针复用独立复现脚本。
+
+<b>第二轮：verify 元数据图内构建损坏（context > ~111.4K）——已修复，context 放开到 131072</b>
+
+症状：`--context-length` 超过约 111.4K 后生成确定性损坏（重复短语、远程注意力
+劣化；与实际序列长度无关——ctx=131072 下 4K 短 prompt 也坏）。二分边界：
+111360 干净 / 111616 损坏。
+
+排除项（均实测）：实际序列长度、KV 池容量（池 114688 与 135168 都出现过
+干净/损坏组合）、page 宽度（111360 与 111616 同为 437 页）、draft 图（draft
+图开 + verify eager = 干净）、verify 元数据数值（图回放后逐字段对比 eager
+重建，page_table/swa/c4/c128/positions 全等）、压缩计划字节（plan_c/plan_w
+全等）、两条元数据构建路径互比（raw vs _old 全等）。
+
+根因（定位到机制层面）：`SGLANG_PREP_IN_CUDA_GRAPH=1`（默认）把 verify 的
+raw→full 元数据构建（`make_forward_metadata_from_raw_verify` 一族 triton/torch
+算子）**录制进 verify cuda graph**。录制后所有可读产物都正确，但生成损坏——
+即损坏源于"构建被录制"这一形态本身（疑似捕获期内存池别名/算子时序效应，
+回放后值正确、前向中途被污染），在 req_to_token 宽度超过 ~437 页时触发。
+`SGLANG_PREP_IN_CUDA_GRAPH=0`（全局图外）可修但有 `.tolist()` CPU 同步。
+
+修复：新增 `SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1`（run_dspark.sh/ds4f.service
+已默认导出）——仅对 TARGET_VERIFY bucket，把 raw→full 升级移到图外按步执行
+（同一组纯 GPU 构建器，无 CPU 同步），图内只录模型层；draft decode 保持图内
+快速路径。改动：`deepseek_v4_backend.py` + `environ.py`。
+
+验证（ctx=131072 + 池 135168 + chunk 512）：probe CLEAN；bench 5/5 PASS；
+长上下文增长探针单会话 19.5K / 109K / 125,211 token 三级全 PASS（远程暗号在
+125K 上下文仍可回忆、新数学题正确、零复读）。性能 A/B 图内 27.8 vs 图外
+28.2 tok/s——零回退。另：>100K 的 prefill 需 chunk 512 + expandable_segments。
+
+独立小怪癖（不影响正确性，已自动规避）：首个 verify（graph 或 eager 均是）
+返回的 hidden_states 是未物化的输出 buffer；`dspark_verify.py` 前 2 步 verify
+自动强制 eager 预热（env `SGLANG_DSv4_VERIFY_EAGER_WARMUP`，默认 2）。
+
+</details>
+
+<details>
+<summary><b>SyncArgs 泄漏与图捕获 use-after-free 事故（均已修复）</b>——症状：长跑 RSS 缓涨 ~12MB/h；首版修复曾引发崩溃循环</summary>
+
+`kt-kernel/cpu_backend/cpuinfer.h` 的 `sync_with_cuda_stream()` 每次 `new SyncArgs`
+从不释放（实测 ~32 B/次 ≈ 生产 ~12 MB/h）。修复时踩过一个必须记录的坑：
+
+<b>第一版修复（回调里无条件 delete args）导致生产 SIGSEGV 崩溃循环。</b> 根因：
+decode/verify 的 cuda graph 捕获期间也调用 `sync_with_cuda_stream`——
+`cudaLaunchHostFunc` 连同 `args` 指针被录成图内 host 节点，**每次图回放都用同一
+指针重跑回调**。首次回放 delete 后，第二次回放变成 use-after-free + double-free →
+堆损坏 → 主线程死在 `pthread_mutex_lock`（faulthandler 栈可见）。也就是说，原代码
+的"泄漏"里有一部分是**被捕获图的函数性需求**（args 必须永生）。
+
+正确修复（已部署生产，提交 c082623）：启动时 `cudaStreamIsCapturing()` 探测——
+eager 一次性回调标记 `owned=true` 回调自删；捕获流标记 `owned=false` 永生（回放
+零分配，只在捕获时分配一次，量级为启动期常数）。验证：eager 1M 次 RSS 增长
+-0.9 B/次（malloc_trim 后）；图 5000 次回放 × 4 节点无崩溃；生产 probe CLEAN +
+bench 5/5 PASS 33.54 tok/s；MoE 微基准 M=1 227µs（基线 233µs）无回退。
+回归测试：`tests/sync_leak_check.py`（见 3.6）。
+
+诊断要点：紧循环 RSS 读数含"已 free 未归还"的驻留页（纯 C 跨线程 malloc/free
+模式本身读出 ~28 B/次），**必须 malloc_trim 后再测**；CPU-only `sync()` 路径因
+指针不逃逸被编译器优化掉分配，泄漏只在 CUDA 路径。
+
+</details>
+
+<details>
+<summary><b>禁用环境变量的审计依据（FUSE_RSF / KT_FP8_LMHEAD 等）</b>——结论汇总见 DSv4Flash.md 10</summary>
+
+`SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD`：默认 False；本栈三处 GPU MoE 路径
+（marlin/triton_kernels/trtllm）里它只控制是否跳过 `output.mul_(rsf)`，**没有
+融合消费方**。模型 routed_scaling_factor=1.5，=1 会静默丢掉 ×1.5——不是性能
+开关，是正确性地雷。
+
+`SGLANG_KT_FP8_LMHEAD`（单元级实测，未动生产）：FP8 GEMV 内核数学正确（vs
+手工反量化参照误差 0.037），T=1 提速 1.96×（2242→1143µs，读带宽减半），但
+T=2 持平、T=4 反而 0.5×（einsum 按 T 逐行读权重），DSpark 下仅 draft 步受益。
+决定性否决点是 **stash 构建有数据竞争**：`build_lmhead_fp8` 的
+`weight[...].to("cpu", non_blocking=True)` 后立即在 CPU 上量化，同一权重两次
+构建产物**比特不同**且权重重建误差 ~0.007（健康 fp8 应为 ~0.0003，差 20×），
+会把 logits 静默算坏。若未来要启用：先给 D2H 后补 `torch.cuda.synchronize()`，
+复测重建误差回到 ~2-3% 再说。
+
+其余（WOA_FP8_TRITON / OVERLAP_STORE_CACHE）在新栈无任何读取点；FUSE_WQA_WKV /
+USE_JIT_NORM / USE_MULTI_STREAM_OVERLAP / USE_FUSED_STORE_CACHE 为 `EnvBool(True)`
+默认值，显式设置=冗余。
+
+</details>

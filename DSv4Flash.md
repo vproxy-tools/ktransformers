@@ -77,7 +77,7 @@ kt doctor    # 应全部"正常"，kt-kernel 显示 v0.6.4
 
 ### 3.1 本机调优配置（DSpark 投机解码 + cuda graph，日常使用）
 
-2026-08-19 起生产切换到 DSpark 投机解码栈（sglang `dspark-kt` 分支，详见第 9 节）。
+生产使用 DSpark 投机解码栈（sglang `dspark-kt` 分支，详见第 9 节）。
 启动命令与 `ds4f.service` 一致：
 
 ```bash
@@ -122,16 +122,16 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
   --tool-call-parser deepseekv4
 ```
 
-2026-08-19 实测（DSpark + cuda graph + KV 池右移）：**39.6 tok/s** 持续
+实测（DSpark + cuda graph + KV 池右移）：**39.6 tok/s** 持续
 （峰值 49.8，accept 2.2-3.8），比无投机基线 26.0 **+52%**；显存（131072 配置、
-生产 30000 实测 2026-08-20）约 **26.9GB / 48GB**（110592 早期配置为 24.4GB），
+生产 30000 实测）约 **26.9GB / 48GB**，
 start→ready 约 **60~100s**（scheduler_e2e ~56s + 图捕获；巨页权重缓存命中后
 load_weight 部分会进一步缩短）。
 
-**吞吐口径澄清（2026-08-19 深夜复测）**：DSpark 下 tok/s = accept/周期，
+**吞吐口径澄清**：DSpark 下 tok/s = accept/周期，
 高度依赖提示词内容——数数类（高可预测）70.8 tok/s、bench 5 题混合
 32.5~35.1（ALL PASS）、单一散文题 soak ~28（该类内容 accept 仅 ~2.3）。
-机器本身无损：MXFP4 MoE 微基准 234.2µs/层，与 8/17 基线 233.5µs 逐微秒
+机器本身无损：MXFP4 MoE 微基准 234.2µs/层，与历史基线 233.5µs 逐微秒
 持平；GPU 时钟正常；QEMU 虚机（node0、~1.2 核）对 node1 专家核与 MoE
 无可测影响。不同日子的"持续 tok/s"差异主要来自 soak 提示词的 accept
 分布，而非性能回退。
@@ -141,7 +141,7 @@ load_weight 部分会进一步缩短）。
 | 参数 | 值 | 说明 |
 |---|---|---|
 | `--speculative-algorithm DSPARK` | 0731 自带 draft（`mtp.0.*`） | 无需 draft path；**不要用 EAGLE**（9.1 节） |
-| `--context-length 131072` | 模型上限 128K | 需 `SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1`（9.3 节修复，run_dspark.sh 已默认导出）；须是 page_size(256) 倍数 |
+| `--context-length 131072` | 模型上限 128K | 需 `SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1`（见 9.3；run_dspark.sh 已默认导出）；须是 page_size(256) 倍数 |
 | `--chunked-prefill-size 512` | 131072 必需 | 513 页宽下 torch indexer gather 的 prefill 瞬时峰值 ~17GB（2048 chunk）会 OOM；512 后峰值 ~4-7GB。须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。仅影响 prefill 速度，decode 不变；90K 以下 prompt 可用 1024 |
 | `--max-total-tokens 135168` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 ~6GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
 | `--mem-fraction-static 0.60` | draft 权重 ~10.6GB 计入预算 | 0.90 会 graph 捕获失败；池大小由 max-total-tokens 决定后此值仅作预算校验 |
@@ -239,7 +239,7 @@ DSpark 单请求吞吐参考区间 32–36 tok/s，口径见 3.1）。
 | 生产 30000 与实验 30001 同时启动 → 反复 OOM 崩溃循环 | 两个实例挤一张 48GB 卡 | 实验前停生产（systemd stop），跑完先停实验（DSv4F-Opt.md 3 的 GPU 独占规则） |
 | 手动 kill 后服务 30s 拉起失败循环 | ExecStart 指向的 venv/路径失效，或 StartLimitBurst(500/天) 耗尽 | `systemctl reset-failed ds4f && systemctl start ds4f`（sudo） |
 | RSS 看起来持续增长 | 紧循环测量含"已 free 未归还"驻留页 | 以 malloc_trim 后读数为准（DSv4F-Opt.md 3.6） |
-| 输出损坏（复读/数学错） | 先跑 `tests/probe_dspark.py`，损坏与 ctx 相关时用 `tests/bisect_ctx.sh` 二分 | 见 9.3/9.5 的两类已修复损坏 |
+| 输出损坏（复读/数学错） | 先跑 `tests/probe_dspark.py`，损坏与 ctx 相关时用 `tests/bisect_ctx.sh` 二分 | 已知两类损坏均已修复（DSv4F-Opt.md §4）；复现即新问题 |
 ## 6. 服务管理（systemd）
 
 工程根目录提供了 `ds4f.service`（内容即 3.1 节的启动命令 + 必需环境变量），
@@ -327,15 +327,14 @@ DeepSeek-V4-Flash 的 CPU 侧常驻权重（MXFP4 路由专家，每个 NUMA 约
 - 大页池容量（当前 node0=300、node1=364 个 1 GiB 页）需 ≥ 常驻权重 + 其它大页用户；
 - 首次冷加载若中途崩溃，未写标记的层会在下次启动自动重写，无需人工干预。
 
-**2026-08-20 现状：缓存未接通（数据目录缺失）。** `/dev/hugepages`（hugetlbfs 挂载点）为
-root:root 755，8/19 08:58 虚机启动时挂载点被重建，`kt_weights/` 目录消失，普通用户无法
-自行创建 → C++ `hugepage_weights::enabled()` 静默回落堆分配（日志无任何 hugepage 行）。
-代码钩子本身完好（C++ alloc/commit/reuse + python `check_reusable` 快路径都在，与
-MXFP4 layerwise prefill 的 host 写出兼容——它读转换后的 BufferB）。重新接通只需 root 一次性：
+**运维要点：数据目录需 root 一次性创建。** `/dev/hugepages`（hugetlbfs 挂载点）
+为 root 所有；若挂载点被重建（如虚机启动把 `kt_weights/` 清掉），普通用户无法
+自行创建目录，C++ `hugepage_weights::enabled()` 会**静默回落堆分配**（日志无任何
+hugepage 行，服务照常运行）。重新接通只需 root 一次性：
 
 ```bash
 sudo mkdir -p /dev/hugepages/kt_weights && sudo chown $USER:$USER /dev/hugepages/kt_weights
-# 陈旧标记已清理（2026-08-20）；下次启动冷加载约 1-2 分钟/全模型，之后 REUSED 秒级
+# 首次冷加载约 1-2 分钟/全模型，之后 REUSED 秒级
 ```
 
 目录建好后可先离线验证（不碰 GPU、可与生产共存，产物直接被服务器复用）：
@@ -368,10 +367,9 @@ GPU 参数同样缓存到持久巨页：`third_party/sglang` 新增
 `cd third_party/sglang && SGLANG_KT_VERSION=0.6.4 pip install --no-deps --no-build-isolation ./python`。
 `KT_HUGEPAGE_GPU_WEIGHTS=0` 可关闭。实测重启到就绪约 40 秒，推理输出正常。
 
-**2026-08-20 现状**：8/19 挂载点重建同样把 GPU 参数缓存的数据文件清掉了
-（node1 的 manifest `gpu_weights.json` 还在，但数据已失配）——下次启动按
-size+mtime 校验自动 miss 并重新填充一次，之后恢复正常复用，无需人工干预
-（数据目录的 sudo 重建见第 8 节开头的说明，GPU/CPU 两个缓存共用该目录）。
+若挂载点重建把数据文件清掉（manifest 还在但已失配），下次启动按 size+mtime
+校验自动 miss 并重新填充一次，之后恢复正常复用，无需人工干预（数据目录的
+重建见第 8 节开头的说明，GPU/CPU 两个缓存共用该目录）。
 
 ## 9. DSpark / 推测解码（speculative decoding）支持情况
 
@@ -400,45 +398,18 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
 - draft 保持纯 GPU（约 10.6GB，MEMFRAC 需 ≥0.60），target 专家全在 CPU。
 - **kt-kernel pinned-buffer 生命周期修复**（graph 损坏的根因）：CPU 专家的
   pinned 中转 buffer 曾走单槽 temp 缓存，graph 捕获后任何 prefill 换槽都会
-  释放并被复用，replay 读写别人内存。修复后 graph 默认开启（DSv4F-Opt.md 1.4）。
+  释放并被复用，replay 读写别人内存。修复后 graph 默认开启（细节见 DSv4F-Opt.md §4）。
 - **输出侧 thinking 切分补丁**（serving_chat.py）：V4 模板的
   explicit_thinking 探测模式下，`SGLANG_DEFAULT_THINKING=1` 只影响 prompt 侧、
   输出侧不切 `</think>`（全部落 content）。补丁让输出侧同样遵循
   请求 > env 的优先级。
 
-### 9.3 已修复：verify 元数据图外构建，context 放开到 131072
+### 9.3 长上下文（>111K）注意
 
-**症状（2026-08-18 发现）**：DSpark + cuda graph 下，`--context-length` 超过
-约 111.4K 后生成确定性损坏（重复短语、远程注意力劣化；实际序列长度无关——
-ctx=131072 下 4K 短 prompt 也坏）。二分边界：111360 ✅ / 111616 ❌。
-
-**排除项**（均实测）：实际序列长度（短 prompt 也坏）、KV 池容量（池 114688
-与 135168 都出现过干净/损坏组合）、page 宽度（111360 与 111616 同为 437 页）、
-draft 图（draft 图开 + verify eager = 干净）、verify 元数据数值（图回放后逐字段
-对比 eager 重建，page_table/swa/c4/c128/positions 全等）、压缩计划字节
-（plan_c/plan_w 全等）、两条元数据构建路径互比（raw 路径 vs _old 路径全等）。
-
-**根因（定位到机制层面）**：`SGLANG_PREP_IN_CUDA_GRAPH=1`（默认）把 verify 的
-raw→full 元数据构建（`make_forward_metadata_from_raw_verify` 一族 triton/torch
-算子）**录制进 verify cuda graph**。录制后所有可读产物都正确，但生成损坏——
-即损坏源于"构建被录制"这一形态本身（疑似捕获期内存池别名/算子时序效应，
-回放后值正确、前向中途被污染），在 req_to_token 宽度超过 ~437 页时触发。
-`SGLANG_PREP_IN_CUDA_GRAPH=0`（全局图外）可修但有 `.tolist()` CPU 同步。
-
-**修复**：新增 `SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1`——仅对 TARGET_VERIFY
-bucket，把 raw→full 升级移到图外按步执行（同一组纯 GPU 构建器，无 CPU 同步），
-图内只录模型层；draft decode 保持图内快速路径。改动：
-`deepseek_v4_backend.py`（out_graph TARGET_VERIFY 分支）+ `environ.py`。
-run_dspark.sh 已默认导出。
-
-**验证（2026-08-19，ctx=131072 + 池 135168 + chunk 512）**：probe CLEAN；
-bench 5/5 PASS（32.8 tok/s）；长上下文增长探针单会话 19.5K / 109K /
-**125,211 token 三级全 PASS**（位置 ~10 埋的远程暗号在 125K 上下文仍可回忆、
-新数学题正确、零复读；第四级 ~134K 超出 131072 被 400 拒绝，属预期）。
-性能：同机 A/B（当日有 QEMU 虚机抢 CPU）图内 27.8 vs 图外 28.2 tok/s——
-**修复零回退**；当日绝对值 ~27-33 与历史 39.6 的差距全部来自虚机竞争
-（虚机停后可复测）。另：>100K 的 prefill 需 chunk 512 + expandable_segments
-（513 页宽 gather 峰值），已写入 run_dspark.sh / ds4f.service。
+`--context-length 131072` 依赖 `SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1`
+（verify 元数据若录制进 cuda graph，超过 ~111.4K 后生成会确定性损坏；该问题
+已修复并在 125K 上下文端到端验证，run_dspark.sh / ds4f.service 均已默认导出）。
+定位与修复过程见 `DSv4F-Opt.md` §4。
 
 ### 9.4 验证与工具
 
@@ -451,36 +422,15 @@ bench 5/5 PASS（32.8 tok/s）；长上下文增长探针单会话 19.5K / 109K 
 - 实验实例：`run_dspark.sh`（30001 端口，CTXLEN/MAXTOK/MEMFRAC/PREFILL/
   EAGER 环境变量可覆盖；`EAGER=1` 回退无损 eager）；`stop_sglang.sh` 安全
   清理所有 sglang 进程（避免 pkill 自匹配；**会连 30000 生产一起停**）。
-- 以上工具均已集中在仓库根的 **`tests/` 目录**（2026-08-20 归类；早期的
+- 以上工具均已集中在仓库根的 **`tests/` 目录**（早期的
   bench/profiler 脚本也一并移入）；启动/停止脚本（`run_dspark.sh`、
   `stop_sglang.sh` 等）仍在仓库根。完整说明（执行前提、结果解读、通过/不通过
   分界、清理要求）面向开发者，见 `DSv4F-Opt.md` §3；本节仅速查。
 
-### 9.5 SyncArgs 泄漏修复与图捕获 use-after-free 事故（2026-08-20）
+## 10. 环境变量使用纪律
 
-`kt-kernel/cpu_backend/cpuinfer.h` 的 `sync_with_cuda_stream()` 每次 `new SyncArgs`
-从不释放（实测 ~32 B/次 ≈ 生产 ~12 MB/h）。修复时踩过一个必须记录的坑：
-
-**第一版修复（回调里无条件 `delete args`）导致生产 SIGSEGV 崩溃循环。** 根因：
-decode/verify 的 cuda graph **捕获期间**也调用 `sync_with_cuda_stream`——
-`cudaLaunchHostFunc` 连同 `args` 指针被录成图内 host 节点，**每次图回放都用同一
-指针重跑回调**。首次回放 delete 后，第二次回放变成 use-after-free + double-free →
-堆损坏 → 主线程死在 `pthread_mutex_lock`（faulthandler 栈可见）。也就是说，原代码
-的"泄漏"里有一部分是**被捕获图的函数性需求**（args 必须永生）。
-
-**正确修复**（已部署 ds4f，三级验证通过）：启动时 `cudaStreamIsCapturing()` 探测——
-eager 一次性回调标记 `owned=true` 回调自删；捕获流标记 `owned=false` 永生（回放零分配，
-只在捕获时分配一次，量级为启动期常数）。验证：eager 1M 次 RSS 增长 -0.9 B/次
-（malloc_trim 后）；图 5000 次回放 × 4 节点无崩溃；生产 probe CLEAN + bench
-5/5 PASS 33.54 tok/s；MoE 微基准 M=1 227µs（基线 233µs）无回退。
-诊断要点：紧循环 RSS 读数含"已 free 未归还"的驻留页（纯 C 跨线程 malloc/free
-模式本身读出 ~28 B/次），**必须 malloc_trim 后再测**；CPU-only `sync()` 路径因
-指针不逃逸被编译器优化掉分配，泄漏只在 CUDA 路径。
-
-## 10. 环境变量使用纪律（2026-08-20 复验）
-
-下面这些环境变量在本栈逐一审计/实测过，**全部不需要显式设置**——4 个默认已开、
-2 个无读取点、2 个开启有害（曾出现于早期部署，勿再引入）：
+下面这些环境变量已逐一审计/实测，**全部不需要显式设置**——4 个默认已开、
+2 个无读取点、2 个开启有害（勿引入）：
 
 | env | 本栈状态 | 结论 |
 |---|---|---|
@@ -493,11 +443,4 @@ eager 一次性回调标记 `owned=true` 回调自删；捕获流标记 `owned=f
 | `SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD=1` | 默认 False；**无融合消费方**，=1 只是跳过 `output.mul_(rsf)` | **禁用**：模型 rsf=1.5，=1 会静默丢掉 ×1.5，三处 GPU MoE 路径（marlin/triton_kernels/trtllm）全部算错 |
 | `SGLANG_KT_FP8_LMHEAD=1` | 读取点在 `logits_processor.py:788`（head.weight BF16 129280×4096 满足条件） | **禁用**：见下 |
 
-`SGLANG_KT_FP8_LMHEAD` 实测细节（单元级，未动生产）：FP8 GEMV 内核数学正确
-（vs 手工反量化参照误差 0.037），T=1 提速 **1.96×**（2242→1143µs，读带宽减半），
-但 T=2 持平、T=4 反而 0.5×（einsum 按 T 逐行读权重），DSpark 下仅 draft 步受益。
-决定性否决点是 **stash 构建有数据竞争**：`build_lmhead_fp8` 的
-`weight[...].to("cpu", non_blocking=True)` 后立即在 CPU 上量化，同一权重两次构建
-产物**比特不同**且权重重建误差 ~0.007（健康 fp8 应为 ~0.0003，差 20×），会把
-logits 静默算坏。若未来要启用：先给 D2H 后补 `torch.cuda.synchronize()`，复测
-重建误差回到 ~2-3% 再说。ds4f.service 注释中已标注这两个 env 禁止引入。
+审计与实测依据见 `DSv4F-Opt.md` §4；ds4f.service 注释中已标注禁止引入。

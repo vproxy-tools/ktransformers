@@ -17,7 +17,7 @@ User=wkgcass
 Group=wkgcass
 WorkingDirectory=/home/wkgcass/ktransformers
 
-# --- 2026-08-19 起切换到 DSpark 投机解码栈（DSv4Flash.md 第 3.1/9 节）---
+# --- DSpark 投机解码栈（DSv4Flash.md 第 3.1/9 节）---
 # venv: 仓库根 .venv（torch 2.11+cu128；sglang 为
 # editable 安装，指向 third_party/sglang 的 dspark-kt 分支——不要切分支！）
 # 回滚旧栈：见文末注释块。
@@ -32,9 +32,9 @@ Environment=SGLANG_DEFAULT_THINKING=1
 
 # --- DSpark + SM89 回退栈必需 ---
 Environment=SGLANG_RAGGED_VERIFY_MODE=static
-# 2026-08-19: verify 元数据图外构建（ctx>111.4K 图内录制会损坏生成，见 DSv4Flash.md 9.3）
+# verify 元数据图外构建（ctx>111.4K 图内录制会损坏生成，见 DSv4Flash.md 9.3）
 Environment=SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1
-# 2026-08-19: 131072（513 页宽）prefill 的 indexer gather 峰值需要小 chunk + 消碎片
+# 131072（513 页宽）prefill 的 indexer gather 峰值需要小 chunk + 消碎片
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # SM89: deep_gemm (SM90+) 路径关闭，走 torch/triton 回退
 Environment=SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
@@ -43,7 +43,7 @@ Environment=SGLANG_OPT_USE_TOPK_V2=0
 # SM89: 索引器 logits 走 torch 回退（deep_gemm 是 SM90+）
 Environment=SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 
-# 旧栈的 8 个 perf env 已于 2026-08-20 在新栈逐一复验（DSv4Flash.md §10）：
+# 早期部署的 8 个 perf env 已逐一复验（DSv4Flash.md §10）：
 #   4 个默认已开（FUSE_WQA_WKV / USE_JIT_NORM / USE_MULTI_STREAM_OVERLAP /
 #     USE_FUSED_STORE_CACHE，environ.py EnvBool(True)，无需设置）；
 #   2 个已废弃（SGLANG_KT_WOA_FP8_TRITON / SGLANG_OPT_USE_OVERLAP_STORE_CACHE，
@@ -54,7 +54,7 @@ Environment=SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 #     SGLANG_KT_FP8_LMHEAD=1 —— build_lmhead_fp8 存数据竞争，两次构建产物
 #       比特不同且权重重建误差 ~20×，会静默打坏 logits。
 # SGLANG_DSV4_MODE / SGLANG_DSV4_2604_SUBMODE / SGLANG_ENABLE_THINKING 为
-# fork 专属，新栈不需要（见 DSv4F-Opt.md 1.5）。
+# 早期部署专属，本栈不需要（见 DSv4F-Opt.md 1.4）。
 
 # 子进程（scheduler / tokenizer manager）与 JIT 缓存需要 HOME 和 venv PATH
 Environment=HOME=/home/wkgcass
@@ -89,7 +89,7 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
 
 # cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。
 # MEMFRAC 0.60：DSpark draft 权重（~10.6GB）计入显存预算，0.90 会捕获失败；
-# 实际显存占用约 26.9GB / 48GB（2026-08-20 实测）。
+# 实际显存占用约 26.9GB / 48GB（实测）。
 # MAX-TOTAL-TOKENS 135168 = context 131072 + 4096 余量（须为 256 倍数；
 # 覆盖 --context-length 时同步调大）。
 
