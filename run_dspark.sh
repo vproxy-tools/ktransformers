@@ -1,13 +1,13 @@
 #!/bin/bash
 # DSv4-Flash + DSpark 实验实例（主线 sglang dspark-kt 分支 + kt CPU 专家）
-# 端口 30001，独立 venv: /var/deepseek-v4-flash/venvs/dspark（不影响生产 ds4f）
+# 端口 30001，用仓库 .venv（不影响生产 ds4f）
 # 用法:
 #   ./run_dspark.sh              # kt MXFP4 混合推理（无投机，基线）
 #   DSPARK=1 ./run_dspark.sh     # + --speculative-algorithm DSPARK（0731 自带 draft head）
 # 环境变量: EXTRA_ARGS / MEMFRAC / KT_CPUINFER / KT_TP_COUNT
 set -e
 cd /home/wkgcass/ktransformers
-source /var/deepseek-v4-flash/venvs/dspark/bin/activate
+source "$(dirname "$0")/.venv/bin/activate"
 
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST=8.9+PTX

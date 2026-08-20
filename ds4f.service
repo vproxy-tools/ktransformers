@@ -18,7 +18,7 @@ Group=wkgcass
 WorkingDirectory=/home/wkgcass/ktransformers
 
 # --- 2026-08-19 起切换到 DSpark 投机解码栈（DSv4Flash.md 第 3.1/9 节）---
-# venv: /var/deepseek-v4-flash/venvs/dspark（torch 2.11+cu128；sglang 为
+# venv: 仓库根 .venv（torch 2.11+cu128；sglang 为
 # editable 安装，指向 third_party/sglang 的 dspark-kt 分支——不要切分支！）
 # 回滚旧栈：见文末注释块。
 
@@ -54,15 +54,15 @@ Environment=SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 #     SGLANG_KT_FP8_LMHEAD=1 —— build_lmhead_fp8 存数据竞争，两次构建产物
 #       比特不同且权重重建误差 ~20×，会静默打坏 logits。
 # SGLANG_DSV4_MODE / SGLANG_DSV4_2604_SUBMODE / SGLANG_ENABLE_THINKING 为
-# fork 专属，新栈不需要（见 DSv4F-Opt.md 7.5）。
+# fork 专属，新栈不需要（见 DSv4F-Opt.md 1.5）。
 
 # 子进程（scheduler / tokenizer manager）与 JIT 缓存需要 HOME 和 venv PATH
 Environment=HOME=/home/wkgcass
-Environment=PATH=/var/deepseek-v4-flash/venvs/dspark/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/home/wkgcass/ktransformers/.venv/bin:/usr/local/bin:/usr/bin:/bin
 
 # ctx=131072：>111K 的 verify 损坏已由 SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1
 # 修复（DSv4Flash.md 9.3），131072 = 模型上限，端到端验证过 125K 增长探针
-ExecStart=/var/deepseek-v4-flash/venvs/dspark/bin/python -m sglang.launch_server \
+ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --model /var/deepseek-v4-flash/0731 \
   --kt-weight-path /var/deepseek-v4-flash/0731 \

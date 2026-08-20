@@ -1,8 +1,7 @@
 # DeepSeek-V4-Flash 构建与启动实录（RTX 4090D / ktransformers optimize-latest 分支）
 
-本文记录在本文机器上从源码编译 ktransformers（sglang-kt + kt-kernel）并启动
-DeepSeek-V4-Flash-0731 推理服务的完整步骤，包括与官方文档
-（`doc/en/DeepSeek-V4-Flash.md`）不一致之处及原因。已在 2026-08-17 全流程验证通过。
+本文记录从源码构建 ktransformers（sglang `dspark-kt` + kt-kernel）并启动
+DeepSeek-V4-Flash-0731 推理服务的完整步骤。
 
 ## 1. 环境信息
 
@@ -12,8 +11,9 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤，包括与官方文档
 > ```bash
 > export KT_ROOT=~/ktransformers                    # ktransformers 仓库根目录
 > export MODEL_DIR=/path/to/DeepSeek-V4-Flash-0731  # 模型权重目录（0731 版）
-> export DSPARK_VENV=/path/to/venvs/dspark          # dspark 栈 venv 目录
 > ```
+>
+> venv 一律指仓库根 `.venv`。
 
 | 项目 | 值 |
 |---|---|
@@ -22,9 +22,9 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤，包括与官方文档
 | CPU | AMD EPYC 9275F（48 核 96 线程，AVX512 全家桶：F/BW/VL/VNNI/BF16/VBMI，无 AMX） |
 | 内存 | 1.5TB（2 NUMA 节点） |
 | 系统 | Ubuntu 24.04，gcc 13.3，cmake 3.28，ninja |
-| Python venv | 生产栈：`$DSPARK_VENV`（Python 3.12，torch 2.11.0+cu128）；旧栈：仓库根 `.venv`（torch 2.9.1，保留可回滚） |
+| Python venv | 仓库根 `.venv`（Python 3.12，torch 2.11.0+cu128） |
 | 模型 | `$MODEL_DIR`（0731 版 checkpoint，156GB，48 个 safetensors 分片，DeepseekV4ForCausalLM） |
-| 代码分支 | ktransformers `optimize-latest`；submodule third_party/sglang = **`dspark-kt` 分支**（2026-08-19 起生产用，见第 9 节；最初构建时为 kvcache-ai fork @ bc7f0058f，5.1 节补丁属于那个时期） |
+| 代码分支 | ktransformers `optimize-latest`；submodule third_party/sglang = **`dspark-kt` 分支**（见第 9 节） |
 
 关键结论：
 
@@ -33,63 +33,46 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤，包括与官方文档
 
 ## 2. 构建步骤
 
-> **时效说明（2026-08-19 起）**：本节是 8/17 首次构建 **旧栈**（`.venv`，sglang
-> fork + torch 2.9.1）的记录，现仅用于重建旧栈/新机器初始化。**当前生产是
-> dspark 栈**（`venvs/dspark`，torch 2.11，构建方式见 `DSv4F-Opt.md` §7.2）。
-> 重建**旧栈**还须把 submodule 检出到 fork 时期（`bc7f0058f` + 5.1 节补丁
-> `312c1ee75`），否则装出来的是 dspark 源码、版本号与行为都不对。
+> **路径约定**：正文命令使用以下变量，按实际环境替换（本机实际取值见
+> `ds4f.service`；`$USER` 为运行服务的系统用户）：
+>
+> ```bash
+> export KT_ROOT=~/ktransformers                    # ktransformers 仓库根目录
+> export MODEL_DIR=/path/to/DeepSeek-V4-Flash-0731  # 模型权重目录（0731 版）
+> ```
+>
+> venv 一律指仓库根 `.venv`。
 
 ```bash
 cd $KT_ROOT
 
-# 2.0 创建 venv（install.sh 只往当前激活的环境里装，不负责建 venv）
-python3.12 -m venv .venv          # 需系统 python3.12（本机 3.12.3）
-source .venv/bin/activate
+# 2.0 创建 venv
+python3.12 -m venv .venv && source .venv/bin/activate
 
 # (可选) pip 缓存挪到大盘，避免根分区被写满
 export PIP_CACHE_DIR=$HOME/.pip-cache
 
-# 2.1 初始化 submodule（仓库已带则跳过；旧栈需按上方时效说明检出 fork 时期指针）
+# 2.1 初始化 submodule（dspark-kt 分支，指针已记录在仓库）
 git submodule update --init --recursive
 
-# 2.2 安装 sglang-kt（含 torch 2.9.1+cu128 等全部依赖，下载约 10GB）
-#     系统依赖 libhwloc-dev、pkg-config 已预装，故跳过 deps 子命令（避免 sudo 交互）
-./install.sh sglang
+# 2.2 安装依赖 + sglang（editable）
+#     关键版本：torch 2.11.0+cu128、flashinfer-python[cu12] 0.6.15.post1、
+#     transformers 5.12.1、tilelang 0.1.11、cuda-python 13.3.1；
+#     sgl-deep-gemm 0.1.5.post3+cu129 需 docs.sglang.ai 的 wheel 索引。
+#     venv 最初为手工组装（约 200 个包，完整清单 pip freeze），
+#     下面的 -e 安装让 sglang 依赖其 pyproject 解析；若个别 cu13 系
+#     依赖与驱动不匹配（本机驱动仅支持 CUDA 12.x），参照 pip freeze
+#     的实测版本手动 pin。
+pip install -e third_party/sglang/python
 
-# 2.3 编译安装 kt-kernel（自动检测 CPU：NATIVE + AMX=OFF + AVX512_BF16/VNNI/VBMI=ON）
-cd kt-kernel && ./install.sh build && cd ..
+# 2.3 编译安装 kt-kernel（自动检测 CPU：NATIVE + AMX=OFF + AVX512 全家桶 ON）
+#     必须带 --no-deps：kt-kernel 的 requirements pin 老 torch，裸装会降级依赖
+cd kt-kernel && pip install . --no-deps --no-build-isolation && cd ..
 
-# 2.4 flashinfer 升级并保证 python/cubin 版本一致
-#     注意：cubin 在 PyPI 最高只有 0.6.13，所以两边都固定 0.6.13
-#     （--upgrade 会装成 python 0.6.17 + cubin 0.6.13 的错位组合）
-pip install "flashinfer-python==0.6.13" "flashinfer-cubin==0.6.13"
-
-# 2.5 tilelang：必须用 0.1.13 + apache-tvm-ffi 0.1.12（见第 4 节排障记录）
-pip install "tilelang==0.1.13"   # 会自动带上 apache-tvm-ffi==0.1.12
-
-# 2.6 验证
-kt doctor          # 应全部"正常"，kt-kernel 显示 v0.6.4 (AVX512_BF16)
-python -c "from transformers import DeepseekV4Config; print('ok')"   # transformers-kt 5.6.0.post1 自带
+# 2.4 验证
+.venv/bin/python -c "import torch, sglang, kt_kernel; print('ok', torch.__version__)"
+kt doctor    # 应全部"正常"，kt-kernel 显示 v0.6.4
 ```
-
-### 与官方文档不同的两处依赖处理
-
-1. **transformers 不需要降到 4.57.1**。
-   文档说 sglang-kt 不固定 transformers、需手动 pin `transformers==4.57.1`；但本分支
-   pyproject 已固定 `transformers-kt==5.6.0.post1`（kvcache-ai 自己的 fork，就是为修复
-   transformers 5.x 的 `DeepSeekV4Config` dataclass TypeError 而生），实测导入正常。
-   直接装完即可，不要再用 pip 装 4.57.1 覆盖。
-
-2. **tilelang 用 0.1.13，不要按文档装 0.1.8**。
-   文档的验证组合 `tilelang==0.1.8 + apache-tvm-ffi<0.1.12` 对应 main 分支旧代码，
-   在本分支（submodule 更新后）实测均崩：
-   - tvm-ffi ≤ 0.1.11：tilelang JIT 编译内核时 `AttributeError: '_NestedLoopCheckVisitor'
-     object has no attribute '_inst'`（tilelang 自带 TVM 的 `TVMDerivedObject.__setattr__`
-     与旧版 tvm-ffi C 层 Object 协议不兼容）；
-   - tilelang 0.1.8 + tvm-ffi ≥ 0.1.12：tilelang 导入时 registry 崩
-     `AttributeError: attribute '__dict__' of 'type' objects is not writable`。
-   - **tilelang 0.1.13 + apache-tvm-ffi 0.1.12**（0.1.13 的原生依赖配对）编译、运行均正常。
-
 ## 3. 启动命令（RTX 4090D / SM_89 适配版）
 
 ### 3.1 本机调优配置（DSpark 投机解码 + cuda graph，日常使用）
@@ -104,16 +87,16 @@ cd $KT_ROOT
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST="8.9+PTX"
 
-# 思考模式默认开启（fork 时代的 SGLANG_ENABLE_THINKING 已废弃）
+# 思考模式默认开启
 export SGLANG_DEFAULT_THINKING=1
 
-# DSpark + SM89 回退栈必需（缺一不可，见 DSv4F-Opt.md §7）
+# DSpark + SM89 回退栈必需（缺一不可，见 DSv4F-Opt.md §1）
 export SGLANG_RAGGED_VERIFY_MODE=static
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
 export SGLANG_OPT_USE_TOPK_V2=0
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 
-$DSPARK_VENV/bin/python -m sglang.launch_server \
+$KT_ROOT/.venv/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --model $MODEL_DIR \
   --kt-weight-path $MODEL_DIR \
@@ -153,7 +136,7 @@ load_weight 部分会进一步缩短）。
 无可测影响。不同日子的"持续 tok/s"差异主要来自 soak 提示词的 accept
 分布，而非性能回退。
 
-参数说明（与旧栈的差异）：
+参数说明：
 
 | 参数 | 值 | 说明 |
 |---|---|---|
@@ -162,25 +145,23 @@ load_weight 部分会进一步缩短）。
 | `--chunked-prefill-size 512` | 131072 必需 | 513 页宽下 torch indexer gather 的 prefill 瞬时峰值 ~17GB（2048 chunk）会 OOM；512 后峰值 ~4-7GB。须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。仅影响 prefill 速度，decode 不变；90K 以下 prompt 可用 1024 |
 | `--max-total-tokens 135168` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 ~6GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
 | `--mem-fraction-static 0.60` | draft 权重 ~10.6GB 计入预算 | 0.90 会 graph 捕获失败；池大小由 max-total-tokens 决定后此值仅作预算校验 |
-| `--kt-cpuinfer 48` | 旧栈默认 44 | 2026-08-19 复验：bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正 |
-| cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §7.4）；前 2 步 verify 自动 eager 预热 |
-| 不再需要 | `SGLANG_DSV4_MODE/2604_SUBMODE` | 新栈从 config 读（swiglu_limit）；`--kt-gpu-prefill-token-threshold`、`--cuda-graph-bs 1` 也不再需要 |
+| `--kt-cpuinfer 48` | 复验 44 vs 48 | bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正 |
+| cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §1.4）；前 2 步 verify 自动 eager 预热 |
 
 注意事项：
 
-- **venv 是 `venvs/dspark` 且 sglang 为 editable**（指向 third_party/sglang 的
+- **venv 是仓库根 `.venv` 且 sglang 为 editable**（指向 third_party/sglang 的
   `dspark-kt` 分支检出）。运行期间不要切 sglang 分支；改分支=改生产代码。
 - **长 prompt 首 token 延迟是分钟级**：108K 上下文 ÷ 512 分块（131072 配置的
   chunk）≈ 211 次前向，且专家全在 CPU（实测 4168-token prompt prefill+回答 14.8s）。
 - `--max-running-requests 1` 保持；要并发需同步评估 draft/显存后重测。
-- 旧栈（.venv + fork）保留可回滚，回滚步骤见 ds4f.service 文末注释块。
 
 ### 3.2 文档基准配置（备用参考，短上下文 / 双并发）
 
 与 3.1 的差异：`--kt-num-gpu-experts 10`、`--kt-enable-dynamic-expert-update`、
 `--kt-cpuinfer 60`、`--context-length 16384`、`--mem-fraction-static 0.85`、
 `--max-running-requests 2`，无 parser 参数。完整命令见官方文档 `doc/en/DeepSeek-V4-Flash.md`
-Step 2（架构环境变量仍按上文 8.9 设置）。实测首请求 11.3 tok/s、显存 27.4GB、启动 4~5 分钟。
+Step 2（架构环境变量仍按上文 8.9 设置）。该配置未在本机当前栈复测，仅作参考。
 
 ### 3.3 思考模式（thinking）
 
@@ -197,9 +178,6 @@ Step 2（架构环境变量仍按上文 8.9 设置）。实测首请求 11.3 tok
 | 官方开关写法 | `"thinking": {"type": "enabled"}` 或 `{"type": "disabled"}` | 与 `chat_template_kwargs.thinking` 等效，对齐 api-docs.deepseek.com |
 | Anthropic 风格 | `"reasoning": {"effort": "none"}` / `{"effort": "max"}` | effort=none 关思考；也接受 `"enabled": true/false` |
 
-> 注意：fork 时代的 `SGLANG_ENABLE_THINKING` 在新栈已废弃（新栈读
-> `SGLANG_DEFAULT_THINKING`，且输出侧切分要求上面提到的 serving_chat 补丁）。
-
 开启后的请求示例（`reasoning_content` 为思考过程，`content` 为最终答案）：
 
 ```bash
@@ -215,8 +193,7 @@ curl -s -X POST http://127.0.0.1:30000/v1/chat/completions \
 ```
 
 > 注意：手动方式（不经 systemd，直接跑 3.1 命令）命令里已含
-> `export SGLANG_DEFAULT_THINKING=1`（fork 时代的 `SGLANG_ENABLE_THINKING`
-> 已废弃，见上方表格后的说明）；systemd 方式由 service 文件注入，无需手动设置。
+> `export SGLANG_DEFAULT_THINKING=1`；systemd 方式由 service 文件注入，无需手动设置。
 
 ### 投机解码
 
@@ -251,64 +228,18 @@ curl -s -X POST http://127.0.0.1:30000/v1/chat/completions \
 kt chat --host 127.0.0.1 --port 30000 --temperature 0.7 --max-tokens 2048
 ```
 
-2026-08-17 实测（temperature=0，max_new_tokens=128，含首 token 延迟）：约 **11.3 tok/s**，
-中英文输出正常。文档标称 5090 为 20+ tok/s，4090D 该成绩符合预期。
+吞吐与正确性请以 `tests/bench_dspark.py 30000` 为准（正确性 5/5 PASS、
+DSpark 单请求吞吐参考区间 32–36 tok/s，口径见 3.1）。
 
-## 5. 排障记录（本次构建实际踩过的坑）
+## 5. 排障记录
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
-| 启动即崩 `deepseek_v4.py ... raise NotImplementedError` | 未设 `SGLANG_DSV4_MODE`，代码只接受 2601/2604 | `export SGLANG_DSV4_MODE=2604` |
-| tilelang JIT 崩 `_NestedLoopCheckVisitor ... no attribute '_inst'` | tilelang 0.1.8 自带 TVM 与 tvm-ffi ≤0.1.11 的 C 层 Object 协议不兼容 | 升级 tilelang 0.1.13 |
-| tilelang 导入崩 `attribute '__dict__' of 'type' objects is not writable` | tilelang 0.1.8 + tvm-ffi ≥0.1.12 的 registry 冲突（即文档提到的 TVM FFI 冲突的另一表现） | tilelang 0.1.13 + tvm-ffi 0.1.12（其原生配对） |
-| `pip install --upgrade flashinfer-python flashinfer-cubin` 后版本错位（0.6.17 / 0.6.13） | PyPI 上 cubin 最高 0.6.13 | 两个包都显式固定 `==0.6.13` |
-| `install.sh` 的 deps 步骤要 sudo 密码 | 只为装 libhwloc-dev / pkg-config，本机已预装 | 跳过 deps，直接跑 `./install.sh sglang` 与 `kt-kernel/install.sh build` |
-| pip 解析器报 sglang-kt 依赖不满足（flashinfer/cutlass-dsl 版本警告） | 文档要求升级 flashinfer 突破了 sglang-kt 的 pin（`flashinfer_python==0.6.3`），属预期行为 | 忽略，运行时正常 |
-| 开思考后 `reasoning_content` 为 null，思考全文（含 `</think>`）混在 `content` 里 | sglang-kt 0.6.4 的 bug：V4 思考模式把 `<think>` 预填在 **prompt** 里，生成流开头没有 `<think>`；而 `_get_reasoning_from_request()` 只认请求里的 `chat_template_kwargs.thinking`，不认 `SGLANG_ENABLE_THINKING` 环境变量 → 解析器按"必须看到 `<think>` 才算思考"创建，拆分失败 | 打补丁（见下），已验证三种路径全部正常 |
-
-### 5.1 补丁：SGLANG_ENABLE_THINKING 环境变量的解析器适配
-
-**修复位置（源码，已提交）**：`third_party/sglang` 分支 `based-on-bc7f0058f`，
-提交 `312c1ee75`（"fix(dsv4): honor SGLANG_ENABLE_THINKING env in reasoning parser decision"），
-已推送至 `git@github.com:vproxy-tools/sglang`。
-改动文件：`python/sglang/srt/entrypoints/openai/serving_chat.py`（`_get_reasoning_from_request`）。
-
-```python
-# 原代码：只看请求参数
-return (
-    request.chat_template_kwargs is not None
-    and request.chat_template_kwargs.get("thinking") is True
-)
-
-# 补丁后：请求参数优先，否则回退到环境变量（与 prompt 渲染侧逻辑一致）
-if (
-    request.chat_template_kwargs is not None
-    and request.chat_template_kwargs.get("thinking") is not None
-):
-    return request.chat_template_kwargs.get("thinking") is True
-return envs.SGLANG_ENABLE_THINKING.get()
-```
-
-原理：`force_reasoning=True` 会让解析器按"输出开头就在思考中，直到 `</think>`"解析
-（DeepSeek-R1 风格），正好匹配 V4 思考模式"prompt 预填 `<think>`、输出只有 `</think>`"的格式。
-补丁让环境变量开启的思考也走这条路径。
-
-**生效方式**（sglang-kt 是普通 wheel 安装，改源码不会自动生效，需重装）：
-
-```bash
-source .venv/bin/activate
-export SGLANG_KT_VERSION=0.6.4
-cd third_party/sglang
-pip install --no-deps --no-build-isolation ./python
-sudo systemctl restart ds4f    # 或 kill 主进程触发 on-failure 自动拉起
-```
-
-已验证三种路径全部正常：环境变量默认思考 / 请求显式 `thinking: true` / 请求显式 `thinking: false`。
-
-⚠️ 补丁在 `based-on-bc7f0058f` 分支上；若 submodule 被 checkout 回 `origin/main`（bc7f0058f）
-或更新到其他基线，补丁会丢失，需重新应用并重装。父仓库 ktransformers 的 submodule 指针
-已指向 `312c1ee75`，记得在父仓库一并提交这个指针变更。
-
+| >100K 上下文 prefill OOM（513 页宽 gather 峰值 ~17GB） | indexer torch 回退按全 ctx 派生页宽 gather | `--chunked-prefill-size 512` + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（run_dspark.sh/ds4f.service 已带） |
+| 生产 30000 与实验 30001 同时启动 → 反复 OOM 崩溃循环 | 两个实例挤一张 48GB 卡 | 实验前停生产（systemd stop），跑完先停实验（DSv4F-Opt.md 3 的 GPU 独占规则） |
+| 手动 kill 后服务 30s 拉起失败循环 | ExecStart 指向的 venv/路径失效，或 StartLimitBurst(500/天) 耗尽 | `systemctl reset-failed ds4f && systemctl start ds4f`（sudo） |
+| RSS 看起来持续增长 | 紧循环测量含"已 free 未归还"驻留页 | 以 malloc_trim 后读数为准（DSv4F-Opt.md 3.6） |
+| 输出损坏（复读/数学错） | 先跑 `tests/probe_dspark.py`，损坏与 ctx 相关时用 `tests/bisect_ctx.sh` 二分 | 见 9.3/9.5 的两类已修复损坏 |
 ## 6. 服务管理（systemd）
 
 工程根目录提供了 `ds4f.service`（内容即 3.1 节的启动命令 + 必需环境变量），
@@ -343,90 +274,32 @@ nvidia-smi --query-gpu=memory.used --format=csv               # 确认显存归�
 
 ## 7. 修改代码后的增量构建安装（迭代开发）
 
-> **与第 2 节的区别**：第 2 节是首次完整构建（`./install.sh`，带全部依赖和 extras）。
-> 本节是**改完代码后让改动生效**的正确姿势。两者不可混用——见下面的注意点 1。
->
-> **2026-08-19 起**：生产栈 venv 是 `$DSPARK_VENV`（不再
-> 是 `.venv`）。其中 sglang 是 editable 安装（改 `third_party/sglang` 源码只需
-> 重启服务）；kt-kernel 是拷贝安装（改后需按 7.2 重编并把产物同步进该 venv）。
-> 以下命令中的 venv 激活请按目标栈选择。
+### 7.1 改 sglang（third_party/sglang，纯 Python 包）
 
-### 7.1 改 sglang-kt（third_party/sglang，纯 Python 包）
-
-> **dspark 生产栈（2026-08-19 起）不需要本节**：其 sglang 是 editable 安装
-> （见上方 2026-08-19 注），改 `third_party/sglang` 源码**只需重启服务**。
-> 本节的 wheel 重装流程仅适用于旧栈 `.venv`（sglang 为拷贝安装）。
-
-```bash
-source .venv/bin/activate
-export PIP_CACHE_DIR=$HOME/.pip-cache
-export SGLANG_KT_VERSION=0.6.4          # 与 install.sh 行为一致（读 ktransformers/version.py）
-cd third_party/sglang
-pip install --no-deps --no-build-isolation ./python
-sudo systemctl restart ds4f             # 重启后生效（见 7.3）
-```
-
-注意点：
-
-1. **不要用 `./install.sh sglang` 重新装**。它执行 `pip install "./python[all]"`，会重新解析
-   全部依赖：把 flashinfer 降回 pin 的 0.6.3（覆盖我们调好的 0.6.13）、重装 [all] extras、
-   触发 st_attn 等 sdist 源码编译。改码迭代必须用上面的 `--no-deps` 增量安装，
-   只替换 sglang-kt 自己，不碰其他包。
-2. **`--no-build-isolation`**：省去构建时另建临时环境下载 setuptools 等，快且行为可控。
-3. **`SGLANG_KT_VERSION`**：不设的话 wheel 版本号会取 pyproject 默认值，与 install.sh
-   装出来的不一致（`pip show sglang-kt` 显示会变）。
-4. **改源码不生效是正常的**：sglang-kt 是普通 wheel 安装（非 editable），运行进程加载的是
-   site-packages 里的拷贝。改了 `third_party/sglang` 后必须重装 + 重启。
-   （反过来：不要直接改 `.venv/.../site-packages/` 下的文件——重启即被绕过、重装即丢失，
-   5.1 节的补丁最初就吃过这个亏，最终落到了源码并提交。）
-5. **验证安装是否到位**（重启前先做，省一轮重启）：
-   ```bash
-   # 安装包与源码是否一致（无输出即一致）
-   diff third_party/sglang/python/sglang/srt/.../xxx.py \
-        .venv/lib/python3.12/site-packages/sglang/srt/.../xxx.py
-   ```
+`.venv` 里的 sglang 是 **editable 安装**——改 `third_party/sglang` 源码后
+**只需重启服务**（见 7.3），无需重装。运行期间不要切 sglang 分支；改分支=改生产代码。
 
 ### 7.2 改 kt-kernel（含 C++/CUDA 编译）
 
-**dspark 生产栈（torch 2.11.0+cu128）必须带 `--no-deps`**——kt-kernel 的
-requirements pin 的是 torch 2.9.x，裸 `pip install .` 会做依赖解析并把 venv 的
-torch 降级（2026-08-20 实际使用的流程）：
+kt-kernel 是拷贝安装，改 C++ 后需重编并装入 `.venv`。**必须带 `--no-deps`**
+（requirements pin 老 torch，裸装会把 venv 的 torch 降级）：
 
 ```bash
-source $DSPARK_VENV/bin/activate
-cd kt-kernel
-python3 -m pip install . --no-deps --no-build-isolation   # 增量重编+装入 venv
-# 需要清缓存全量重编时按旧法（--no-deps 同样要带）：
-#   CPUINFER_VERBOSE=0 python3 -m pip install . --no-deps --no-build-isolation
+source $KT_ROOT/.venv/bin/activate
+cd $KT_ROOT/kt-kernel
+python3 -m pip install . --no-deps --no-build-isolation   # 增量重编+装入
 ```
-
-旧栈 `.venv`（torch 2.9.1，requirements 一致）才可以用 `./install.sh build`
-（默认清 build/ 全量重编；频繁迭代加 `--no-clean` 保留编译缓存）。
 
 ### 7.3 重启使改动生效
 
 ```bash
 sudo systemctl restart ds4f
-# 无 sudo 时的等价方式：kill 主进程触发 on-failure 自动拉起
-pkill -9 -f "sglang.launch_server"     # systemd 会在 30s 后拉起新进程
+# 无 sudo 时：kill 主进程（systemctl show ds4f -p MainPID --value），30s 后自动拉起
 ```
 
 - 重启成本：30s 延迟 + 权重加载 + CUDA Graph，约 60~140s。
-- kill 方式受 `StartLimitBurst=500`/天 限制，超了会被 systemd 放弃，
-  需 `sudo systemctl reset-failed ds4f && sudo systemctl start ds4f`。
-- 改动是否生效看新进程的启动时间：`systemctl status ds4f` 或 `journalctl -u ds4f`。
-
-### 7.4 高频改码的替代：editable 安装
-
-```bash
-pip uninstall sglang-kt
-cd third_party/sglang && pip install --no-deps -e "./python"
-```
-
-之后改 sglang 源码**只需重启服务、无需重装**（python 代码进程启动时重新 import）。
-代价：环境从"wheel 拷贝"变成"指向源码树的链接"，别人复现时行为不同；
-正式部署前建议切回 wheel 安装（按 7.1 重装即可覆盖回普通模式）。
-
+- 自动拉起受 `StartLimitBurst=500`/天 限制，耗尽需 `systemctl reset-failed`。
+- 改动是否生效看新进程启动时间：`systemctl status ds4f` 或 `journalctl -u ds4f`。
 ## 8. 内存侧权重持久巨页（persistent hugepages）
 
 DeepSeek-V4-Flash 的 CPU 侧常驻权重（MXFP4 路由专家，每个 NUMA 约 81 GiB）不再走
@@ -468,8 +341,8 @@ sudo mkdir -p /dev/hugepages/kt_weights && sudo chown $USER:$USER /dev/hugepages
 目录建好后可先离线验证（不碰 GPU、可与生产共存，产物直接被服务器复用）：
 
 ```bash
-KT_MODEL_DIR=$MODEL_DIR $DSPARK_VENV/bin/python $KT_ROOT/tests/hp_weight_check.py 0   # 第一遍:冷(转换+commit)
-KT_MODEL_DIR=$MODEL_DIR $DSPARK_VENV/bin/python $KT_ROOT/tests/hp_weight_check.py 0   # 第二遍:热(打印 REUSED)
+KT_MODEL_DIR=$MODEL_DIR $KT_ROOT/.venv/bin/python $KT_ROOT/tests/hp_weight_check.py 0   # 第一遍:冷(转换+commit)
+KT_MODEL_DIR=$MODEL_DIR $KT_ROOT/.venv/bin/python $KT_ROOT/tests/hp_weight_check.py 0   # 第二遍:热(打印 REUSED)
 ```
 
 之后 ds4f 任意一次重启自然接通（冷一次，此后每次 REUSED、`load_weight` 显著缩短）。
@@ -502,12 +375,12 @@ size+mtime 校验自动 miss 并重新填充一次，之后恢复正常复用，
 
 ## 9. DSpark / 推测解码（speculative decoding）支持情况
 
-**结论（2026-08-19 更新）：已支持并在生产启用。** sglang 换到主线基底 + kt 引擎
-移植的 `dspark-kt` 分支（third_party/sglang，基底 4ad990ba7），DSpark 投机解码
-+ kt CPU 专家 + cuda graph 全部打通：**39.6 tok/s**（无投机基线 26.0，+52%；
-eager 模式 34.3）。`--speculative-algorithm DSPARK` 一个参数即可，0731 自带
-draft（`mtp.0.*`，4705 个权重键；config: block_size=5, markov_rank=256,
-target_layers=[40,41,42]）。**不要用 EAGLE**（见 9.1）。
+**已支持并在生产启用。** sglang 走 `dspark-kt` 分支（third_party/sglang，
+主线基底 4ad990ba7 + kt CPU 专家引擎移植），DSpark 投机解码 + cuda graph
+全部打通：**39.6 tok/s**（无投机基线 26.0，+52%；eager 模式 34.3）。
+`--speculative-algorithm DSPARK` 一个参数即可，0731 自带 draft（`mtp.0.*`，
+4705 个权重键；config: block_size=5, markov_rank=256, target_layers=[40,41,42]）。
+**不要用 EAGLE**（见 9.1）。
 
 ### 9.1 通用 EAGLE/MTP 路径仍不可用
 
@@ -519,16 +392,15 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
 
 ### 9.2 栈结构与关键修复
 
-- venv：`$DSPARK_VENV`（torch 2.11.0+cu128、flashinfer
+- venv：仓库根 `.venv`（torch 2.11.0+cu128、flashinfer
   cu12 系、sgl-kernel/sgl-deep-gemm cu129 索引；sglang editable 指向
   third_party/sglang@`dspark-kt`，kt-kernel 以 torch 2.11 头文件重编）。
-  生产旧栈 `.venv`（fork）保留可回滚。
 - SM89 适配：sparse 注意力走 Triton 回退、索引器 logits 走 torch 回退、
-  topk v1、paged_mqa_metadata smem 钳制（详见 DSv4F-Opt.md §7）。
+  topk v1、paged_mqa_metadata smem 钳制（详见 DSv4F-Opt.md §1）。
 - draft 保持纯 GPU（约 10.6GB，MEMFRAC 需 ≥0.60），target 专家全在 CPU。
 - **kt-kernel pinned-buffer 生命周期修复**（graph 损坏的根因）：CPU 专家的
   pinned 中转 buffer 曾走单槽 temp 缓存，graph 捕获后任何 prefill 换槽都会
-  释放并被复用，replay 读写别人内存。修复后 graph 默认开启（DSv4F-Opt.md 7.4）。
+  释放并被复用，replay 读写别人内存。修复后 graph 默认开启（DSv4F-Opt.md 1.4）。
 - **输出侧 thinking 切分补丁**（serving_chat.py）：V4 模板的
   explicit_thinking 探测模式下，`SGLANG_DEFAULT_THINKING=1` 只影响 prompt 侧、
   输出侧不切 `</think>`（全部落 content）。补丁让输出侧同样遵循
@@ -579,10 +451,10 @@ bench 5/5 PASS（32.8 tok/s）；长上下文增长探针单会话 19.5K / 109K 
 - 实验实例：`run_dspark.sh`（30001 端口，CTXLEN/MAXTOK/MEMFRAC/PREFILL/
   EAGER 环境变量可覆盖；`EAGER=1` 回退无损 eager）；`stop_sglang.sh` 安全
   清理所有 sglang 进程（避免 pkill 自匹配；**会连 30000 生产一起停**）。
-- 以上工具均已集中在仓库根的 **`tests/` 目录**（2026-08-20 归类；旧栈时期的
+- 以上工具均已集中在仓库根的 **`tests/` 目录**（2026-08-20 归类；早期的
   bench/profiler 脚本也一并移入）；启动/停止脚本（`run_dspark.sh`、
   `stop_sglang.sh` 等）仍在仓库根。完整说明（执行前提、结果解读、通过/不通过
-  分界、清理要求）面向开发者，见 `DSv4F-Opt.md` §9；本节仅速查。
+  分界、清理要求）面向开发者，见 `DSv4F-Opt.md` §3；本节仅速查。
 
 ### 9.5 SyncArgs 泄漏修复与图捕获 use-after-free 事故（2026-08-20）
 
@@ -605,20 +477,20 @@ eager 一次性回调标记 `owned=true` 回调自删；捕获流标记 `owned=f
 模式本身读出 ~28 B/次），**必须 malloc_trim 后再测**；CPU-only `sync()` 路径因
 指针不逃逸被编译器优化掉分配，泄漏只在 CUDA 路径。
 
-## 10. 旧栈 8 个 perf env 在新栈（dspark-kt）的复验（2026-08-20）
+## 10. 环境变量使用纪律（2026-08-20 复验）
 
-旧栈（.venv / sglang-kt 主线基底）为性能设过 8 个 env。逐个在新栈代码审计 +
-可执行处实测后的结论——**一个都不要搬，4 个默认已开、2 个已废弃、2 个开启有害**：
+下面这些环境变量在本栈逐一审计/实测过，**全部不需要显式设置**——4 个默认已开、
+2 个无读取点、2 个开启有害（曾出现于早期部署，勿再引入）：
 
-| 旧栈 env | 新栈状态 | 结论 |
+| env | 本栈状态 | 结论 |
 |---|---|---|
 | `SGLANG_OPT_FUSE_WQA_WKV=1` | `environ.py:1303` 默认 `EnvBool(True)` | 冗余，不设即开 |
 | `SGLANG_OPT_USE_JIT_NORM=1` | `environ.py:1316` 默认 `EnvBool(True)` | 冗余，不设即开 |
 | `SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1` | `environ.py:1317` 默认 `EnvBool(True)`（仅 HIP 分支强制关） | 冗余，不设即开 |
 | `SGLANG_OPT_USE_FUSED_STORE_CACHE=1` | `environ.py:1315` 默认 `EnvBool(True)` | 冗余，不设即开 |
-| `SGLANG_KT_WOA_FP8_TRITON=1` | 新栈无任何读取点（仅 environ.py 定义+docstring） | 已废弃 |
-| `SGLANG_OPT_USE_OVERLAP_STORE_CACHE=1` | 新栈无任何读取点 | 已废弃 |
-| `SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD=1` | 默认 False；新栈**无融合消费方**，=1 只是跳过 `output.mul_(rsf)` | **禁用**：模型 rsf=1.5，=1 会静默丢掉 ×1.5，三处 GPU MoE 路径（marlin/triton_kernels/trtllm）全部算错 |
+| `SGLANG_KT_WOA_FP8_TRITON=1` | 无任何读取点（仅 environ.py 定义+docstring） | 已废弃 |
+| `SGLANG_OPT_USE_OVERLAP_STORE_CACHE=1` | 无任何读取点 | 已废弃 |
+| `SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD=1` | 默认 False；**无融合消费方**，=1 只是跳过 `output.mul_(rsf)` | **禁用**：模型 rsf=1.5，=1 会静默丢掉 ×1.5，三处 GPU MoE 路径（marlin/triton_kernels/trtllm）全部算错 |
 | `SGLANG_KT_FP8_LMHEAD=1` | 读取点在 `logits_processor.py:788`（head.weight BF16 129280×4096 满足条件） | **禁用**：见下 |
 
 `SGLANG_KT_FP8_LMHEAD` 实测细节（单元级，未动生产）：FP8 GEMV 内核数学正确
@@ -628,5 +500,4 @@ eager 一次性回调标记 `owned=true` 回调自删；捕获流标记 `owned=f
 `weight[...].to("cpu", non_blocking=True)` 后立即在 CPU 上量化，同一权重两次构建
 产物**比特不同**且权重重建误差 ~0.007（健康 fp8 应为 ~0.0003，差 20×），会把
 logits 静默算坏。若未来要启用：先给 D2H 后补 `torch.cuda.synchronize()`，复测
-重建误差回到 ~2-3% 再说。旧栈当时开着此 env，质量影响未评估（存疑）。
-ds4f.service 回滚块中的旧栈 env 清单已同步加注（FUSE_RSF 标注禁止、两个废弃）。
+重建误差回到 ~2-3% 再说。ds4f.service 注释中已标注这两个 env 禁止引入。

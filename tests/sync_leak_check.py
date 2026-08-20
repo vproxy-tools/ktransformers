@@ -11,7 +11,7 @@
           RSS 增长 ≈ 0（捕获型 args 永生，回放零分配）。
 
 用法（用 dspark venv 的 python，须有 GPU；与生产服务可共存，显存占用 <1.5GB）:
-  /var/deepseek-v4-flash/venvs/dspark/bin/python sync_leak_check.py
+  <仓库>/.venv/bin/python tests/sync_leak_check.py
 退出码 0 = 通过；任何一路数值超标或崩溃 = 不通过。
 """
 import gc

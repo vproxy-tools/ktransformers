@@ -32,3 +32,4 @@ kvc2/
 sched/
 *.png
 .venv
+*.swp
