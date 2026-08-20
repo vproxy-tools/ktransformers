@@ -64,6 +64,16 @@ prefill 的 apply 在 sync 后把 mask 清零，保证之后无 python 的 decod
 （= 0 专家对照 40.6，噪声内零回退）。阈值可用
 `SGLANG_KT_GPU_EXPERTS_PREFILL_MIN` 调。
 
+**整层放置（front-loading）实测否决**：同显存把层 0-3 整层放 GPU
+（`--kt-expert-placement-strategy front-loading`，24×43=1032 个专家），
+prefill 487.1（≈uniform，无增益），但 bench_dspark 第 5 题确定性 FAIL——
+输出退化为复读（accept 虚高把 decode 推到 ~47 tok/s 的假象）。疑点指向
+matmul_ogs 全专家层与 CPU dpbf16 路径的细微数值差异经 greedy 放大；
+uniform 子集路径无此问题。该路径在 SM120 上游验证过、本栈未验证——
+如需启用须先做逐层输出对齐。结论：**prefill 下分裂层与整层放置同显存
+收益相当（GPU 份额与 CPU 重叠，分裂开销在大 batch 下摊薄），整层无优势
+且有正确性风险，维持 uniform + 相位切换。**
+
 配套修复：`v4_triton_kernels_moe.py` 的 `_make_routing_data_v4` 原依赖
 `triton_kernels.routing`（本 venv 的 0.1.0 精简版没有）——改走 SparseMatrix
 + `make_ragged_tensor_metadata`（vLLM 同款构造），topk 6→8 的 2 幂 padding
