@@ -44,6 +44,12 @@ Environment=SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 # 索引器用 tilelang 融合内核替代上面的 torch eager 回退（SM89 实测编译通过；
 # prefill 383→493 tok/s，decode 无回退。回退开关：置 0）
 Environment=SGLANG_OPT_USE_TILELANG_INDEXER=1
+# 部分常驻专家层用 Marlin 内核（SM89）：常驻 GPU 专家在 decode 分摊 CPU 权重
+# 带宽（matmul_ogs 小 M 每层 ~762us 不可用）。回退开关：置 0
+Environment=SGLANG_V4_MARLIN_PARTIAL=1
+# Marlin 常驻模式下关闭"decode 全 CPU"的相位切换（Marlin decode 47.9 >
+# 全 CPU 41.4；仅在 MARLIN_PARTIAL=0 时才应设回 1）
+Environment=SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0
 
 # 早期部署的 8 个 perf env 已逐一复验（DSv4Flash.md §10）：
 #   4 个默认已开（FUSE_WQA_WKV / USE_JIT_NORM / USE_MULTI_STREAM_OVERLAP /
@@ -69,13 +75,15 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --model /var/deepseek-v4-flash/0731 \
   --kt-weight-path /var/deepseek-v4-flash/0731 \
   --kt-method MXFP4 \
-  --kt-num-gpu-experts 24 \
+  --kt-expert-placement-strategy hybrid \
+  --kt-num-gpu-full-layers 1 \
+  --kt-num-gpu-experts 28 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
   --context-length 131072 \
   --attention-backend flashinfer \
-  --mem-fraction-static 0.85 \
+  --mem-fraction-static 0.87 \
   --max-total-tokens 135168 \
   --chunked-prefill-size 1024 \
   --max-prefill-tokens 1024 \
@@ -90,14 +98,15 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --tool-call-parser deepseekv4
 
 # cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。
-# KT-NUM-GPU-EXPERTS 24：相位切换（SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY，默认开）——
-#   prefill 批次（≥64 token）用 GPU 常驻专家（+7% prefill），decode/verify（含
-#   cuda graph 重放）全走 CPU（40 tok/s，与 0 专家完全一致）。CPU 侧本来就有
-#   全部 256 个专家权重，GPU 副本按层常驻 ~13GB。
-# MEMFRAC 0.85：DSpark draft（~10.6GB）+ 24 GPU 专家（~13GB）计入预算后 0.60
-#   会拒绝启动；实测总占用约 36.8GB / 48GB。
+# 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：每层
+#   28 个常驻专家（~15GB，Marlin 计算 prefill+decode）+ 第 1 个 MoE 层整层
+#   （~3.2GB，零 GPU-CPU 通信，decode 走 Marlin 省整层 CPU 带宽）。叠加式：
+#   整层用的是 uniform-28 之外的真余显存（matmul_ogs 时代整层负收益，
+#   Marlin 解锁后净赚）。实测 prefill 506.9 / decode 47.9 tok/s。
+# MEMFRAC 0.87：DSpark draft（~10.6GB）+ 专家（~18.4GB）计入预算；实测总
+#   占用约 42.0GB / 48GB（再填一层 3.2GB 会挤压图捕获，勿超）。
 # CHUNKED-PREFILL 1024（原 512）：tilelang 索引器 + expandable_segments 下，
-#   >100K 重预填充实测安全（grow_probe 到 125K 通过）；prefill ~494 tok/s。
+#   >100K 重预填充实测安全（grow_probe 到 125K 通过）。
 #   若换更大 KV 占用的配置出现 >100K prefill OOM，回退 512。
 
 # 注意：历史版本单元文件里的 perf env 不要搬回本文件——复验结论见

@@ -107,13 +107,15 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
   --model $MODEL_DIR \
   --kt-weight-path $MODEL_DIR \
   --kt-method MXFP4 \
+  --kt-expert-placement-strategy hybrid \
+  --kt-num-gpu-full-layers 1 \
   --kt-num-gpu-experts 28 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
   --context-length 131072 \
   --attention-backend flashinfer \
-  --mem-fraction-static 0.85 \
+  --mem-fraction-static 0.87 \
   --max-total-tokens 135168 \
   --chunked-prefill-size 1024 \
   --max-prefill-tokens 1024 \
@@ -128,9 +130,9 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
   --tool-call-parser deepseekv4
 ```
 
-实测（47K prompt / DSpark + 常驻 28 GPU 专家 + partial Marlin + tilelang）：
-**prefill 499.3 tok/s**（优化前 306，+63%）、decode **43.1 tok/s**（+9%）、
-显存约 **39.6GB / 48GB**、start→ready 约 60~100s。
+实测（47K prompt / DSpark + hybrid 放置[28/层 + 1 整层] + partial Marlin + tilelang）：
+**prefill 506.9 tok/s**（优化前 306，+66%）、decode **47.9 tok/s**（+21%）、
+显存约 **42.0GB / 48GB**、start→ready 约 60~100s。
 吞吐口径澄清与逐项优化记录见 DSv4F-Opt.md §5。
 
 **吞吐口径澄清**：DSpark 下 tok/s = accept/周期，
@@ -150,7 +152,7 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
 | `--chunked-prefill-size 1024` | prefill 摊销更好（~+8%） | tilelang 索引器下 >100K 重预填充实测安全（grow_probe 125K PASS，DSv4F-Opt.md §5.4）；须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。若改配置后 >100K prefill OOM，回退 512 |
 | `--max-total-tokens 135168` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 ~6GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
 | `--mem-fraction-static 0.85` | draft 10.6GB + 24 GPU 专家 ~13GB 计入预算 | 实测 36.8GB/48GB；0.60 会因预算校验拒绝启动 |
-| `--kt-num-gpu-experts 28` | 常驻 + partial Marlin（`SGLANG_V4_MARLIN_PARTIAL=1`，`PREFILL_ONLY=0`） | 常驻 GPU 专家经 Marlin 分摊 decode 带宽（43.1 tok/s）；若 Marlin 不可用须回退相位切换模式（`PREFILL_ONLY=1` 默认、24 专家），否则 decode 掉到 ~25 tok/s（matmul_ogs 小 M 每层 762µs） |
+| hybrid：28/层 + 1 整层 | 常驻 + partial Marlin（`SGLANG_V4_MARLIN_PARTIAL=1`，`PREFILL_ONLY=0`） | 拆分层 GPU 专家与 CPU 逐层并行；整层（~3.2GB）叠加用真余显存，零通信且 decode 走 Marlin（47.9 tok/s）；显存 42.0GB，再填一层会挤压图捕获。若 Marlin 不可用须回退相位切换模式（`PREFILL_ONLY=1`、24 专家、无整层），否则 decode 掉到 ~25 tok/s（matmul_ogs 小 M 每层 762µs） |
 | `--kt-cpuinfer 48` | 复验 44 vs 48 | bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正；v2 内核下 24/28/32 线程每 NUMA 持平 |
 | cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §1.4）；前 2 步 verify 自动 eager 预热 |
 

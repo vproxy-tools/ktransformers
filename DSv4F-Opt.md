@@ -140,7 +140,15 @@ probe CLEAN / bench ALL PASS / grow_probe 125K 全 PASS，显存 ~39.6GB。
 | 配置 | prefill | decode |
 |---|---|---|
 | 相位切换 + matmul_ogs（§5.3） | 487.0 | 41.4 |
-| **常驻 28 + partial Marlin（终版）** | **499.3** | **43.13** |
+| 常驻 28 + partial Marlin | 499.3 | 43.13 |
+| **+ hybrid 1 整层叠加（1F+28U，真终版）** | **506.9** | **47.93** |
+
+**hybrid 叠加式胜出的前提是 Marlin**（用户提议）：之前 hybrid 测出持平/
+负收益有两个原因——整层被迫走 matmul_ogs，且当时是"替换式"花显存（从
+uniform 份额里拨）。Marlin 解锁后"uniform-28 保持 + 真余显存填 1 整层"
+是纯增量：整层省 38.6ms CPU/层、暴露 ~4ms GPU、零通信，decode 该层走
+Marlin 再省 ~1.1ms/步。显存 42.0GB（再填一层会挤压图捕获）。
+probe CLEAN / bench ALL PASS / grow_probe 125K 全 PASS。
 
 ### 5.8 为什么是 499 不是 800（量化结论）
 
