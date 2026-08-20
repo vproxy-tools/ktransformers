@@ -30,7 +30,7 @@ for CTX in "$@"; do
     tail -4 /tmp/dspark_bisect.log
     continue
   fi
-  if python3 probe_dspark.py 30001 >/tmp/probe_out.txt 2>&1; then
+  if python3 tests/probe_dspark.py 30001 >/tmp/probe_out.txt 2>&1; then
     echo "=== CTX=$CTX CLEAN ==="
   else
     echo "=== CTX=$CTX CORRUPT ==="

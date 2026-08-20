@@ -27,15 +27,20 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤，包括与官方文档
 > **时效说明（2026-08-19 起）**：本节是 8/17 首次构建 **旧栈**（`.venv`，sglang
 > fork + torch 2.9.1）的记录，现仅用于重建旧栈/新机器初始化。**当前生产是
 > dspark 栈**（`venvs/dspark`，torch 2.11，构建方式见 `DSv4F-Opt.md` §7.2）。
+> 重建**旧栈**还须把 submodule 检出到 fork 时期（`bc7f0058f` + 5.1 节补丁
+> `312c1ee75`），否则装出来的是 dspark 源码、版本号与行为都不对。
 
 ```bash
 cd /home/wkgcass/ktransformers
+
+# 2.0 创建 venv（install.sh 只往当前激活的环境里装，不负责建 venv）
+python3.12 -m venv .venv          # 需系统 python3.12（本机 3.12.3）
 source .venv/bin/activate
 
 # (可选) pip 缓存挪到大盘，避免根分区被写满
 export PIP_CACHE_DIR=/var/pip-cache
 
-# 2.1 初始化 submodule（仓库已带则跳过）
+# 2.1 初始化 submodule（仓库已带则跳过；旧栈需按上方时效说明检出 fork 时期指针）
 git submodule update --init --recursive
 
 # 2.2 安装 sglang-kt（含 torch 2.9.1+cu128 等全部依赖，下载约 10GB）
@@ -455,8 +460,8 @@ sudo mkdir -p /dev/hugepages/kt_weights && sudo chown wkgcass:wkgcass /dev/hugep
 
 ```bash
 cd /var/deepseek-v4-flash/venvs/dspark
-./bin/python /home/wkgcass/ktransformers/hp_weight_check.py 0   # 第一遍:冷(转换+commit)
-./bin/python /home/wkgcass/ktransformers/hp_weight_check.py 0   # 第二遍:热(打印 REUSED)
+./bin/python /home/wkgcass/ktransformers/tests/hp_weight_check.py 0   # 第一遍:冷(转换+commit)
+./bin/python /home/wkgcass/ktransformers/tests/hp_weight_check.py 0   # 第二遍:热(打印 REUSED)
 ```
 
 之后 ds4f 任意一次重启自然接通（冷一次，此后每次 REUSED、`load_weight` 显著缩短）。
@@ -557,17 +562,19 @@ bench 5/5 PASS（32.8 tok/s）；长上下文增长探针单会话 19.5K / 109K 
 
 ### 9.4 验证与工具
 
-- 正确性/吞吐：`bench_dspark.py`（5 提示词贪心）；快速探针：`probe_dspark.py`
+- 正确性/吞吐：`tests/bench_dspark.py`（5 提示词贪心）；快速探针：`tests/probe_dspark.py`
   （数学/翻译/重复词检测，退出码 0=干净）。
-- 长上下文：`grow_probe.py`（单会话逐级加长 20/96/112/120K，含位置 ~10 埋的
+- 长上下文：`tests/grow_probe.py`（单会话逐级加长 20/96/112/120K，含位置 ~10 埋的
   远程暗号回忆、新数学题、重复度检测；`--stages=` 可自定义）。
-- ctx 阈值二分：`bisect_ctx.sh CTX1 CTX2 ...`（逐 ctx 重启+短探针，判
+- ctx 阈值二分：`tests/bisect_ctx.sh CTX1 CTX2 ...`（逐 ctx 重启+短探针，判
   CLEAN/CORRUPT；损坏与实际序列长度无关时尤其快）。
 - 实验实例：`run_dspark.sh`（30001 端口，CTXLEN/MAXTOK/MEMFRAC/PREFILL/
   EAGER 环境变量可覆盖；`EAGER=1` 回退无损 eager）；`stop_sglang.sh` 安全
   清理所有 sglang 进程（避免 pkill 自匹配；**会连 30000 生产一起停**）。
-- 以上工具的完整说明（执行前提、结果解读、通过/不通过分界、清理要求）面向
-  开发者，见 `DSv4F-Opt.md` §9；本节仅速查。
+- 以上工具均已集中在仓库根的 **`tests/` 目录**（2026-08-20 归类；旧栈时期的
+  bench/profiler 脚本也一并移入）；启动/停止脚本（`run_dspark.sh`、
+  `stop_sglang.sh` 等）仍在仓库根。完整说明（执行前提、结果解读、通过/不通过
+  分界、清理要求）面向开发者，见 `DSv4F-Opt.md` §9；本节仅速查。
 
 ### 9.5 SyncArgs 泄漏修复与图捕获 use-after-free 事故（2026-08-20）
 

@@ -60,8 +60,8 @@ Environment=SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 Environment=HOME=/home/wkgcass
 Environment=PATH=/var/deepseek-v4-flash/venvs/dspark/bin:/usr/local/bin:/usr/bin:/bin
 
-# 上下文 110592（108K）：DSpark verify 在 >111K context 下确定性损坏
-# （二分实测：110592 干净 / 111616 起损坏，见 DSv4Flash.md 9.3）
+# ctx=131072：>111K 的 verify 损坏已由 SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1
+# 修复（DSv4Flash.md 9.3），131072 = 模型上限，端到端验证过 125K 增长探针
 ExecStart=/var/deepseek-v4-flash/venvs/dspark/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --model /var/deepseek-v4-flash/0731 \
@@ -87,27 +87,19 @@ ExecStart=/var/deepseek-v4-flash/venvs/dspark/bin/python -m sglang.launch_server
   --reasoning-parser deepseek-v4 \
   --tool-call-parser deepseekv4
 
-# cuda graph 默认开启（kt-kernel pinned-buffer 生命周期修复后正确且更快，
-# 39.6 vs 34.3 tok/s）；前 2 步 verify 由 dspark_verify.py 强制 eager 预热。
-# MEMFRAC 0.60：DSpark draft 权重（~10.6GB）计入显存预算，0.90 会捕获失败。
-# MAX-TOTAL-TOKENS 114688（= context 110592 + 4096 余量）：KV 池右移，
-# 30.7GB → 24.5GB（省 6.2GB），A/B 实测无性能差异（单请求用不满大池）。
-#   注意：覆盖 --context-length 时须同步调大此值（256 倍数）。
-# --kt-gpu-prefill-token-threshold 与 --cuda-graph-bs 1 为旧栈参数，新栈不需要。
+# cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。
+# MEMFRAC 0.60：DSpark draft 权重（~10.6GB）计入显存预算，0.90 会捕获失败；
+# 实际显存占用约 26.9GB / 48GB（2026-08-20 实测）。
+# MAX-TOTAL-TOKENS 135168 = context 131072 + 4096 余量（须为 256 倍数；
+# 覆盖 --context-length 时同步调大）。
 
-# --- 回滚旧栈（如需）：恢复以下三处 ---
-# 注意（2026-08-20 复验）：以下旧栈 env 仅在旧栈自身有效；
-#   SGLANG_KT_FP8_LMHEAD 的 stash 构建竞争在新栈实测会算坏 logits
-#   （旧栈 torch 版本不同，但建议回滚后也先跑 probe_dspark.py 验证质量）。
-# Environment=PATH=/home/wkgcass/ktransformers/.venv/bin:/usr/local/bin:/usr/bin:/bin
-# 并恢复旧环境变量：SGLANG_DSV4_MODE=2604 / SGLANG_DSV4_2604_SUBMODE=2604B /
-#   SGLANG_ENABLE_THINKING=1 / SGLANG_KT_WOA_FP8_TRITON=1 / SGLANG_KT_FP8_LMHEAD=1 /
-#   SGLANG_OPT_FUSE_WQA_WKV=1 / SGLANG_OPT_USE_JIT_NORM=1 /
-#   SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1 / SGLANG_OPT_USE_FUSED_STORE_CACHE=1 /
-#   SGLANG_OPT_USE_OVERLAP_STORE_CACHE=1 / SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD=1
-# ExecStart 中去掉 --speculative-algorithm DSPARK，--context-length 131072，
-#   --mem-fraction-static 0.90，--kt-cpuinfer 48，加回 --kt-gpu-prefill-token-threshold 4096
-#   与 --cuda-graph-bs 1 --cuda-graph-max-bs 1
+# --- 回滚旧栈（如需）---
+# 旧版单元文件（.venv PATH + 旧栈全套 env 与参数）直接取 git 历史：
+#   git -C /home/wkgcass/ktransformers show 1560a27:ds4f.service
+# 注意：旧栈 env 仅在旧栈自身有效，不要把其中任何一项搬回本文件
+# （复验结论见 DSv4Flash.md 10；尤其 FUSE_RSF_SHARED_ADD 会静默算错、
+# KT_FP8_LMHEAD 的 stash 构建有数据竞争）。回滚后先跑 tests/probe_dspark.py
+# 30000 验证质量再对外。
 
 # 崩溃后至少等 30s 再拉起（配合上面的 StartLimit 限流）
 Restart=on-failure
