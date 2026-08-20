@@ -544,7 +544,9 @@ bench 5/5 PASS（32.8 tok/s）；长上下文增长探针单会话 19.5K / 109K 
   CLEAN/CORRUPT；损坏与实际序列长度无关时尤其快）。
 - 实验实例：`run_dspark.sh`（30001 端口，CTXLEN/MAXTOK/MEMFRAC/PREFILL/
   EAGER 环境变量可覆盖；`EAGER=1` 回退无损 eager）；`stop_sglang.sh` 安全
-  清理所有 sglang 进程（避免 pkill 自匹配）。
+  清理所有 sglang 进程（避免 pkill 自匹配；**会连 30000 生产一起停**）。
+- 以上工具的完整说明（执行前提、结果解读、通过/不通过分界、清理要求）面向
+  开发者，见 `DSv4F-Opt.md` §9；本节仅速查。
 
 ### 9.5 SyncArgs 泄漏修复与图捕获 use-after-free 事故（2026-08-20）
 

@@ -1,15 +1,21 @@
 #!/bin/bash
-# 用法: bisect_ctx.sh CTX1 CTX2 ...  —— 依次以给定 ctx 重启并跑短探针，输出 CLEAN/CRUPT
+# 用法: bisect_ctx.sh CTX1 CTX2 ...  —— 依次以给定 ctx 重启并跑短探针，输出 CLEAN/CORRUPT
+# 只重启 30001 实验实例（run_dspark.sh 固定 30001）；生产 ds4f(30000) 不受影响。
 set -u
 cd /home/wkgcass/ktransformers
 for CTX in "$@"; do
-  PIDS=$(pgrep -f 'sglang\.launch_server' | tr '\n' ' ')
+  # 按 "launch_server 且 cmdline 含 --port 30001" 精确匹配，避免误杀生产
+  PIDS=$(pgrep -f 'sglang\.launch_server' | while read -r p; do
+    tr '\0' ' ' < /proc/"$p"/cmdline 2>/dev/null | grep -q -- '--port 30001' && echo "$p"
+  done)
   [ -n "$PIDS" ] && kill $PIDS 2>/dev/null
   for i in $(seq 1 20); do
     sleep 3
-    pgrep -f 'sglang\.launch_server' >/dev/null || break
+    pgrep -f 'sglang\.launch_server' | while read -r p; do
+      tr '\0' ' ' < /proc/"$p"/cmdline 2>/dev/null | grep -q -- '--port 30001' && echo "$p"
+    done | grep -q . || break
   done
-  pkill -9 -f 'sglang\.launch_server' 2>/dev/null
+  pkill -9 -f 'sglang\.launch_server.*--port 30001' 2>/dev/null
   sleep 3
   echo "=== CTX=$CTX starting ==="
   DSPARK=1 CTXLEN=$CTX MAXTOK=$CTX MEMFRAC=0.60 nohup ./run_dspark.sh > /tmp/dspark_bisect.log 2>&1 &

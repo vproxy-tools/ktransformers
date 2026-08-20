@@ -267,9 +267,9 @@ checksum 对比；pinned 指针复用独立复现脚本。
   （environ 已带开关，默认关）。
 - SPS 置信度调度表（`--speculative-dspark-sps-table-path`）离线构建。
 - kt-kernel C++ 小修：`CPUInfer::sync_with_cuda_stream` 的 `new SyncArgs` 从不
-  delete（每层每步 16B 泄漏，长跑约 12MB/h），修在 sync_ 内 delete 即可，但需
-  重编 .so。生产 fork 的 .venv 内 experts_base.py 同样带本 bug，生产切 dspark-kt
-  栈时一并带上。
+  delete（每层每步 16B 泄漏，长跑约 12MB/h）——**已修（2026-08-20，c082623）**：
+  eager 一次性回调自删、图捕获型 args 永生（无条件 delete 曾引发回放 use-after-free
+  崩溃循环，事故记录见 DSv4Flash.md 9.5）；回归测试 `sync_leak_check.py`（9.6 节）。
 - 生产切换评估：dspark-kt 分支当前基线比生产 fork 新 6782 个主线提交，行为
   差异（SWA 池、调度器、入口）需完整回归后再考虑替换 ds4f。
 
@@ -281,3 +281,145 @@ checksum 对比；pinned 指针复用独立复现脚本。
 - DSpark 实验：`run_dspark.sh` / `stop_dspark.sh`（30001 端口，venv-dspark；
   `KEEP_GRAPHS=1` 开 graph 调试）；基准 `bench_dspark.py`（5 提示词贪心，校验+吞吐）；
   sglang 分支 `third_party/sglang@dspark-kt`
+- **测试工具全集（功能/前提/执行/清理/结果解读/通过分界）：见 §9**
+  —— `probe_dspark.py` / `bench_dspark.py` / `grow_probe.py` / `bisect_ctx.sh` /
+  `hp_weight_check.py` / `sync_leak_check.py` / `run_dspark.sh`+`stop_sglang.sh` /
+  `kt-kernel/bench/bench_fp4_moe*.py`
+
+## 9. 测试工具参考（开发者）
+
+面向开发者；普通用户视角的构建/部署/运行见 `DSv4Flash.md`（其 9.4 节有工具简表并指回本节）。
+通用前提：所有探针/基准都向目标端口发**真实生成请求**（temperature=0 贪心），
+默认超时 600–1200s；除特别注明外用系统 python3 即可（只依赖 urllib）。
+
+**GPU 独占规则（重要）**：生产 ds4f(30000) 与实验实例（run_dspark.sh，30001）**不能
+同时占 GPU**——2026-08-20 早晨生产部署时实验实例残留 24GB 显存，导致生产 OOM 崩溃
+循环 11 次。要跑实验（bisect_ctx.sh / A/B 重启类），先停生产（`sudo systemctl stop
+ds4f`，或 kill 主进程靠 systemd 30s 后拉起、注意 StartLimitBurst 预算）；跑完把实验
+实例停干净再把生产拉回。探针/基准（不重启服务器）与生产共存没问题。
+
+### 9.1 `probe_dspark.py` —— 快速损坏探针
+
+- **功能**：3 个短生成（数学 12×3、中译英、百字短文），检查数学正确性、翻译可辨、
+  思考/正文切分、重复词（dup_score：8+ 字符 chunk 在邻近 60 字内重复次数）。
+- **前提**：目标端口有活的 sglang 实例（生产或实验均可）。
+- **执行**：`python3 probe_dspark.py [port]`（默认 30001；对生产用 30000）。~1 分钟。
+- **清理**：无需。服务端无状态残留（--disable-radix-cache，不污染缓存）。
+- **解读**：输出 `CLEAN` 或 `CORRUPT:` + 逐条失败原因（math wrong / translate bad /
+  reasoning dup / essay dup 等）。
+- **通过分界**：**退出码 0=CLEAN，1=CORRUPT**，可直接接 CI/脚本判断。偶发单条
+  失败先重跑一次（贪心下应稳定复现才算真损坏）。
+
+### 9.2 `bench_dspark.py` —— 正确性 + 吞吐基准（5 提示词）
+
+- **功能**：5 个贪心提示词（算术/翻译/事实/作文/代码），逐条硬校验 + 记录
+  completion_tokens/耗时，汇总 tok/s。
+- **前提**：同上；建议目标实例已跑 warmup（首条请求含 Triton JIT 时会偏慢）。
+- **执行**：`python3 bench_dspark.py [port]`。~20–60s（含思考输出的提示词较慢）。
+- **清理**：无需。
+- **解读**：每条 `[i] PASS/FAIL  N tok / Ts = X tok/s` + 输出前 80 字；末行
+  `TOTAL: ... tok/s` 与 `ALL PASS` / `SOME FAILED`。
+- **通过分界**：`ALL PASS` = 通过；吞吐参考区间（131072 ctx + cpuinfer 48 +
+  单请求）**32–36 tok/s**，低于 30 需查（先看当条 accept 长度：tok/s = accept/周期，
+  强依赖提示词的 accept 分布，见 DSv4Flash.md 3.1 的说明，勿直接当回归）。逐条
+  FAIL 的判据是硬校验（如乘法结果字符串），与吞吐无关。
+
+### 9.3 `grow_probe.py` —— 长上下文增长探针
+
+- **功能**：单会话逐级加长（默认 20/96/112/120K），第 1 级埋远程暗号 `XK-42Q7`
+  （~19.5K 填充文本，每行 ~39 token 已按本分词器校准），每级做暗号回忆 + 新数学题 +
+  重复度检测——区分"长程注意力丢失"（暗号丢）与"当步生成损坏"（数学错/复读）。
+- **前提**：**ctx=131072 配置**的实例（`run_dspark.sh` 默认；池 135168）。
+- **执行**：`python3 grow_probe.py [port] [--stages=20,96,112,120]`。每级 ~1–3 分钟，
+  全程 10–20 分钟（输出逐级 flush，可中途看进度）。
+- **清理**：无需（radix cache 已禁用，会话结束即释放；服务端 KV 池按页回收）。
+- **解读**：每级一行 `[stage NK] prompt~P => PASS/FAIL codeword=.. math=.. dup=..`，
+  失败项在下一行给样例。判损坏"出现的实际序列长度"区间取首个 FAIL 级。
+- **通过分界**：**全部级 PASS = 通过**。任一级 codeword 丢失而 math 正常 → 长程
+  注意力问题；math 错/dup>4 → 当步生成损坏（曾用于定位 >111K verify 损坏，见
+  DSv4Flash.md 9.3）。~134K 级被 400 拒绝属预期（超 131072 上限）。
+
+### 9.4 `bisect_ctx.sh` —— context 阈值二分（重启循环）
+
+- **功能**：对给定的一组 ctx 值，逐个以该 ctx 重启 30001 实验实例并跑 9.1 探针，
+  输出逐 ctx 的 CLEAN/CORRUPT——损坏只与静态 ctx 配置相关（与实际序列长度无关）
+  时定位最快。
+- **前提**：**GPU 归实验用**（脚本会反复重启 30001；已改为只杀 cmdline 含
+  `--port 30001` 的实例，生产 30000 不受影响，但两者仍不能同时驻留显存——先停生产）。
+- **执行**：`./bisect_ctx.sh CTX1 CTX2 ...`（如 `98304 106496 110592 111616`）。
+  每个 ctx 启动 ~2 分钟 + 探针 ~1 分钟；全程 = ctx 数 × ~3 分钟。
+- **清理**：跑完脚本**不会自动停最后一个实例**——生产要用 GPU 时先
+  `./stop_sglang.sh`（会连生产一起杀，慎用；或按 9.7 的方式精确停 30001）。
+- **解读**：逐行 `=== CTX=N CLEAN/CORRUPT ===`（CORRUPT 附探针失败明细）；
+  `SERVER_FAILED` 表示该 ctx 起不来（OOM 等），看 `/tmp/dspark_bisect.log`。
+- **通过分界**：无（是定位工具）。相邻一档 CLEAN、一档 CORRUPT 即损坏阈值边界
+  （如 110592 CLEAN / 111616 CORRUPT）。
+
+### 9.5 `hp_weight_check.py` —— 巨页权重缓存冷/热链路验证（CPU-only）
+
+- **功能**：用真实模型某一层走与服务器**完全一致**的 NativeMoE MXFP4 加载路径：
+  冷进程做 safetensors 读取 + 转换写入持久 arena + commit 标记；热进程 python
+  `check_reusable` 命中 → 跳过 safetensors，C++ 直接 mmap 驻留大页。产物（marker +
+  weights.bin 分段）**就是服务器要复用的内容**（layer key/stamp/pfp 与 ds4f 一致）。
+- **前提**：`/dev/hugepages/kt_weights` 已存在且当前用户可写（root 一次性
+  mkdir+chown，见 DSv4Flash.md 8）；**必须用 dspark venv 的 python**（要 import
+  kt_kernel）。
+- **执行**：连跑两遍（必须是两个独立进程——同进程第二次 alloc 时 arena cursor 已
+  前移，marker 偏移不再相等，测不出复用）：
+  `/var/deepseek-v4-flash/venvs/dspark/bin/python hp_weight_check.py [layer_idx]`
+- **清理**：**不需要，也不要清**——marker/大页内容留给服务器复用。只有换模型/换
+  布局时才清 `/var/lib/kt-hugepage-weights` 与 `kt_weights/`（DSv4Flash.md 8）。
+- **解读**：第 1 遍应见 `[hugepage_weights] layer N tp X: ... allocated in persistent
+  hugepages`（转换+commit，单层秒级）；第 2 遍 `[pre-check] check_reusable = True`、
+  `weights REUSED from persistent hugepages (safetensors skipped)`、`... REUSED from
+  persistent hugepages`、总耗时从数百 ms 掉到 ~60ms。marker 可核对
+  `pfp=9bcd0b02fd234216`（0731 模型 + AMXFP4_KGroup_MOE 的期望值）。
+- **通过分界**：**第 2 遍打印 REUSED 且 check_reusable=True = 通过**；第 2 遍仍
+  allocated（冷）= 复用链断（marker/指纹不一致，删除标记重跑）；日志完全没有
+  `[hugepage_weights]` 行 = 缓存未启用（目录缺失或 KT_HUGEPAGE_WEIGHTS=0）。
+
+### 9.6 `sync_leak_check.py` —— SyncArgs 泄漏 / 图回放 UAF 回归
+
+- **功能**：双路回归 kt-kernel `CPUInfer::sync_with_cuda_stream` 的修复（DSv4Flash.md
+  9.5）：eager 路 100 万次调用后 malloc_trim RSS 增长应≈0；含 4 个 sync host 节点的
+  cuda graph 5000 次回放应无崩溃无增长（捕获型 args 永生、回放零分配）。
+- **前提**：GPU 可用（占用 <1.5GB，**与生产共存安全**）；dspark venv python（编译进
+  venv 的 .so 才是被测对象——先按 DSv4Flash.md 7.2 重编并装入 venv 再测源码改动）。
+- **执行**：`/var/deepseek-v4-flash/venvs/dspark/bin/python sync_leak_check.py`，~2 分钟。
+- **清理**：无需（纯本地进程）。
+- **解读**：`[eager] ... (X B/次)` 与 `[graph] ... 无崩溃`；测量陷阱：紧循环 RSS 读数
+  含"已 free 未归还"的驻留页（纯 C 跨线程 malloc/free 模式本身 ~28B/次），所以
+  **必须看 malloc_trim 之后**的数字——脚本已内置 trim。
+- **通过分界**：末行 **PASS**（eager ≤8 B/次、graph 增长 ≤64MB、无崩溃）退出码 0；
+  FAIL 或中途 Segmentation fault = 不通过（后者=图回放 UAF 回来了）。
+
+### 9.7 `run_dspark.sh` / `stop_sglang.sh` —— 实验实例启停
+
+- **功能**：`run_dspark.sh` 在 30001 起 dspark 实验实例（独立 venv，不动生产），
+  环境变量覆盖：`CTXLEN`（默认 131072）、`MAXTOK`（135168）、`MEMFRAC`（DSPARK 下
+  默认 0.60）、`KT_CPUINFER`（48）、`PREFILL`（512）、`EAGER=1` 回退无损 eager；
+  `stop_sglang.sh` 停**所有** sglang 进程（含生产！）。
+- **前提**：GPU 独占规则（见节首）。要精确只停 30001：按 cmdline 过滤
+  `--port 30001` 后 kill（bisect_ctx.sh 里的写法可抄）；要停生产交给 systemd。
+- **执行**：`DSPARK=1 CTXLEN=... ./run_dspark.sh`（前台日志；或 nohup 重定向）；
+  就绪判定 `grep "fired up and ready to roll"`，全量启动 ~2 分钟。
+- **清理**：实验完停实例即完成清理；日志在自选的重定向文件。
+- **解读/通过分界**：启动脚本非测试工具；就绪后接 9.1/9.2 判定。
+
+### 9.8 `kt-kernel/bench/bench_fp4_moe.py`（+ `_cold` 变体）—— CPU MoE 微基准
+
+- **功能**：合成 V4-Flash 形状（E256/H4096/I2048/top6/g32）的 MXFP4 权重，测 AMX MoE
+  逐层内核 µs 级性能；`--routing balanced|concentrated` 控制专家命中分布，
+  `--m-list` 批次列表；`_cold` 变体按 token 轮换随机路由（模拟真实 L3 冷访问）。
+  结果追加进 `bench/bench_fp4_moe.jsonl`（含 git commit 与时间戳，作历史基线）。
+- **前提**：无 GPU 需求（CPU-only，**与生产共存安全**）；用 dspark venv python。
+  机器健康对照时注意**同负载条件**——服务器在跑（尤其加载权重期）或其它吃核任务
+  会显著抬高 M=1（曾把 233µs 读成 321µs）。
+- **执行**：`cd kt-kernel && ../../venvs路径/bin/python bench/bench_fp4_moe.py --m-list 1,4`
+  （cold：`bench_fp4_moe_cold.py [--iters 300]`）。
+- **清理**：无需（jsonl 历史有意保留；脚本已强制 `KT_HUGEPAGE_WEIGHTS=0`，
+  合成权重不会碰持久巨页 arena）。
+- **解读**：每行 `M=  N  per-iter= X us  tok/s=`；历史基线 M=1 ≈ **227–235µs**
+  （2026-08-17/19/20 三日一致）。
+- **通过分界**：M=1 落在历史 ±5% 内 = 机器/内核健康；显著偏高先查负载再查回归
+  （对照 jsonl 里最近记录的 commit 定位改动）。
