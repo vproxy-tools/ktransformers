@@ -13,9 +13,9 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤，包括与官方文档
 | CPU | AMD EPYC 9275F（48 核 96 线程，AVX512 全家桶：F/BW/VL/VNNI/BF16/VBMI，无 AMX） |
 | 内存 | 1.5TB（2 NUMA 节点） |
 | 系统 | Ubuntu 24.04，gcc 13.3，cmake 3.28，ninja |
-| Python venv | 仓库根目录 `.venv`（Python 3.12.3） |
+| Python venv | 生产栈：`/var/deepseek-v4-flash/venvs/dspark`（Python 3.12，torch 2.11.0+cu128）；旧栈：仓库根 `.venv`（torch 2.9.1，保留可回滚） |
 | 模型 | `/var/deepseek-v4-flash/0731`（156GB，48 个 safetensors 分片，DeepseekV4ForCausalLM） |
-| 代码分支 | ktransformers `optimize-latest`（submodule third_party/sglang = kvcache-ai fork @ bc7f0058f） |
+| 代码分支 | ktransformers `optimize-latest`；submodule third_party/sglang = **`dspark-kt` 分支**（2026-08-19 起生产用，见第 9 节；最初构建时为 kvcache-ai fork @ bc7f0058f，5.1 节补丁属于那个时期） |
 
 关键结论：
 
@@ -23,6 +23,10 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤，包括与官方文档
 - pyproject 里的 `torch-cu130` 索引只对 `uv` 生效（`[tool.uv.sources]`）；`install.sh` 用的是普通 pip，x86_64 会从 PyPI 装 cu128 版 torch，正好适配本机驱动。
 
 ## 2. 构建步骤
+
+> **时效说明（2026-08-19 起）**：本节是 8/17 首次构建 **旧栈**（`.venv`，sglang
+> fork + torch 2.9.1）的记录，现仅用于重建旧栈/新机器初始化。**当前生产是
+> dspark 栈**（`venvs/dspark`，torch 2.11，构建方式见 `DSv4F-Opt.md` §7.2）。
 
 ```bash
 cd /home/wkgcass/ktransformers
@@ -101,7 +105,7 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
   --kt-weight-path /var/deepseek-v4-flash/0731 \
   --kt-method MXFP4 \
   --kt-num-gpu-experts 0 \
-  --kt-cpuinfer 44 \
+  --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
   --context-length 131072 \
@@ -122,10 +126,10 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 ```
 
 2026-08-19 实测（DSpark + cuda graph + KV 池右移）：**39.6 tok/s** 持续
-（峰值 49.8，accept 2.2-3.8），比无投机基线 26.0 **+52%**；显存约
-**24.5GB / 48GB**（KV 池右移后；右移前 30.7GB），就绪约 80~90s（巨页权重
-缓存命中时）。同日放开到 131072（9.3 节修复，`--max-total-tokens 135168`），
-显存约 24.4GB。
+（峰值 49.8，accept 2.2-3.8），比无投机基线 26.0 **+52%**；显存（131072 配置、
+生产 30000 实测 2026-08-20）约 **26.9GB / 48GB**（110592 早期配置为 24.4GB），
+start→ready 约 **60~100s**（scheduler_e2e ~56s + 图捕获；巨页权重缓存命中后
+load_weight 部分会进一步缩短）。
 
 **吞吐口径澄清（2026-08-19 深夜复测）**：DSpark 下 tok/s = accept/周期，
 高度依赖提示词内容——数数类（高可预测）70.8 tok/s、bench 5 题混合
@@ -144,7 +148,7 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 | `--chunked-prefill-size 512` | 131072 必需 | 513 页宽下 torch indexer gather 的 prefill 瞬时峰值 ~17GB（2048 chunk）会 OOM；512 后峰值 ~4-7GB。须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。仅影响 prefill 速度，decode 不变；90K 以下 prompt 可用 1024 |
 | `--max-total-tokens 135168` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 ~6GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
 | `--mem-fraction-static 0.60` | draft 权重 ~10.6GB 计入预算 | 0.90 会 graph 捕获失败；池大小由 max-total-tokens 决定后此值仅作预算校验 |
-| `--kt-cpuinfer 48` | 与旧栈一致 | 2026-08-19 复验：bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正 |
+| `--kt-cpuinfer 48` | 旧栈默认 44 | 2026-08-19 复验：bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正 |
 | cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §7.4）；前 2 步 verify 自动 eager 预热 |
 | 不再需要 | `SGLANG_DSV4_MODE/2604_SUBMODE` | 新栈从 config 读（swiglu_limit）；`--kt-gpu-prefill-token-threshold`、`--cuda-graph-bs 1` 也不再需要 |
 
@@ -152,8 +156,8 @@ export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 
 - **venv 是 `venvs/dspark` 且 sglang 为 editable**（指向 third_party/sglang 的
   `dspark-kt` 分支检出）。运行期间不要切 sglang 分支；改分支=改生产代码。
-- **长 prompt 首 token 延迟是分钟级**：108K 上下文 ÷ 2048 分块 ≈ 54 次前向，
-  且专家全在 CPU（实测 4168-token prompt prefill+回答 14.8s）。
+- **长 prompt 首 token 延迟是分钟级**：108K 上下文 ÷ 512 分块（131072 配置的
+  chunk）≈ 211 次前向，且专家全在 CPU（实测 4168-token prompt prefill+回答 14.8s）。
 - `--max-running-requests 1` 保持；要并发需同步评估 draft/显存后重测。
 - 旧栈（.venv + fork）保留可回滚，回滚步骤见 ds4f.service 文末注释块。
 
@@ -196,8 +200,9 @@ curl -s -X POST http://127.0.0.1:30000/v1/chat/completions \
   }'
 ```
 
-> 注意：手动方式（不经 systemd，直接跑 3.1 命令）需要自己 `export SGLANG_ENABLE_THINKING=1`
-> 才默认思考；systemd 方式由 service 文件注入，无需手动设置。
+> 注意：手动方式（不经 systemd，直接跑 3.1 命令）命令里已含
+> `export SGLANG_DEFAULT_THINKING=1`（fork 时代的 `SGLANG_ENABLE_THINKING`
+> 已废弃，见上方表格后的说明）；systemd 方式由 service 文件注入，无需手动设置。
 
 ### 投机解码
 
@@ -293,7 +298,8 @@ sudo systemctl restart ds4f    # 或 kill 主进程触发 on-failure 自动拉�
 ## 6. 服务管理（systemd）
 
 工程根目录提供了 `ds4f.service`（内容即 3.1 节的启动命令 + 必需环境变量），
-崩溃自动拉起（30s 延迟、每天最多 12 次，防止异常状态下反复加载 150GB 权重）。
+崩溃自动拉起（30s 延迟；限流 `StartLimitIntervalSec=86400` / `StartLimitBurst=500`，
+即每天最多 500 次重启）。
 
 安装（需要 sudo）：
 
@@ -306,7 +312,7 @@ sudo systemctl enable --now ds4f        # 开机自启 + 立即启动
 常用操作：
 
 ```bash
-systemctl status ds4f                  # 状态（启动约 46s 后就绪）
+systemctl status ds4f                  # 状态（start→ready 约 60~100s）
 journalctl -u ds4f -f                  # 跟踪日志，出现 "fired up and ready to roll" 即就绪
 sudo systemctl restart ds4f            # 重启（改了 service 文件后需先 daemon-reload）
 sudo systemctl stop ds4f               # 停止（先 SIGTERM 给 120s 干净退出，超时强杀）
@@ -332,6 +338,10 @@ nvidia-smi --query-gpu=memory.used --format=csv               # 确认显存归�
 > 以下命令中的 venv 激活请按目标栈选择。
 
 ### 7.1 改 sglang-kt（third_party/sglang，纯 Python 包）
+
+> **dspark 生产栈（2026-08-19 起）不需要本节**：其 sglang 是 editable 安装
+> （见上方 2026-08-19 注），改 `third_party/sglang` 源码**只需重启服务**。
+> 本节的 wheel 重装流程仅适用于旧栈 `.venv`（sglang 为拷贝安装）。
 
 ```bash
 source .venv/bin/activate
@@ -364,14 +374,20 @@ sudo systemctl restart ds4f             # 重启后生效（见 7.3）
 
 ### 7.2 改 kt-kernel（含 C++/CUDA 编译）
 
+**dspark 生产栈（torch 2.11.0+cu128）必须带 `--no-deps`**——kt-kernel 的
+requirements pin 的是 torch 2.9.x，裸 `pip install .` 会做依赖解析并把 venv 的
+torch 降级（2026-08-20 实际使用的流程）：
+
 ```bash
-source .venv/bin/activate
+source /var/deepseek-v4-flash/venvs/dspark/bin/activate
 cd kt-kernel
-./install.sh build              # 默认会清 build/ 全量重编（几分钟）
-# 频繁迭代可加 --no-clean 保留编译缓存，只重编改动部分
+python3 -m pip install . --no-deps --no-build-isolation   # 增量重编+装入 venv
+# 需要清缓存全量重编时按旧法（--no-deps 同样要带）：
+#   CPUINFER_VERBOSE=0 python3 -m pip install . --no-deps --no-build-isolation
 ```
 
-kt-kernel 的 requirements（torch==2.9.1）与现环境一致，直接跑不会动依赖。
+旧栈 `.venv`（torch 2.9.1，requirements 一致）才可以用 `./install.sh build`
+（默认清 build/ 全量重编；频繁迭代加 `--no-clean` 保留编译缓存）。
 
 ### 7.3 重启使改动生效
 
@@ -381,8 +397,8 @@ sudo systemctl restart ds4f
 pkill -9 -f "sglang.launch_server"     # systemd 会在 30s 后拉起新进程
 ```
 
-- 重启成本：30s 延迟 + 权重加载 + CUDA Graph，约 80~140s。
-- kill 方式受 `StartLimitBurst=12`/天 限制，超了会被 systemd 放弃，
+- 重启成本：30s 延迟 + 权重加载 + CUDA Graph，约 60~140s。
+- kill 方式受 `StartLimitBurst=500`/天 限制，超了会被 systemd 放弃，
   需 `sudo systemctl reset-failed ds4f && sudo systemctl start ds4f`。
 - 改动是否生效看新进程的启动时间：`systemctl status ds4f` 或 `journalctl -u ds4f`。
 
@@ -465,6 +481,11 @@ GPU 参数同样缓存到持久巨页：`third_party/sglang` 新增
 不再读盘。改动 sglang 后需重装：
 `cd third_party/sglang && SGLANG_KT_VERSION=0.6.4 pip install --no-deps --no-build-isolation ./python`。
 `KT_HUGEPAGE_GPU_WEIGHTS=0` 可关闭。实测重启到就绪约 40 秒，推理输出正常。
+
+**2026-08-20 现状**：8/19 挂载点重建同样把 GPU 参数缓存的数据文件清掉了
+（node1 的 manifest `gpu_weights.json` 还在，但数据已失配）——下次启动按
+size+mtime 校验自动 miss 并重新填充一次，之后恢复正常复用，无需人工干预
+（数据目录的 sudo 重建见第 8 节开头的说明，GPU/CPU 两个缓存共用该目录）。
 
 ## 9. DSpark / 推测解码（speculative decoding）支持情况
 

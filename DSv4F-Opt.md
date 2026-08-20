@@ -151,7 +151,8 @@ sudo systemctl daemon-reload && sudo systemctl start ds4f
 `~/.config/sglang/env` 保留同名 KEY=VALUE 作为兜底（unit 未含对应行时才生效，
 语义为 setdefault；进程显式环境变量 > unit > 该文件）。
 - 回滚单项：注释 unit 中对应 `Environment=` 行（或删除兜底文件对应行）；
-  回滚内核：`cd kt-kernel && git checkout <旧commit> && ./install.sh build`。
+  回滚内核：`cd kt-kernel && git checkout <旧commit> && ./install.sh build`
+  （旧栈 `.venv` 流程；**dspark 生产栈**重编必须 `--no-deps`，见 DSv4Flash.md 7.2）。
 - 说明：代码侧（venv 内已装）不依赖 env 文件也可运行——`SGLANG_KT_WOA_FP8_TRITON=0`
   时 wo_a 回退 bf16 einsum，其余 SGLANG_OPT_* 默认关闭。
 
@@ -203,16 +204,18 @@ kvcache-ai fork（基于 2 月主线）没有 DSpark，因此开新分支 **`dsp
 
 - 独立 venv：`/var/deepseek-v4-flash/venvs/dspark`（torch 2.11.0+cu128、
   flashinfer 0.6.15.post1[cu12]、sgl-kernel/sgl-deep-gemm 自 docs.sglang.ai
-  cu129 索引、transformers 5.12.1；sglang 与 kt-kernel 均 editable/本地构建）。
-  生产 `.venv` 完全不动。
+  cu129 索引、transformers 5.12.1；sglang 为 editable、kt-kernel 为本地构建
+  拷贝安装）。旧栈 `.venv`（torch 2.9.1）保留未动，仅作回滚。
 - 启停：`run_dspark.sh` / `stop_dspark.sh`（30001 端口）。`DSPARK=1` 开投机，
   默认 cuda graph 开 + `SGLANG_RAGGED_VERIFY_MODE=static`（7.4 修复后正确且
   更快；`EAGER=1` 回退无损 eager）。MEMFRAC：无投机 0.30，DSPARK 需 ≥0.60
   （draft 权重计入预算）。
 - 依赖分支状态：third_party/sglang 指针已记录在 optimize-latest（分支 `dspark-kt`，
   venv 内 sglang 为 editable 安装）。kt-kernel 以 torch 2.11 头文件重编
-  （`pip install --no-build-isolation --no-deps .`）。注意：生产 ds4f 仍用
-  `.venv` 内的 fork 拷贝，不受此指针影响；从本分支全新构建会得到 dspark 实验栈。
+  （`pip install --no-build-isolation --no-deps .`）。
+  **2026-08-19/20 更新：dspark 栈已转正为生产**——ds4f.service 直接使用本 venv
+  （editable sglang + 拷贝 .so），systemd 部署于 30000。本节撰写时（8/19 实验期）
+  生产还是 `.venv` 旧栈，那一状态已作废；旧栈 `.venv` 现仅作回滚用途。
 
 ### 7.3 实测（greedy，5 提示词，30001 端口）
 
