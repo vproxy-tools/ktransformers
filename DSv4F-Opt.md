@@ -51,28 +51,39 @@ prefill +7~9%（空闲 GPU 算力 + CPU 侧 DRAM 减压），decode 却 -40%
 （M=1 时路由构建 + matmul_ogs 开销远超省下的 CPU 时间）。
 
 修法（kt_ep_wrapper.py `KTEPWrapperMethod.apply`）：C++ 的
-`should_skip_expert` 是从 python 传入的 mask 张量**内存实时读**的——
+`should_skip_expert` 从 mask 张量**内存实时读**——但注意它读的是
+kt-kernel wrapper 在 `BaseMoEWrapper.__init__` 里 **clone 出来的 pinned
+副本**，不是 sglang 侧持有的那张（第一次实现写错了张量，decode 图重放
+读到的永远是初始快照 → front-loading 下层 0-3 在 decode 整层缺失，
+输出退化为复读 prompt；uniform 下每层缺 24 个专家 ~9% MoE 质量，
+探针门槛内侥幸通过——两处都必须翻 pinned 副本）。
 `SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=1`（默认开）下，≥64 token 的批次
 （prefill chunk）恢复真 mask（CPU 只算非 GPU 专家，GPU 算常驻的），
 更小批次（decode / DSpark verify / 尾块）清零 mask（CPU 算全部 256 个）；
 GPU 侧同步旁路（decode 图捕获时走 bypass 分支，图内无 GPU MoE kernel）。
-prefill 的 apply 在 sync 后把 mask 清零，保证之后无 python 的 decode 图
-重放读到全零。**依赖调度器串行调度（--max-running-requests 1）**；
-未来开并发 prefill+decode 前需重估竞争窗口。
+**第二个坑**：prefill 层末的清零必须先 `self._sync_done_event.synchronize()`
+——`sync_forward` 只是 cudaLaunchHostFunc 异步挂载，不等事件就清零会
+抢在本层 C++ 读取之前，静默退化为"CPU 全量 + GPU 双算"（prefill -7%）。
+事件等待的流水线代价 ~1.5%。**依赖调度器串行调度
+（--max-running-requests 1）**；`SGLANG_KT_KEEP_MASK=1` 可禁用清零
+（回到常驻行为，decode 会缺 GPU 专家，仅诊断用）。
 
-实测（DSpark + 24 专家 + 131072 ctx）：prefill 460.9→493.9，decode 39.55
-（= 0 专家对照 40.6，噪声内零回退）。阈值可用
+实测（DSpark + 24 专家 + 131072 ctx，事件门控版）：prefill 460.6→487.0
+（0 专家对照 460.6），decode 41.4（全量 256 专家正确计算，ALL PASS），
+grow_probe 8/96/112K（125K 上下文）全 PASS。阈值可用
 `SGLANG_KT_GPU_EXPERTS_PREFILL_MIN` 调。
 
-**整层放置（front-loading）实测否决**：同显存把层 0-3 整层放 GPU
-（`--kt-expert-placement-strategy front-loading`，24×43=1032 个专家），
-prefill 487.1（≈uniform，无增益），但 bench_dspark 第 5 题确定性 FAIL——
-输出退化为复读（accept 虚高把 decode 推到 ~47 tok/s 的假象）。疑点指向
-matmul_ogs 全专家层与 CPU dpbf16 路径的细微数值差异经 greedy 放大；
-uniform 子集路径无此问题。该路径在 SM120 上游验证过、本栈未验证——
-如需启用须先做逐层输出对齐。结论：**prefill 下分裂层与整层放置同显存
-收益相当（GPU 份额与 CPU 重叠，分裂开销在大 batch 下摊薄），整层无优势
-且有正确性风险，维持 uniform + 相位切换。**
+**整层放置（front-loading）实测否决（性能原因，非正确性）**：同显存把
+层 0-3 整层放 GPU（`--kt-expert-placement-strategy front-loading`，
+24×43=1032 个专家）。最初观测到的"第 5 题确定性 FAIL/复读退化"经定位
+是上面第一个 mask bug 在整层场景的放大（4 个整层缺失 ≫ 每层缺 24 个），
+修复后 bench ALL PASS、decode 41.5。但 prefill 只有 461.9（vs uniform
+487.0，-5%）：整层放置的 GPU 份额无法与 CPU 重叠（GPU 算那 4 层时 CPU
+空闲、反之亦然），而分裂层的 GPU 份额在每层内与 CPU 并行。结论：
+**分裂层（uniform）在 prefill 上严格优于整层，维持 uniform + 相位切换。**
+诊断工具：`SGLANG_KT_DEBUG_FULL_LAYER_DIFF=1` 可对 GPU 层做
+GPU-vs-全专家-CPU 在线对拍（注意双 submit 的 hack 有偶发全零假象，
+仅作参考）。
 
 配套修复：`v4_triton_kernels_moe.py` 的 `_make_routing_data_v4` 原依赖
 `triton_kernels.routing`（本 venv 的 0.1.0 精简版没有）——改走 SparseMatrix
@@ -109,8 +120,12 @@ prefill 专用配置（无 DSpark、56 专家、MAXTOK 66048、MEMFRAC 0.92）�
 | + 内核 v2 | 353 | — |
 | + 24 GPU 专家（常驻） | 374.6 | 24.5（回退！） |
 | + chunk 1024 | 382.8 | — |
-| + tilelang 索引器 | 493.0 | 40.6（0 专家对照） |
-| **+ 相位切换（生产）** | **493.9** | **39.55** |
+| + tilelang 索引器（0 专家对照） | 460.6 | 40.6 |
+| + 相位切换 v1（mask 写错张量，decode 缺 9%） | 493.9 | 39.55 |
+| **+ 相位切换 v2（pinned 双写 + 事件门控，生产）** | **487.0** | **41.4** |
+
+（相位切换 v1 的 prefill 493.9 带着竞态红利且 decode 静默缺 24 专家/层，
+不作数；v2 是全量正确下的诚实数字。）
 
 
 ## 1. DSpark 投机解码（主线 sglang 移植）

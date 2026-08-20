@@ -125,9 +125,9 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
 ```
 
 实测（47K prompt / DSpark + 相位切换 GPU 专家 + tilelang 索引器）：
-**prefill 493.9 tok/s**（优化前 306，+61%）、decode **39.55 tok/s**（无回退）、
-显存约 **36.8GB / 48GB**、start→ready 约 60~100s。
-吞吐口径澄清与逐项优化记录见 DSv4F-Opt.md §5。
+**prefill 487.0 tok/s**（优化前 306，+59%）、decode **41.4 tok/s**（全量
+256 专家正确计算，无回退）、显存约 **36.8GB / 48GB**、start→ready 约
+60~100s。吞吐口径澄清与逐项优化记录见 DSv4F-Opt.md §5。
 
 **吞吐口径澄清**：DSpark 下 tok/s = accept/周期，
 高度依赖提示词内容——数数类（高可预测）70.8 tok/s、bench 5 题混合
@@ -146,7 +146,7 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
 | `--chunked-prefill-size 1024` | prefill 摊销更好（~+8%） | tilelang 索引器下 >100K 重预填充实测安全（grow_probe 125K PASS，DSv4F-Opt.md §5.4）；须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。若改配置后 >100K prefill OOM，回退 512 |
 | `--max-total-tokens 135168` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 ~6GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
 | `--mem-fraction-static 0.85` | draft 10.6GB + 24 GPU 专家 ~13GB 计入预算 | 实测 36.8GB/48GB；0.60 会因预算校验拒绝启动 |
-| `--kt-num-gpu-experts 24` | 相位切换（默认开） | prefill 批次用 GPU 专家（+7%），decode/verify 全走 CPU——见 DSv4F-Opt.md §5.3；常驻模式（`SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0`）会让 decode 掉到 ~25 tok/s，勿用 |
+| `--kt-num-gpu-experts 24` | 相位切换（默认开） | prefill 批次用 GPU 专家（+5.7%），decode/verify 全走 CPU（翻的是 kt-kernel wrapper 的 pinned mask 副本，见 DSv4F-Opt.md §5.3）；常驻模式（`SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0`）会让 decode 掉到 ~25 tok/s，勿用 |
 | `--kt-cpuinfer 48` | 复验 44 vs 48 | bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正；v2 内核下 24/28/32 线程每 NUMA 持平 |
 | cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §1.4）；前 2 步 verify 自动 eager 预热 |
 
