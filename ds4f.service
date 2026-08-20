@@ -50,6 +50,13 @@ Environment=SGLANG_V4_MARLIN_PARTIAL=1
 # Marlin 常驻模式下关闭"decode 全 CPU"的相位切换（Marlin decode 47.9 >
 # 全 CPU 41.4；仅在 MARLIN_PARTIAL=0 时才应设回 1）
 Environment=SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0
+# 专家分布统计（测量用，默认关闭=零开销，DSv4F-Opt.md §6.10）：
+#   1) 取消下一行注释并重启服务；2) 跑真实负载；
+#   3) pkill -USR2 -f 'sglang::scheduler'   → /tmp/kt-distribute.txt
+#      （只发给 scheduler 进程！systemctl kill -s USR2 会打到无处理器的
+#       进程导致服务退出）；4) python3 tests/analyze_dist.py 分析。
+# 开启时开销实测：prefill 不变（507.8 vs 506.7），decode 步时不变。
+# Environment=KT_EXPERT_DIST_TRACK=1
 
 # 早期部署的 8 个 perf env 已逐一复验（DSv4Flash.md §10）：
 #   4 个默认已开（FUSE_WQA_WKV / USE_JIT_NORM / USE_MULTI_STREAM_OVERLAP /

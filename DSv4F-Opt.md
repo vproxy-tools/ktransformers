@@ -637,7 +637,6 @@ USE_JIT_NORM / USE_MULTI_STREAM_OVERLAP / USE_FUSED_STORE_CACHE 为 `EnvBool(Tru
 - 逐项核算与兑换率见 §5.8。
 
 ### 6.8 单元测试 —— `tests/test_routing_v4.py`
-
 GPU 专家路由构造（SparseMatrix 路径）+ **CUDA graph 捕获安全**双校验：
 `.venv/bin/python tests/test_routing_v4.py`，末行 PASS 为通过。
 改 `_make_routing_data_v4` / triton_kernels 版本后必跑（曾有 torch 回退
@@ -655,4 +654,33 @@ GPU 专家路由构造（SparseMatrix 路径）+ **CUDA graph 捕获安全**双�
 | `grow_probe.py` | 长上下文分级探针（到 125K） | 系统 python3 |
 | `analyze_trace.py` | profiler trace 聚合分析 | 系统 python3 |
 | `test_routing_v4.py` | 路由构造 + 图捕获单测 | `.venv` |
+| `test_expert_dist.py` | 专家分布计数/清零/dump 单测 | `.venv`（GPU） |
+| `analyze_dist.py` | SIGUSR2 dump 的放置收益分析 | 系统 python3 |
 | `sync_leak_check.py` / `hp_weight_check.py` 等 | 既有回归（§3） | 见 §3 |
+
+### 6.10 专家路由分布 —— 真实负载测量（SIGUSR2 dump）
+
+- **开关**：`KT_EXPERT_DIST_TRACK=1`（默认关）。关=热路径每层仅一次布尔
+  判断（实测 prefill 506.7 vs 基线 506.9，无差）；开=每层前向 2 个微型
+  CUDA 内核（int64 cast + scatter_add 到常驻 [43,256] int64 计数器），
+  CUDA graph 可捕获 → **decode/verify 图回放同样计数**。开销 A/B（同机
+  同晚、含 QEMU 干扰负载）：prefill 507.8 vs 506.7；bench_dspark 41.10
+  vs 42.75（accept 内容敏感噪声带内）；日志步时同 ~66ms。结论：开≈免费。
+- **实现**：sglang 分支 `kt_ep_wrapper.py`（计数 + SIGUSR2 handler，
+  handler 在关闭时也安装 → 误发 USR2 只写提示文件、不杀进程）+
+  `cuda_graph_setup.py`（图捕获 begin/end 钩子；end 清零捕获期的
+  dummy 路由，且 dump 在捕获期拒绝执行）。
+- **用法**：服务带 env 启动 → 跑真实负载 → `pkill -USR2 -f
+  'sglang::scheduler'`（**只发 scheduler 进程**，systemctl kill 会打到
+  无 handler 的进程导致退出）→ 读 `/tmp/kt-distribute.txt`：TOTAL/
+  DELTA_SINCE_LAST_DUMP 两个 43×256 矩阵 + 每层 SUMMARY。再跑一段负载
+  再 dump 一次，DELTA 即该窗口的分布（两次 dump 相减，免停服）。
+- **校验口径**：每层 pairs 必须全部相等（每 token 每层恰好 6 对）；
+  实测 47,303-token prefill + 447 verify 步 = 299,922 对/层，逐位吻合
+  （verify 窗口 6 token×6 专家/步也计入——图回放路径生效的直接证据）。
+- **首轮真实负载结论（47K 合成 + 5 题生成）**：连续 ID 0-27 驻留只承接
+  **11.3%** 路由量；每层最热 28 专家可承接 **67.0%**（5.9×，零额外
+  显存）——若做按热度放置（fork 已有 `frequency` 策略 +
+  `--init-expert-location *.pt` 基础设施），是比"换层填满"大一个量级的
+  下一步。分析：`python3 tests/analyze_dist.py`（tests/test_expert_dist.py
+  为单测）。
