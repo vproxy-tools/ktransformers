@@ -150,6 +150,37 @@ uniform 份额里拨）。Marlin 解锁后"uniform-28 保持 + 真余显存填 1
 Marlin 再省 ~1.1ms/步。显存 42.0GB（再填一层会挤压图捕获）。
 probe CLEAN / bench ALL PASS / grow_probe 125K 全 PASS。
 
+### 5.8 显存账本（实测，hybrid 1F+28U 终版配置）
+
+数据来源：服务器启动日志的 avail mem 里程碑 + `DSV4 memory calculation` 行
+（hybrid 1F+28U 配置，2026-08-20 实测，总卡 47.5GB / 标称 48GB）：
+
+| 项 | 大小 | 依据 / 算法 |
+|---|---|---|
+| 目标模型加载合计 | **29.04 GB** | log `Load weight end ... mem usage=29.04 GB` |
+| ├─ 路由专家（hybrid 1F+28U） | 18.40 GB | 3.23（整层）+ 28×43×12.6MB（见下） |
+| └─ 骨架（attention/索引器/共享专家/embedding/lm_head/norm） | ~8.8 GB | 差额 + safetensors 分类 |
+| DSpark draft（mtp.0） | **10.37 GB** | log 第二次 `Load weight end` |
+| KV 池（135168 token，fp8） | **~1.0-1.25 GB** | `bytes_per_full_token=9259.90` × 135168 |
+| CUDA 图 + 工作区 + allocator 保留 | ~2-3 GB | `Memory pool end avail=6.86` → 稳态占用 42.0 |
+| **稳态合计** | **42.0 GB** | nvidia-smi 实测 |
+
+专家粒度换算（MXFP4，fp4 权重 + E8M0 尺度）：
+
+| 单位 | 显存 |
+|---|---|
+| 1 个专家（单层；gate 4.0MiB + up 4.0MiB + down 4.0MiB + 尺度） | **~12.6 MB** |
+| 1 个"专家列"（同一 id × 43 层，即 +1 个 uniform 专家） | ~542 MB |
+| 1 个完整层（256 专家 × 12.6MB） | **~3.23 GB** |
+| 当前配置每层专家占用（28 个） | ~353 MB/层（第 1 层另整层 3.23GB） |
+
+**KV↔专家兑换率（重要结论）**：每 token KV 仅 **9,259.9 B**（DSA 压缩缓存，
+fp8；log `DSV4 memory calculation` 行直接给出）。因此：
+- 整个 131072 上下文池 ≈ **1.25GB，不到半个完整专家层**（3.23GB）；
+- "砍上下文换一个整层"在本模型上**不可行**——把上下文砍到 0 也凑不出一层；
+- 显存的大头是**权重**不是 KV。想再换整层，唯二杠杆：关 DSpark（10.37GB ≈
+  3.2 个整层）或从每层专家数里挪（28→25 省 1.6GB ≈ 半层）。
+
 ### 5.8 为什么是 499 不是 800（量化结论）
 
 47K prompt 每 token 2.00ms = CPU MoE ~1.45ms + 非 MoE（attention/dense/
@@ -506,3 +537,113 @@ USE_JIT_NORM / USE_MULTI_STREAM_OVERLAP / USE_FUSED_STORE_CACHE 为 `EnvBool(Tru
 默认值，显式设置=冗余。
 
 </details>
+
+## 6. 测试方法学（§5 全部数字的测法，逐项详记）
+
+### 6.1 通用约定
+
+- **实验实例**：`run_dspark.sh`（端口 30001）承载全部 A/B；env 覆盖
+  `MEMFRAC / MAXTOK / PREFILL / DSPARK / EXTRA_ARGS`，一条命令 = 一个配置。
+  生产 ds4f(30000) 与实验实例互斥占卡（GPU 独占规则，§3 节首）。
+- **每次 A/B 只改一个变量**；同配置连跑 2-3 次取总均值，跑间噪声
+  **±0.5-1%**（<1.5% 的差异一律视为持平，不下结论）。
+- **首请求预热**：含 Triton/tilelang JIT 的第一条请求会偏慢，一律丢弃
+  （bench 脚本取第 2 次起的迭代；或先打一条不计数的请求）。
+- **巨页状态**：改 kt-kernel 布局后首启是冷转换（1-3 分钟），之后
+  `REUSED from persistent hugepages`；A/B 前确认日志出现 REUSED，
+  避免把冷启动 IO 计入。
+- **判断门槛**：prefill 以 ±1% 为噪声带；decode 的 bench_dspark 吞吐
+  是 accept 内容敏感的（同配置两次可差 32.8→39.4，均 ALL PASS），
+  decode 结论必须结合 accept len 看 server log，只有步时
+  （accept÷tok/s）才是稳定口径。
+
+### 6.2 prefill 吞吐 —— `tests/bench_prefill.py`
+
+- **方法**：构造 ~47K token 的合成 prompt（"tok{i}-{rand}" 词表， tokenizer
+  实测 ~47,303 token），`/generate` + `max_new_tokens=1`，从响应
+  `meta_info.e2e_latency` 取 TTFT——此时 e2e ≈ prefill + 1 步 decode，
+  prefill tok/s = prompt_tokens ÷ e2e。`--tokens N` 调整规模、`--iters K`
+  迭代次数。
+- **用法**：`python3 tests/bench_prefill.py 30001 --tokens 8192 --iters 3`。
+- **口径**：47K 参考值 506.9（hybrid 终版）；不同 prompt 长度的注意力成本
+  不同（4K/16K/47K 不可直接互比），只比同长度。
+- **不校验正确性**（纯速度）；正确性用 6.4/6.5。
+
+### 6.3 CPU MoE 内核微基准 —— `tests/bench_moe_sweep.py` + `tests/kern_test.cpp`
+
+- `bench_moe_sweep.py`：V4 形状（E256/H4096/I2048/top6/gs32）合成
+  **E8M0 纯 2 幂尺度**权重（触发 fold 快路径；非 2 幂自动回退 legacy，
+  可用于 A/B），走与服务器一致的 CPUInfer 前向。`--tpn` 扫每 NUMA 线程数，
+  `--m` 扫批大小，`--check` 对 torch 参考实现比对数值
+  （max_rel_err 应 <1e-3；实测 2.7e-4）。脚本已强制
+  `KT_HUGEPAGE_WEIGHTS=0`，合成权重不碰持久巨页。
+- `kern_test.cpp`：**单核内核试验台**（g++ -O3 -march=native 秒级迭代），
+  400MB 权重 arena 超出 L3 → 真实 DRAM 流式；扫 tile 形状（4×4/8×2/…）
+  与预取距离（pf16-128）。§5.1 的"4×4 是寄存器上限最优、大 tile 溢出
+  反慢 2-4×"即出自它。坑：计时需按模板 MB 数正确折算 MAC（曾有两处
+  记账 bug 得出虚高数字）。
+- 判读：单核 DRAM 流式 ~87.5（legacy）→ ~120（fold）GMAC/s；
+  in-situ 每核 ~65-70。差距 = ragged tail(~12%) + 负载不均 + 相位开销。
+
+### 6.4 正确性 —— `tests/probe_dspark.py`（快）/ `tests/bench_dspark.py`（全）
+
+- probe：3 个短生成（数学/翻译/短文），校验数学结果、翻译可辨、思考切分、
+  重复度（8+ 字符 chunk 邻近 60 字重复计数）。**退出码 0=CLEAN** 可接脚本。
+- bench：5 个贪心提示词逐条**硬校验**（如乘法结果字符串）+ 吞吐；
+  `ALL PASS` 为通过。注意吞吐项 accept 敏感（见 6.1）。
+- 每次改放置/内核/相位逻辑后至少跑这两样。
+
+### 6.5 长上下文 —— `tests/grow_probe.py`
+
+- 单会话逐级加长（默认 20/96/112/120K；`--stages=` 自定义），第 1 级
+  ~19.5K 处埋暗号，每级做暗号回忆 + 新数学题 + 重复度——区分"长程注意力
+  丢失"（暗号丢）与"当步损坏"（数学错/复读）。
+- 终版配置跑法：`--stages=20,96,112`（112K 级实际 prompt 125,216 token，
+  即验证到 125K 上下文）。~134K 级会 400（超 131072 上限，预期行为，
+  脚本未捕获该异常是已知瑕疵）。全程 10-20 分钟。
+
+### 6.6 GPU 侧剖析 —— torch profiler + `tests/analyze_trace.py`
+
+- 抓取：
+  ```bash
+  mkdir -p /tmp/prof_out
+  curl -s -X POST http://127.0.0.1:30001/start_profile -H "Content-Type: application/json" \
+    -d '{"output_dir":"/tmp/prof_out","num_steps":40,"activities":["CPU","GPU"]}'
+  # 发一个负载请求，等几秒，trace 自动落盘 /tmp/prof_out/*.trace.json.gz
+  ```
+- 分析：`python3 tests/analyze_trace.py <trace.json.gz> [--window 0.3]`
+  （按 kernel 名聚合 GPU 时间；`--window` 跳过 prefill 前段只看 decode）。
+  §5.7 定位 matmul_ogs 762µs/层、§5 前期测 GPU 利用率 21%/每层 22ms 空闲
+  间隙，均出自此法。
+- 已知限制：perf_event_paranoid=4 且无 sudo → perf 不可用，只能靠
+  torch profiler（GPU 侧）+ FORWARD_TIME_PROFILE（kt-kernel 相位，需
+  重编，用完还原）+ 单核试验台（CPU 侧）三件套拼图。
+
+### 6.7 显存账本测法
+
+- 启动日志里程碑：`Load weight end ... mem usage=`（分目标/draft 两次）、
+  `DSV4 memory calculation: bytes_per_full_token=...`（每 token KV 字节，
+  直接读）、`Memory pool end. avail mem=`。
+- 稳态：就绪后 `nvidia-smi --query-gpu=memory.used --format=csv,noheader`。
+- 逐项核算与兑换率见 §5.8。
+
+### 6.8 单元测试 —— `tests/test_routing_v4.py`
+
+GPU 专家路由构造（SparseMatrix 路径）+ **CUDA graph 捕获安全**双校验：
+`.venv/bin/python tests/test_routing_v4.py`，末行 PASS 为通过。
+改 `_make_routing_data_v4` / triton_kernels 版本后必跑（曾有 torch 回退
+版本在图捕获期崩溃的前车之鉴）。
+
+### 6.9 脚本索引（全部集中在本仓库 `tests/`）
+
+| 脚本 | 用途 | 依赖 |
+|---|---|---|
+| `bench_prefill.py` | prefill 吞吐（47K 口径） | 系统 python3，仅 urllib |
+| `bench_moe_sweep.py` | CPU MoE 微基准 + 数值校验 | `.venv`（kt_kernel+torch） |
+| `kern_test.cpp` | 单核内核试验台（tile/预取扫描） | g++ -O3 -march=native |
+| `probe_dspark.py` | 快速损坏探针（退出码判断） | 系统 python3 |
+| `bench_dspark.py` | 5 题硬校验 + decode 吞吐 | 系统 python3 |
+| `grow_probe.py` | 长上下文分级探针（到 125K） | 系统 python3 |
+| `analyze_trace.py` | profiler trace 聚合分析 | 系统 python3 |
+| `test_routing_v4.py` | 路由构造 + 图捕获单测 | `.venv` |
+| `sync_leak_check.py` / `hp_weight_check.py` 等 | 既有回归（§3） | 见 §3 |

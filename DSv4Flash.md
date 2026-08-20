@@ -431,9 +431,12 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
   EAGER 环境变量可覆盖；`EAGER=1` 回退无损 eager）；`stop_sglang.sh` 安全
   清理所有 sglang 进程（避免 pkill 自匹配；**会连 30000 生产一起停**）。
 - 以上工具均已集中在仓库根的 **`tests/` 目录**（早期的
-  bench/profiler 脚本也一并移入）；启动/停止脚本（`run_dspark.sh`、
-  `stop_sglang.sh` 等）仍在仓库根。完整说明（执行前提、结果解读、通过/不通过
-  分界、清理要求）面向开发者，见 `DSv4F-Opt.md` §3；本节仅速查。
+  bench/profiler 脚本也一并移入，另含 prefill 优化轮新增：`bench_prefill.py`
+  prefill 吞吐、`bench_moe_sweep.py` MoE 微基准、`kern_test.cpp` 单核内核
+  试验台、`analyze_trace.py` profiler 聚合、`test_routing_v4.py` 路由单测）；
+  启动/停止脚本（`run_dspark.sh`、`stop_sglang.sh` 等）仍在仓库根。
+  完整说明（执行前提、结果解读、通过/不通过分界、清理要求、prefill 优化轮
+  全部数字的测法）面向开发者，见 `DSv4F-Opt.md` §3 与 §6；本节仅速查。
 
 ## 10. 环境变量使用纪律
 
