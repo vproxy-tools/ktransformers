@@ -85,6 +85,23 @@ grow_probe 8/96/112K（125K 上下文）全 PASS。阈值可用
 GPU-vs-全专家-CPU 在线对拍（注意双 submit 的 hack 有偶发全零假象，
 仅作参考）。
 
+**混合放置（hybrid）已实现并实测**：`--kt-expert-placement-strategy
+hybrid --kt-num-gpu-full-layers F --kt-num-gpu-experts U`——前 F 个 MoE
+层整层上 GPU，其余每层撒 U 个专家叠加收益（一个整层 ≈3.2GB，一个专家
+跨 43 层 ≈542MB）。实测（DSpark、相位切换修复版）：
+
+| 配置 | 专家显存 | prefill | decode | 上下文 |
+|---|---|---|---|---|
+| uniform-24（生产默认） | 13GB | 487.0 | 41.4 | 131072 |
+| hybrid 2 整层+16/层 | 14.7GB | 485.5 | 41.4 | 131072 |
+| hybrid 2 整层+24/层 | 18.9GB | 495.1 | 39-41* | 池压至 ~92K |
+
+（*decode 为 accept 内容波动，两次 bench 32.8/39.4 均 ALL PASS。）
+结论：**同显存下整层与分裂的 prefill 收益几乎线性等价（整层略亏
+~5%，因 GPU 份额无法与 CPU 跨层重叠）**；激进 hybrid 换 +1.7% prefill
+要牺牲 KV 池。生产维持 uniform-24；hybrid 留作显存富余场景的调节手段
+（如无 DSpark 的 prefill 模式、更大显存的卡）。
+
 配套修复：`v4_triton_kernels_moe.py` 的 `_make_routing_data_v4` 原依赖
 `triton_kernels.routing`（本 venv 的 0.1.0 精简版没有）——改走 SparseMatrix
 + `make_ragged_tensor_metadata`（vLLM 同款构造），topk 6→8 的 2 幂 padding
