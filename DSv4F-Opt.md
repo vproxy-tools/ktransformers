@@ -116,10 +116,36 @@ hybrid --kt-num-gpu-full-layers F --kt-num-gpu-experts U`——前 F 个 MoE
 prefill 专用配置（无 DSpark、56 专家、MAXTOK 66048、MEMFRAC 0.92）可到
 **536.5 tok/s**，适合批量灌注场景（上下文上限 ~62K）。
 
-### 5.5 为什么是 494 不是 800（量化结论）
+#### 5.7 终局：partial Marlin 解锁常驻 GPU 专家的 decode 收益
 
-47K prompt 每 token 2.03ms = CPU MoE ~1.5ms + 非 MoE（attention/dense/
-索引/glue）~0.5ms。要到 800（1.25ms/token）需 CPU MoE 再降 ~2×：
+用户再提出：prefill 尽量用 GPU 专家；decode 按路由分流、至少一半专家给
+CPU，让 CPU 权重带宽与 GPU 算力并行。物理约束修正：GPU 只能算**权重常驻
+显存**的专家，"一半"意味着 ~69GB 显存（128/层×43×12.6MB）——本卡不可行；
+实际可常驻 ~11% 的 pair。但机制方向正确，此前被一个内核问题掩盖：
+
+**profile 定位**：常驻模式的 decode 慢在 `_matmul_ogs_NNT_bf16...16x256x128`
+内核 **762µs/层**（M=6 只跑出 2.4 TFLOPS，tile 形状完全不适合小 M）——
+这是当初 decode 40→24.5 塌掉的全部原因，与"GPU 参与 decode"无关。
+代码里已有小 M 优化的 **Marlin 路径**（`_MARLIN_MXFP4_CAPS` 含 SM89），
+但被 `_resident_partial` 条件禁止用于部分常驻层。
+
+修法：`SGLANG_V4_MARLIN_PARTIAL=1`（mxfp4_deepseek.py）放开限制，
+`prepare_v4_mxfp4_marlin` 打包常驻子集、路由 remap 兼容 -1 掩码。
+
+**终版配置**（常驻 28 专家 + partial Marlin，关闭相位切换）：
+prefill **499.3**、decode **43.13**（双超相位切换版的 487.0/41.4），
+probe CLEAN / bench ALL PASS / grow_probe 125K 全 PASS，显存 ~39.6GB。
+32 专家与 28 持平（饱和）。相位切换机制保留作 Marlin 不可用时的回退。
+
+| 配置 | prefill | decode |
+|---|---|---|
+| 相位切换 + matmul_ogs（§5.3） | 487.0 | 41.4 |
+| **常驻 28 + partial Marlin（终版）** | **499.3** | **43.13** |
+
+### 5.8 为什么是 499 不是 800（量化结论）
+
+47K prompt 每 token 2.00ms = CPU MoE ~1.45ms + 非 MoE（attention/dense/
+索引/glue）~0.55ms。要到 800（1.25ms/token）需 CPU MoE 再降 ~2×：
 - 内核指令组合上限（dpbf16 32 MAC/条 + fold 后非 FMA 端 ~2 条/MAC 组）
   单核 ~110 GMAC/s 已接近；in-situ 65-70，理论剩余 1.4×。
 - GPU 专家受显存限制（DSpark 共存时 ≤24-28 个 ≈ 9-11% 对），线性外推

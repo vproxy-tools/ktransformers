@@ -97,13 +97,17 @@ export SGLANG_OPT_USE_TOPK_V2=0
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 # 索引器 tilelang 融合内核（prefill 383→493 tok/s 的主力项，见 DSv4F-Opt.md §5.2）
 export SGLANG_OPT_USE_TILELANG_INDEXER=1
+# 部分常驻专家层用 Marlin 内核：常驻 GPU 专家在 decode 分摊 CPU 带宽（见 §5.7）
+export SGLANG_V4_MARLIN_PARTIAL=1
+# Marlin 常驻模式下关闭"decode 全 CPU"的相位切换
+export SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0
 
 $KT_ROOT/.venv/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --model $MODEL_DIR \
   --kt-weight-path $MODEL_DIR \
   --kt-method MXFP4 \
-  --kt-num-gpu-experts 24 \
+  --kt-num-gpu-experts 28 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
@@ -124,10 +128,10 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
   --tool-call-parser deepseekv4
 ```
 
-实测（47K prompt / DSpark + 相位切换 GPU 专家 + tilelang 索引器）：
-**prefill 487.0 tok/s**（优化前 306，+59%）、decode **41.4 tok/s**（全量
-256 专家正确计算，无回退）、显存约 **36.8GB / 48GB**、start→ready 约
-60~100s。吞吐口径澄清与逐项优化记录见 DSv4F-Opt.md §5。
+实测（47K prompt / DSpark + 常驻 28 GPU 专家 + partial Marlin + tilelang）：
+**prefill 499.3 tok/s**（优化前 306，+63%）、decode **43.1 tok/s**（+9%）、
+显存约 **39.6GB / 48GB**、start→ready 约 60~100s。
+吞吐口径澄清与逐项优化记录见 DSv4F-Opt.md §5。
 
 **吞吐口径澄清**：DSpark 下 tok/s = accept/周期，
 高度依赖提示词内容——数数类（高可预测）70.8 tok/s、bench 5 题混合
@@ -146,7 +150,7 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
 | `--chunked-prefill-size 1024` | prefill 摊销更好（~+8%） | tilelang 索引器下 >100K 重预填充实测安全（grow_probe 125K PASS，DSv4F-Opt.md §5.4）；须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。若改配置后 >100K prefill OOM，回退 512 |
 | `--max-total-tokens 135168` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 ~6GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
 | `--mem-fraction-static 0.85` | draft 10.6GB + 24 GPU 专家 ~13GB 计入预算 | 实测 36.8GB/48GB；0.60 会因预算校验拒绝启动 |
-| `--kt-num-gpu-experts 24` | 相位切换（默认开） | prefill 批次用 GPU 专家（+5.7%），decode/verify 全走 CPU（翻的是 kt-kernel wrapper 的 pinned mask 副本，见 DSv4F-Opt.md §5.3）；常驻模式（`SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0`）会让 decode 掉到 ~25 tok/s，勿用 |
+| `--kt-num-gpu-experts 28` | 常驻 + partial Marlin（`SGLANG_V4_MARLIN_PARTIAL=1`，`PREFILL_ONLY=0`） | 常驻 GPU 专家经 Marlin 分摊 decode 带宽（43.1 tok/s）；若 Marlin 不可用须回退相位切换模式（`PREFILL_ONLY=1` 默认、24 专家），否则 decode 掉到 ~25 tok/s（matmul_ogs 小 M 每层 762µs） |
 | `--kt-cpuinfer 48` | 复验 44 vs 48 | bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正；v2 内核下 24/28/32 线程每 NUMA 持平 |
 | cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §1.4）；前 2 步 verify 自动 eager 预热 |
 
