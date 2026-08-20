@@ -77,7 +77,15 @@ struct BufferABF16Impl {
             __m512i* s = (__m512i*)(src + (m_begin + i) * k + k_block_begin + k_begin);
             __m512i* d =
                 (__m512i*)(a + k_block_begin * m_block_size + m_begin * k_block_size + k_begin * M_STEP + i * K_STEP);
-            avx512_copy_32xbf16(s, d);
+            if constexpr (requires { K::PERMUTE_ACT; }) {
+              // kernel-specific one-time activation permute (e.g. MXFP4 stores
+              // activations in the vpermb dequant order so the GEMM inner loop
+              // loads raw __m512bh with no per-group shuffle)
+              const __m512i pidx = _mm512_load_si512((const void*)K::ACT_PERM_IDX);
+              _mm512_storeu_si512(d, _mm512_permutexvar_epi16(pidx, _mm512_loadu_si512(s)));
+            } else {
+              avx512_copy_32xbf16(s, d);
+            }
           }
         }
       }

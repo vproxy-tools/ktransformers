@@ -18,11 +18,13 @@ export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
 export SGLANG_OPT_USE_TOPK_V2=0
 # SM89: indexer logits via torch fallback (deep_gemm is SM90+)
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
+# 索引器 tilelang 融合内核替代 torch eager 回退（SM89 实测编译通过；
+# prefill 383→493 tok/s，decode 无回退。TILELANG=0 回退）
+export SGLANG_OPT_USE_TILELANG_INDEXER="${TILELANG:-1}"
 
-# 131072（513 页宽）下 prefill 的 torch indexer gather 峰值 ~17GB 会 OOM；
-# expandable_segments 消碎片 + chunk 减为 512（gather 峰值 ~4-7GB，1024 在
-# >100K 重预填充时仍差 ~0.01GB）。
-# 2026-08-19 实测两者都必要；只影响长 prompt 的 prefill 速度，decode 不受影响。
+# expandable_segments 消碎片（长 prompt prefill 的 indexer gather 峰值）。
+# chunk 1024 在 tilelang 索引器下 >100K 重预填充实测安全（grow_probe 125K 通过）；
+# 若配置变更后出现 >100K prefill OOM，PREFILL=512 回退。
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 export KT_CPUINFER="${KT_CPUINFER:-48}"
@@ -68,8 +70,8 @@ exec python -m sglang.launch_server \
   --attention-backend flashinfer \
   --mem-fraction-static "${MEMFRAC:-0.30}" \
   --max-total-tokens "$MAXTOK" \
-  --chunked-prefill-size "${PREFILL:-512}" \
-  --max-prefill-tokens "${PREFILL:-512}" \
+  --chunked-prefill-size "${PREFILL:-1024}" \
+  --max-prefill-tokens "${PREFILL:-1024}" \
   --max-running-requests 1 \
   --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \

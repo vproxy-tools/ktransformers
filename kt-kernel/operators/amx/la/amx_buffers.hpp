@@ -1075,17 +1075,19 @@ struct BufferBInt4WithZeroImpl {
 template <typename K>
 struct BufferBInt4KGroupImpl {
   using dt = typename K::dt;
-  dt* b;     // packed signed int4 weights, col majored
-  float* d;  // scales only (no mins/zero-points), row majored
+  dt* b;        // packed signed int4 weights, col majored
+  float* d;     // scales only (no mins/zero-points), row majored
+  int16_t* se;  // int16 BF16-exponent addends for pow2 scales (MXFP4 fold path)
   int n, k, k_group_size, k_group_count;
 
   static constexpr int N_STEP = K::N_STEP;
   static constexpr int K_STEP = K::K_STEP;
   static constexpr bool SCALE = true;
 
-  // Size calculation: packed int4 weights + scales (NO mins)
+  // Size calculation: packed int4 weights + scales (NO mins) + int16 fold addends
   static size_t required_size(int n, int k, int k_group_size) {
-    return sizeof(int8_t) * n * k / 2 + sizeof(float) * n * (k / k_group_size);
+    return sizeof(int8_t) * n * k / 2 + sizeof(float) * n * (k / k_group_size) +
+           sizeof(int16_t) * n * (k / k_group_size);
   }
 
   BufferBInt4KGroupImpl(int n, int k, int k_group_size, void* ptr) : n(n), k(k), k_group_size(k_group_size) {
@@ -1100,6 +1102,7 @@ struct BufferBInt4KGroupImpl {
     k_group_count = k / k_group_size;
     b = reinterpret_cast<dt*>(ptr);
     d = reinterpret_cast<float*>(offset_pointer(b, n * k / 2));
+    se = reinterpret_cast<int16_t*>(d + static_cast<size_t>(n) * k_group_count);
   }
 
   // Load from packed signed int4 format
@@ -1125,11 +1128,14 @@ struct BufferBInt4KGroupImpl {
     return reinterpret_cast<dt*>(reinterpret_cast<uint8_t*>(b) + row_offset + col_offset);
   }
 
-  // Get scale pointer for a specific row and k_group
+  // Get pointer to submatrix for computation
   float* get_scale(int n, int n_begin, int k, int k_begin) {
     int k_group_idx = k_begin / k_group_size;
     return d + n_begin * (k / k_group_size) + k_group_idx;
   }
+
+  // int16 fold addends for one weight row (k/k_group_size entries)
+  const int16_t* get_scale16(int n_begin) const { return se + static_cast<size_t>(n_begin) * k_group_count; }
 
   // Split range for parallel processing
   static std::pair<int, int> split_range_n(int n, int ith, int nth) {

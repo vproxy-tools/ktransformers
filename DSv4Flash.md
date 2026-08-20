@@ -95,22 +95,24 @@ export SGLANG_RAGGED_VERIFY_MODE=static
 export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
 export SGLANG_OPT_USE_TOPK_V2=0
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
+# 索引器 tilelang 融合内核（prefill 383→493 tok/s 的主力项，见 DSv4F-Opt.md §5.2）
+export SGLANG_OPT_USE_TILELANG_INDEXER=1
 
 $KT_ROOT/.venv/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --model $MODEL_DIR \
   --kt-weight-path $MODEL_DIR \
   --kt-method MXFP4 \
-  --kt-num-gpu-experts 0 \
+  --kt-num-gpu-experts 24 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
   --context-length 131072 \
   --attention-backend flashinfer \
-  --mem-fraction-static 0.60 \
+  --mem-fraction-static 0.85 \
   --max-total-tokens 135168 \
-  --chunked-prefill-size 512 \
-  --max-prefill-tokens 512 \
+  --chunked-prefill-size 1024 \
+  --max-prefill-tokens 1024 \
   --max-running-requests 1 \
   --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \
@@ -122,11 +124,10 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
   --tool-call-parser deepseekv4
 ```
 
-实测（DSpark + cuda graph + KV 池右移）：**39.6 tok/s** 持续
-（峰值 49.8，accept 2.2-3.8），比无投机基线 26.0 **+52%**；显存（131072 配置、
-生产 30000 实测）约 **26.9GB / 48GB**，
-start→ready 约 **60~100s**（scheduler_e2e ~56s + 图捕获；巨页权重缓存命中后
-load_weight 部分会进一步缩短）。
+实测（47K prompt / DSpark + 相位切换 GPU 专家 + tilelang 索引器）：
+**prefill 493.9 tok/s**（优化前 306，+61%）、decode **39.55 tok/s**（无回退）、
+显存约 **36.8GB / 48GB**、start→ready 约 60~100s。
+吞吐口径澄清与逐项优化记录见 DSv4F-Opt.md §5。
 
 **吞吐口径澄清**：DSpark 下 tok/s = accept/周期，
 高度依赖提示词内容——数数类（高可预测）70.8 tok/s、bench 5 题混合
@@ -142,10 +143,11 @@ load_weight 部分会进一步缩短）。
 |---|---|---|
 | `--speculative-algorithm DSPARK` | 0731 自带 draft（`mtp.0.*`） | 无需 draft path；**不要用 EAGLE**（9.1 节） |
 | `--context-length 131072` | 模型上限 128K | 需 `SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1`（见 9.3；run_dspark.sh 已默认导出）；须是 page_size(256) 倍数 |
-| `--chunked-prefill-size 512` | 131072 必需 | 513 页宽下 torch indexer gather 的 prefill 瞬时峰值 ~17GB（2048 chunk）会 OOM；512 后峰值 ~4-7GB。须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。仅影响 prefill 速度，decode 不变；90K 以下 prompt 可用 1024 |
+| `--chunked-prefill-size 1024` | prefill 摊销更好（~+8%） | tilelang 索引器下 >100K 重预填充实测安全（grow_probe 125K PASS，DSv4F-Opt.md §5.4）；须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。若改配置后 >100K prefill OOM，回退 512 |
 | `--max-total-tokens 135168` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 ~6GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
-| `--mem-fraction-static 0.60` | draft 权重 ~10.6GB 计入预算 | 0.90 会 graph 捕获失败；池大小由 max-total-tokens 决定后此值仅作预算校验 |
-| `--kt-cpuinfer 48` | 复验 44 vs 48 | bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正 |
+| `--mem-fraction-static 0.85` | draft 10.6GB + 24 GPU 专家 ~13GB 计入预算 | 实测 36.8GB/48GB；0.60 会因预算校验拒绝启动 |
+| `--kt-num-gpu-experts 24` | 相位切换（默认开） | prefill 批次用 GPU 专家（+7%），decode/verify 全走 CPU——见 DSv4F-Opt.md §5.3；常驻模式（`SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0`）会让 decode 掉到 ~25 tok/s，勿用 |
+| `--kt-cpuinfer 48` | 复验 44 vs 48 | bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正；v2 内核下 24/28/32 线程每 NUMA 持平 |
 | cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §1.4）；前 2 步 verify 自动 eager 预热 |
 
 注意事项：

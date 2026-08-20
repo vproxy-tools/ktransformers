@@ -14,6 +14,10 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
 
@@ -33,6 +37,15 @@ struct GemmKernel224MXFP4SmallKGroup {
 
   static inline const int N_BLOCK = 256;
   static inline const int K_BLOCK = 7168;
+
+  // Prefill kernel v2: BufferA::from_mat pre-permutes activations into the
+  // [even|odd] vpermb decode order once per element, so the GEMM inner loop
+  // loads raw __m512bh and skips the per-group permutexvar.
+  static constexpr bool PERMUTE_ACT = true;
+  // word permute applied by from_mat: permuted[k] = src[ACT_PERM_IDX[k]]
+  alignas(64) static constexpr uint16_t ACT_PERM_IDX[32] = {
+      0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
+      1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31};
 
   static std::string name() { return "MXFP4_KGROUP"; }
   static int recommended_nth(int n) { return (n + N_BLOCK - 1) / N_BLOCK; }
@@ -63,6 +76,18 @@ struct GemmKernel224MXFP4SmallKGroup {
       0x00, 0x00, 0x00, 0x3F, 0x80, 0x3F, 0xC0, 0x3F, 0x00, 0x40, 0x40, 0x40,
       0x80, 0x40, 0xC0, 0x40, 0x00, 0x80, 0x00, 0xBF, 0x80, 0xBF, 0xC0, 0xBF,
       0x00, 0xC0, 0x40, 0xC0, 0x80, 0xC0, 0xC0, 0xC0};
+  // Fold-path variant: fp4 zero maps to ±2^-95 (0x1000/0x9000) instead of ±0,
+  // so the exponent-add scale fold cannot underflow-wrap a zero weight into
+  // garbage for the negative scale exponents real E8M0 checkpoints use
+  // (observed -8..-5). ±2^-95 × s stays ≥ ~2^-126 (representable) and is
+  // ~70 ulps below fp32 epsilon relative to any real product.
+  alignas(64) static constexpr uint8_t fp4_bf16_vpermb_lut_nz[64] = {
+      0x00, 0x10, 0x00, 0x3F, 0x80, 0x3F, 0xC0, 0x3F, 0x00, 0x40, 0x40, 0x40,
+      0x80, 0x40, 0xC0, 0x40, 0x00, 0x90, 0x00, 0xBF, 0x80, 0xBF, 0xC0, 0xBF,
+      0x00, 0xC0, 0x40, 0xC0, 0x80, 0xC0, 0xC0, 0xC0,
+      0x00, 0x10, 0x00, 0x3F, 0x80, 0x3F, 0xC0, 0x3F, 0x00, 0x40, 0x40, 0x40,
+      0x80, 0x40, 0xC0, 0x40, 0x00, 0x90, 0x00, 0xBF, 0x80, 0xBF, 0xC0, 0xBF,
+      0x00, 0xC0, 0x40, 0xC0, 0x80, 0xC0, 0xC0, 0xC0};
   // per-128b-lane shuffle idx that duplicates each input byte into a 16-bit lane
   alignas(32) static constexpr uint8_t fp4_dup_lo_idx[32] = {
       0, 0, 2, 2, 4, 4, 6, 6, 8, 8, 10, 10, 12, 12, 14, 14,
@@ -80,7 +105,8 @@ struct GemmKernel224MXFP4SmallKGroup {
 
   // Convert 16 packed FP4 bytes (32 values = 1 k_group) → 32 BF16 values (__m512i)
   // Output column order: [BF16(lo[0]),BF16(hi[0]), ..., BF16(lo[15]),BF16(hi[15])]
-  __attribute__((always_inline)) static inline __m512i mxfp4_to_bf16_32(__m128i packed) {
+  template <const uint8_t* LUT>
+  __attribute__((always_inline)) static inline __m512i mxfp4_to_bf16_32_lut(__m128i packed) {
     const __m256i b16 = _mm256_cvtepu8_epi16(packed);  // byte j -> 16-bit lane j
     const __m256i m = _mm256_set1_epi16(0x0F);
     const __m256i lo16 = _mm256_and_si256(b16, m);
@@ -93,7 +119,38 @@ struct GemmKernel224MXFP4SmallKGroup {
         _mm512_inserti64x4(_mm512_castsi256_si512(lo_dup), hi_dup, 1);
     const __m512i idx = _mm512_add_epi8(
         _mm512_slli_epi16(nib, 1), _mm512_load_si512((const void*)fp4_seq01));
-    return _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)fp4_bf16_vpermb_lut));
+    return _mm512_permutexvar_epi8(idx, _mm512_load_si512((const void*)LUT));
+  }
+
+  __attribute__((always_inline)) static inline __m512i mxfp4_to_bf16_32(__m128i packed) {
+    return mxfp4_to_bf16_32_lut<fp4_bf16_vpermb_lut>(packed);
+  }
+
+  // Scale-fold fast path gate. E8M0 group scales are exact powers of two, so
+  // the per-group fp32 scale multiply can be folded into the dequanted BF16
+  // weight as a pure exponent add (int16). Starts enabled and is downgraded to
+  // false by the load-time scan if any scale is not an exact power of two
+  // (synthetic benches etc.); the kernels then fall back to the exact legacy
+  // fp32-fmadd path.
+  static inline std::atomic<bool> fold_scale{true};
+  static bool fold_enabled() { return fold_scale.load(std::memory_order_relaxed); }
+
+  // Dequant 32 FP4 weights and multiply by the pow2 group scale via an
+  // exponent add on the BF16 bit pattern (exact for E8M0 scales).
+  // fp32 pow2 bits = (e+127)<<23; the bf16 exponent field lives at bit 7, so
+  // the int16 addend is ((e+127)<<7) - (127<<7) = e<<7 (bias subtracted).
+  static inline int16_t scale_exp16(const float* s) {
+    uint32_t sbits;
+    std::memcpy(&sbits, s, 4);
+    return (int16_t)(((sbits >> 16) & 0xFF80u) - 0x3F80u);
+  }
+
+  // fold variant used in the mat-mat inner loop: se comes from a precomputed
+  // int16 array so the broadcast is a single vpbroadcastw [mem] (no scalar
+  // gp→simd cross-domain move on the critical path).
+  __attribute__((always_inline)) static inline __m512bh dequant_scale_fold_se(__m128i w, int16_t se) {
+    const __m512i d = mxfp4_to_bf16_32_lut<fp4_bf16_vpermb_lut_nz>(w);
+    return (__m512bh)_mm512_add_epi16(d, _mm512_set1_epi16(se));
   }
 #else
   // Convert 16 packed FP4 bytes (32 values = 1 k_group) → 32 BF16 values (__m512i)
@@ -141,9 +198,13 @@ struct GemmKernel224MXFP4SmallKGroup {
     __attribute__((always_inline)) ActivationBF16(__m512bh a_) : a(a_) {
 #if defined(__AVX512VBMI__) && defined(__AVX512BF16__)
       // match DequantizedWeight's vpermb element order [lo-nibbles | hi-nibbles]
-      // = [v0,v2,...,v30, v1,v3,...,v31]
-      a = (__m512bh)_mm512_permutexvar_epi16(
-          _mm512_load_si512((const void*)fp4_act_perm_idx), (__m512i)a_);
+      // = [v0,v2,...,v30, v1,v3,...,v31]. With PERMUTE_ACT, BufferA::from_mat
+      // already stores activations in this order, so the per-group permute is
+      // skipped (it was re-executed for every N tile of the same row before).
+      if constexpr (!PERMUTE_ACT) {
+        a = (__m512bh)_mm512_permutexvar_epi16(
+            _mm512_load_si512((const void*)fp4_act_perm_idx), (__m512i)a_);
+      }
 #elif !defined(__AVX512BF16__)
       a_even = _mm512_castsi512_ps(_mm512_slli_epi32((__m512i)a_, 16));
       a_odd = _mm512_castsi512_ps(_mm512_and_si512((__m512i)a_, odd_mask));
@@ -269,14 +330,92 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-  // mat-mat: 4×4 register tile (M_TILE=4, N_TILE=4 → 16 累加器)。
-  // 每 K-group 解码 4 行 N 一次, 被 4 个 token 共享 → PSHUFB 解码开销 / 4。
-  // M / N 尾巴回退到 mat-vec 单 token 内层 (V4 chunked-prefill 16/32/64 整数倍, 极少触发)。
+  // mat-mat prefill kernel (v2).
+  //
+  // Fast path (E8M0 pow2 scales, VBMI+BF16): 4-token × 4-row register tiles
+  // with the per-group scale folded into the dequant as a BF16 exponent add
+  // (exact for powers of two) and activations pre-permuted by BufferA::from_mat
+  // so the inner loop is raw loads + dpbf16 accumulation only. Single-core
+  // testbed (/tmp/kern_test): 118.8 vs 87.5 GMAC/s for the legacy tile, with
+  // DRAM streaming fully hidden by the g+64-group weight prefetch. Tiles
+  // larger than 4×4 (16 accumulators + dequant temps) spill registers and run
+  // 2-4× slower — do not raise MB/NB without re-measuring.
   static void fp4_mat_mat_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
                                  int nth) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
     const int kg_count = k / 32;
+
+#if defined(__AVX512VBMI__) && defined(__AVX512BF16__)
+    if (fold_enabled()) {
+      constexpr int MB = 4;
+      constexpr int NB = 4;
+
+      // ROWS is instantiated 1..4 — a runtime bound would keep the per-group
+      // token loop rolled (stack pointer loads per iteration) and costs most
+      // of the fold path's advantage over the legacy kernel.
+      auto tile_body = [&](auto rows_ct, int m_pos) {
+        constexpr int ROWS = decltype(rows_ct)::value;
+        __m512bh* a_rows[ROWS];
+        for (int i = 0; i < ROWS; i++) a_rows[i] = (__m512bh*)ba->get_submat(m, k, m_pos + i, 0);
+
+        int n_pos = n_start;
+        for (; n_pos + NB <= n_end; n_pos += NB) {
+          __m128i* w0 = (__m128i*)bb->get_submat(n, k, n_pos + 0, 0);
+          __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
+          __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
+          __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
+          const int16_t* se0 = bb->get_scale16(n_pos + 0);
+          const int16_t* se1 = bb->get_scale16(n_pos + 1);
+          const int16_t* se2 = bb->get_scale16(n_pos + 2);
+          const int16_t* se3 = bb->get_scale16(n_pos + 3);
+
+          __m512 acc[ROWS][NB];
+          for (int i = 0; i < ROWS; i++)
+            for (int j = 0; j < NB; j++) acc[i][j] = _mm512_setzero_ps();
+
+          for (int g = 0; g < kg_count; g++) {
+            if ((g & 3) == 0) {
+              _mm_prefetch((const char*)(w0 + g + 128), _MM_HINT_T0);
+              _mm_prefetch((const char*)(w1 + g + 128), _MM_HINT_T0);
+              _mm_prefetch((const char*)(w2 + g + 128), _MM_HINT_T0);
+              _mm_prefetch((const char*)(w3 + g + 128), _MM_HINT_T0);
+            }
+            const __m512bh d0 = dequant_scale_fold_se(w0[g], se0[g]);
+            const __m512bh d1 = dequant_scale_fold_se(w1[g], se1[g]);
+            const __m512bh d2 = dequant_scale_fold_se(w2[g], se2[g]);
+            const __m512bh d3 = dequant_scale_fold_se(w3[g], se3[g]);
+#pragma GCC unroll 4
+            for (int i = 0; i < ROWS; i++) {
+              const __m512bh a = a_rows[i][g];
+              acc[i][0] = _mm512_dpbf16_ps(acc[i][0], a, d0);
+              acc[i][1] = _mm512_dpbf16_ps(acc[i][1], a, d1);
+              acc[i][2] = _mm512_dpbf16_ps(acc[i][2], a, d2);
+              acc[i][3] = _mm512_dpbf16_ps(acc[i][3], a, d3);
+            }
+          }
+          for (int i = 0; i < ROWS; i++) {
+            float* c_row = bc->get_submat(m, n, m_pos + i, n_start);
+            reduce4(acc[i][0], acc[i][1], acc[i][2], acc[i][3], c_row + (n_pos - n_start));
+          }
+        }
+      };
+
+      for (int m_pos = 0; m_pos < m; m_pos += MB) {
+        switch (std::min(MB, m - m_pos)) {
+          case 4: tile_body(std::integral_constant<int, 4>{}, m_pos); break;
+          case 3: tile_body(std::integral_constant<int, 3>{}, m_pos); break;
+          case 2: tile_body(std::integral_constant<int, 2>{}, m_pos); break;
+          default: tile_body(std::integral_constant<int, 1>{}, m_pos); break;
+        }
+      }
+      return;
+    }
+#endif  // __AVX512VBMI__ && __AVX512BF16__
+
+    // Legacy path: 4×4 register tile, per-group fp32 scale fmadd.
+    // Retained for non-pow2 scales (synthetic benches) — results match the
+    // fold path mathematically (same products, different accumulation order).
     constexpr int MB = 4;
     constexpr int NB = 4;
 
@@ -499,6 +638,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (this->hugepage_reusable(physical_to_logical_map)) {
       printf("[hugepage_weights] layer %d tp %d: weights reused from persistent hugepages, skip conversion\n",
              config_.layer_idx, tp_part_idx);
+      scan_scale_pow2();
       return;
     }
     if (this->hp_active() && config_.gate_proj == nullptr)
@@ -551,10 +691,91 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                           (ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
           convert_or_copy(down_bb_[expert_idx]->d,
                           (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+          fill_scale16(gate_bb_[expert_idx].get());
+          fill_scale16(up_bb_[expert_idx].get());
+          fill_scale16(down_bb_[expert_idx].get());
         },
         nullptr);
 
     this->hugepage_commit(physical_to_logical_map);
+    scan_scale_pow2();
+  }
+
+  // Vectorized d (float) → se (int16 exponent addend) for one weight matrix.
+  // se[i] = ((bits>>16) & 0xFF80) - 0x3F80, meaningful only for pow2 scales
+  // (guaranteed when the fold path runs — see scan_scale_pow2).
+  static void fill_scale16(auto* bb) {
+    const size_t count = static_cast<size_t>(bb->n) * bb->k_group_count;
+    const float* d = bb->d;
+    int16_t* se = bb->se;
+    size_t i = 0;
+    for (; i + 16 <= count; i += 16) {
+      const __m512 v = _mm512_loadu_ps(d + i);
+      const __m512i bits = _mm512_castps_si512(v);
+      // ((bits >> 16) & 0xFF80) - 0x3F80, packed to int16 lanes (signed values)
+      const __m512i t = _mm512_and_si512(_mm512_srli_epi32(bits, 16), _mm512_set1_epi32(0xFF80));
+      const __m512i s = _mm512_sub_epi32(t, _mm512_set1_epi32(0x3F80));
+      const __m256i lo = _mm512_cvtsepi32_epi16(s);
+      _mm256_storeu_si256((__m256i*)(se + i), lo);
+    }
+    for (; i < count; i++) {
+      uint32_t b;
+      std::memcpy(&b, d + i, 4);
+      se[i] = (int16_t)(((b >> 16) & 0xFF80u) - 0x3F80u);
+    }
+  }
+
+  // One-time scan of the resident group scales: the fold path is exact only
+  // when every scale is a power of two (E8M0). Downgrades the global fold flag
+  // otherwise. Runs on the pool; ~400MB of float reads per layer at cold load.
+  void scan_scale_pow2() {
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    std::atomic<bool> all_pow2{true};
+    auto check = [](const float* d, size_t count, std::atomic<bool>& ok) {
+      auto bad_scalar = [](uint32_t b) {
+        // fold requires: pow2 (no mantissa bits) and a normal finite exponent
+        // (zero / subnormal / inf / NaN scales cannot be folded exactly)
+        return (b & 0x007FFFFFu) != 0 || (b & 0x7F800000u) == 0 || (b & 0x7F800000u) == 0x7F800000u;
+      };
+      size_t i = 0;
+      for (; i + 8 <= count; i += 8) {
+        const __m256 v = _mm256_loadu_ps(d + i);
+        const __m256i mant = _mm256_castps_si256(_mm256_and_ps(v, _mm256_castsi256_ps(_mm256_set1_epi32(0x007FFFFF))));
+        const __m256i expo = _mm256_and_si256(_mm256_srli_epi32(_mm256_castps_si256(v), 23), _mm256_set1_epi32(0xFF));
+        const __m256i zero_exp = _mm256_cmpeq_epi32(expo, _mm256_setzero_si256());
+        const __m256i inf_exp = _mm256_cmpeq_epi32(expo, _mm256_set1_epi32(0xFF));
+        if (!_mm256_testz_si256(mant, mant) || !_mm256_testz_si256(zero_exp, zero_exp) ||
+            !_mm256_testz_si256(inf_exp, inf_exp)) {
+          ok.store(false, std::memory_order_relaxed);
+          return;
+        }
+      }
+      for (; i < count; i++) {
+        uint32_t b;
+        std::memcpy(&b, d + i, 4);
+        if (bad_scalar(b)) {
+          ok.store(false, std::memory_order_relaxed);
+          return;
+        }
+      }
+    };
+    pool->do_work_stealing_job(
+        config_.expert_num * 3, nullptr,
+        [this, &check, &all_pow2](int task_id) {
+          int expert_idx = task_id / 3;
+          int which = task_id % 3;
+          const auto& bb = which == 0 ? gate_bb_[expert_idx] : which == 1 ? up_bb_[expert_idx] : down_bb_[expert_idx];
+          size_t kg = bb->k / bb->k_group_size;
+          check(bb->d, (size_t)bb->n * kg, all_pow2);
+        },
+        nullptr);
+    if (!all_pow2.load(std::memory_order_relaxed)) {
+      if (T::fold_enabled()) {
+        printf("[mxfp4-fold] layer %d tp %d: non-pow2 group scales found, scale-fold path disabled\n", config_.layer_idx,
+               tp_part_idx);
+      }
+      T::fold_scale.store(false, std::memory_order_relaxed);
+    }
   }
 
   static inline void fast_memcpy(void* __restrict dst, const void* __restrict src, size_t bytes) {

@@ -1,5 +1,108 @@
 # DSv4Flash 优化与开发者笔记（DSv4F-Opt）
 
+## 5. Prefill 优化轮（2026-08-20）：306 → 494 tok/s
+
+目标：prefill 300+ → 800。本轮落地四项改动，47K prompt 实测
+**306 → 493.9 tok/s（+61%）**，decode 39.55 tok/s 无回退，全部正确性
+门槛通过（probe CLEAN / bench 5/5 PASS / grow_probe 125K 三级 PASS）。
+800 未达，剩余差距的量化分析见 5.5。
+
+### 5.1 CPU MoE 内核 v2（MXFP4 fold 路径）
+
+改动文件：`kt-kernel/operators/amx/fp4-moe.hpp`、
+`kt-kernel/operators/amx/la/amx_raw_buffers.hpp`（BufferA 预置换）、
+`kt-kernel/operators/amx/la/amx_buffers.hpp`（BufferB 增加 se 数组）。
+
+单核试验台（/tmp 流式 DRAM 权重，m=12×n=2048×k=4096）定位的三处瓶颈与修法：
+
+| 改动 | 原理 | 单核收益 |
+|---|---|---|
+| 激活预置换（PERMUTE_ACT） | `BufferA::from_mat` 一次性把激活置换到 vpermb 解码序 [偶\|奇]，内层每 group 的 permutexvar（每个 n-tile 重复执行同一行）彻底删除 | ~6% |
+| scale 折入指数（fold） | E8M0 尺度是纯 2 的幂 → 反量化出的 bf16 权重直接 int16 加 `e<<7`（指数域加法，**精确**），删掉每 (token,row,group) 的 set1+fmadd（FMA 端口一半负载） | ~20% |
+| 运行期 rows 循环 → 4 路编译期实例化 | 运行期边界使编译器无法展开 token 循环（栈上指针寻址），丢掉大部分 fold 收益——这是最大单点 | ~25% |
+
+其它：tile 形状 sweep 证明 **4×4 是寄存器上限下的最优**（12×2/8×2 等大 tile
+全部因 zmm 溢出反而慢 2-4×，勿在未重测前加大 MB×NB）；权重预取距离 64→128
+组（+3%）。单核 DRAM 流式 87.5 → ~120 GMAC/s。
+
+- 数值：fold 与 legacy 数学等价（同乘积、不同累加序），合成权重校验
+  max_rel_err 2.7e-4（bf16 舍入噪声内）；fp4 零值用 nz-LUT 映射 ±2^-95
+  避免负指数尺度下指数加法回绕成垃圾。
+- 安全网：加载时 `scan_scale_pow2` 并行扫描全部 group scale，任何非 2 幂
+  （合成基准）都会把全局 fold 开关降级为 false，内核自动回退 legacy 路径。
+- **BufferB 布局变更**（新增每 group int16 的 se 数组，~+12% 尺度区）改变了
+  巨页指纹——升级后首次启动会整体冷转换一次（1-3 分钟），之后恢复 REUSED。
+- 微基准：M=512 每 27.5→20.2ms，M=1024 48.9→37.8ms（bench_moe_sweep.py）。
+- in-situ 每核 ~65-70 GMAC/s（vs 试验台 ~110+）：差距来自 Poisson 路由的
+  ragged tile 尾部（~12%）+ 负载不均 + 相位开销；无 perf counter（paranoid=4）
+  无法进一步定位。
+
+### 5.2 tilelang 索引器（SM89 可用）
+
+`SGLANG_OPT_USE_TILELANG_INDEXER=1`（run_dspark.sh / ds4f.service 已默认）：
+用 tilelang 融合内核替换 indexer 的 torch eager 回退（SM89 上原本只有 SM120
+才自动启用）。**383 → 493 tok/s（+29%）**——torch 回退的几十个小 kernel 的
+python/launch 串行时间是 prefill 侧最大单项浪费。TILELANG=0 回退。
+
+### 5.3 相位切换 GPU 专家（prefill 用 GPU、decode 全 CPU）
+
+GPU 常驻专家（`--kt-num-gpu-experts`）对两相位效果相反：
+prefill +7~9%（空闲 GPU 算力 + CPU 侧 DRAM 减压），decode 却 -40%
+（M=1 时路由构建 + matmul_ogs 开销远超省下的 CPU 时间）。
+
+修法（kt_ep_wrapper.py `KTEPWrapperMethod.apply`）：C++ 的
+`should_skip_expert` 是从 python 传入的 mask 张量**内存实时读**的——
+`SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=1`（默认开）下，≥64 token 的批次
+（prefill chunk）恢复真 mask（CPU 只算非 GPU 专家，GPU 算常驻的），
+更小批次（decode / DSpark verify / 尾块）清零 mask（CPU 算全部 256 个）；
+GPU 侧同步旁路（decode 图捕获时走 bypass 分支，图内无 GPU MoE kernel）。
+prefill 的 apply 在 sync 后把 mask 清零，保证之后无 python 的 decode 图
+重放读到全零。**依赖调度器串行调度（--max-running-requests 1）**；
+未来开并发 prefill+decode 前需重估竞争窗口。
+
+实测（DSpark + 24 专家 + 131072 ctx）：prefill 460.9→493.9，decode 39.55
+（= 0 专家对照 40.6，噪声内零回退）。阈值可用
+`SGLANG_KT_GPU_EXPERTS_PREFILL_MIN` 调。
+
+配套修复：`v4_triton_kernels_moe.py` 的 `_make_routing_data_v4` 原依赖
+`triton_kernels.routing`（本 venv 的 0.1.0 精简版没有）——改走 SparseMatrix
++ `make_ragged_tensor_metadata`（vLLM 同款构造），topk 6→8 的 2 幂 padding
+保持不变以满足 triton 元数据内核假设；cuda graph 捕获安全（已单测）。
+
+### 5.4 chunk 1024 与显存预算
+
+`--chunked-prefill-size/--max-prefill-tokens 1024`：MoE 每 token 摊销更好
+（M=1024 vs 512 提升 ~8%）。tilelang 索引器下 >100K 重预填充实测安全
+（grow_probe 125K PASS；旧栈 torch 回退时 1024 在 >100K 差 0.01GB 的限制
+不再成立）。显存：DSpark+24 专家需 MEMFRAC 0.85（实测 36.8GB/48GB）。
+prefill 专用配置（无 DSpark、56 专家、MAXTOK 66048、MEMFRAC 0.92）可到
+**536.5 tok/s**，适合批量灌注场景（上下文上限 ~62K）。
+
+### 5.5 为什么是 494 不是 800（量化结论）
+
+47K prompt 每 token 2.03ms = CPU MoE ~1.5ms + 非 MoE（attention/dense/
+索引/glue）~0.5ms。要到 800（1.25ms/token）需 CPU MoE 再降 ~2×：
+- 内核指令组合上限（dpbf16 32 MAC/条 + fold 后非 FMA 端 ~2 条/MAC 组）
+  单核 ~110 GMAC/s 已接近；in-situ 65-70，理论剩余 1.4×。
+- GPU 专家受显存限制（DSpark 共存时 ≤24-28 个 ≈ 9-11% 对），线性外推
+  无法覆盖剩余差距。
+- prefill CUDA graph（本可消掉每层 ~4ms 串行 glue）三条路均不通：
+  full 仅 decode；tc_piecewise 需 dynamo 可追踪（kt pybind 对象不可）；
+  breakable 需要驱动 >550（当前 550.144 报 CUDA error 35）。
+- 单卡 TBO 不适用（无通信可重叠）。
+
+### 5.6 结果汇总（47K prompt，131072 ctx，DSpark）
+
+| 配置 | prefill tok/s | decode tok/s |
+|---|---|---|
+| 优化前基线（chunk 512，0 专家，torch 索引器） | 306 | 39.6 |
+| + 内核 v2 | 353 | — |
+| + 24 GPU 专家（常驻） | 374.6 | 24.5（回退！） |
+| + chunk 1024 | 382.8 | — |
+| + tilelang 索引器 | 493.0 | 40.6（0 专家对照） |
+| **+ 相位切换（生产）** | **493.9** | **39.55** |
+
+
 ## 1. DSpark 投机解码（主线 sglang 移植）
 
 ### 1.1 背景与路线

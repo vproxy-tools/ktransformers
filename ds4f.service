@@ -41,6 +41,9 @@ Environment=SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
 Environment=SGLANG_OPT_USE_TOPK_V2=0
 # SM89: 索引器 logits 走 torch 回退（deep_gemm 是 SM90+）
 Environment=SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
+# 索引器用 tilelang 融合内核替代上面的 torch eager 回退（SM89 实测编译通过；
+# prefill 383→493 tok/s，decode 无回退。回退开关：置 0）
+Environment=SGLANG_OPT_USE_TILELANG_INDEXER=1
 
 # 早期部署的 8 个 perf env 已逐一复验（DSv4Flash.md §10）：
 #   4 个默认已开（FUSE_WQA_WKV / USE_JIT_NORM / USE_MULTI_STREAM_OVERLAP /
@@ -66,16 +69,16 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --model /var/deepseek-v4-flash/0731 \
   --kt-weight-path /var/deepseek-v4-flash/0731 \
   --kt-method MXFP4 \
-  --kt-num-gpu-experts 0 \
+  --kt-num-gpu-experts 24 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
   --context-length 131072 \
   --attention-backend flashinfer \
-  --mem-fraction-static 0.60 \
+  --mem-fraction-static 0.85 \
   --max-total-tokens 135168 \
-  --chunked-prefill-size 512 \
-  --max-prefill-tokens 512 \
+  --chunked-prefill-size 1024 \
+  --max-prefill-tokens 1024 \
   --max-running-requests 1 \
   --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \
@@ -87,10 +90,15 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --tool-call-parser deepseekv4
 
 # cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。
-# MEMFRAC 0.60：DSpark draft 权重（~10.6GB）计入显存预算，0.90 会捕获失败；
-# 实际显存占用约 26.9GB / 48GB（实测）。
-# MAX-TOTAL-TOKENS 135168 = context 131072 + 4096 余量（须为 256 倍数；
-# 覆盖 --context-length 时同步调大）。
+# KT-NUM-GPU-EXPERTS 24：相位切换（SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY，默认开）——
+#   prefill 批次（≥64 token）用 GPU 常驻专家（+7% prefill），decode/verify（含
+#   cuda graph 重放）全走 CPU（40 tok/s，与 0 专家完全一致）。CPU 侧本来就有
+#   全部 256 个专家权重，GPU 副本按层常驻 ~13GB。
+# MEMFRAC 0.85：DSpark draft（~10.6GB）+ 24 GPU 专家（~13GB）计入预算后 0.60
+#   会拒绝启动；实测总占用约 36.8GB / 48GB。
+# CHUNKED-PREFILL 1024（原 512）：tilelang 索引器 + expandable_segments 下，
+#   >100K 重预填充实测安全（grow_probe 到 125K 通过）；prefill ~494 tok/s。
+#   若换更大 KV 占用的配置出现 >100K prefill OOM，回退 512。
 
 # 注意：历史版本单元文件里的 perf env 不要搬回本文件——复验结论见
 # DSv4Flash.md 10（尤其 FUSE_RSF_SHARED_ADD 会静默算错、KT_FP8_LMHEAD 的
