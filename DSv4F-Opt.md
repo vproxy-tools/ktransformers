@@ -181,6 +181,15 @@ fp8；log `DSV4 memory calculation` 行直接给出）。因此：
 - 显存的大头是**权重**不是 KV。想再换整层，唯二杠杆：关 DSpark（10.37GB ≈
   3.2 个整层）或从每层专家数里挪（28→25 省 1.6GB ≈ 半层）。
 
+**"关 DSpark 换 3 整层"实测（2026-08-20 A/B，不值）**：关 DSpark 后 hybrid
+填到 4F+28U（4×256 + 39×28 = 2116 专家，目标权重 37.56GB、稳态 40.25GB，
+余 8.81GB）——prefill **532.4**（vs 506.9，**+5.0%**，约 8.5 tok/s/整层）；
+decode 稳态 **28.73**（bench_dspark 27.78，5/5 PASS，vs 47.93，**−42%**）。
+DSpark 的 accept×~1.7 加速远超 3 个整层的带宽减负；且 4F+28U+DSpark =
+37.56+10.4GB > 48GB 物理装不下，二者只能二选一。**维持 1F+28U+DSpark**。
+（复现：去掉 `--speculative-algorithm DSPARK` 与其 2 个专属 env，改
+`--kt-num-gpu-full-layers 4`；bench 口径同 §6.1/6.2，log /tmp/nodspark_4f.log）
+
 ### 5.8 为什么是 499 不是 800（量化结论）
 
 47K prompt 每 token 2.00ms = CPU MoE ~1.45ms + 非 MoE（attention/dense/
