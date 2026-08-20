@@ -7,7 +7,7 @@
   第 2 遍（热，独立进程）: python check_reusable 命中 → 跳过 safetensors，
                 C++ mmap 已驻留大页（日志 REUSED from persistent hugepages）。
 
-用法: 连跑两遍 python3 hp_weight_check.py [layer_idx]
+用法: KT_MODEL_DIR=<模型目录> 连跑两遍 python3 hp_weight_check.py [layer_idx]
 前置: /dev/hugepages/kt_weights 已由 root 创建并 chown 给当前用户。
 """
 import os
@@ -15,7 +15,7 @@ import sys
 import time
 
 LAYER = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-MODEL = "/var/deepseek-v4-flash/0731"
+MODEL = os.environ.get("KT_MODEL_DIR", "/var/deepseek-v4-flash/0731")
 HIDDEN, INTER, EXPERTS, TOPK = 4096, 2048, 256, 6
 
 import torch

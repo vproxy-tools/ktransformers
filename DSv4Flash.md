@@ -6,6 +6,15 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤，包括与官方文档
 
 ## 1. 环境信息
 
+> **路径约定**：为保持可移植，正文命令统一使用以下变量（本机实际取值见
+> `ds4f.service`；`$USER` 为运行服务的系统用户）：
+>
+> ```bash
+> export KT_ROOT=~/ktransformers                    # ktransformers 仓库根目录
+> export MODEL_DIR=/path/to/DeepSeek-V4-Flash-0731  # 模型权重目录（0731 版）
+> export DSPARK_VENV=/path/to/venvs/dspark          # dspark 栈 venv 目录
+> ```
+
 | 项目 | 值 |
 |---|---|
 | GPU | 1× NVIDIA GeForce RTX 4090 D（48GB，SM_89 / Ada Lovelace） |
@@ -13,8 +22,8 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤，包括与官方文档
 | CPU | AMD EPYC 9275F（48 核 96 线程，AVX512 全家桶：F/BW/VL/VNNI/BF16/VBMI，无 AMX） |
 | 内存 | 1.5TB（2 NUMA 节点） |
 | 系统 | Ubuntu 24.04，gcc 13.3，cmake 3.28，ninja |
-| Python venv | 生产栈：`/var/deepseek-v4-flash/venvs/dspark`（Python 3.12，torch 2.11.0+cu128）；旧栈：仓库根 `.venv`（torch 2.9.1，保留可回滚） |
-| 模型 | `/var/deepseek-v4-flash/0731`（156GB，48 个 safetensors 分片，DeepseekV4ForCausalLM） |
+| Python venv | 生产栈：`$DSPARK_VENV`（Python 3.12，torch 2.11.0+cu128）；旧栈：仓库根 `.venv`（torch 2.9.1，保留可回滚） |
+| 模型 | `$MODEL_DIR`（0731 版 checkpoint，156GB，48 个 safetensors 分片，DeepseekV4ForCausalLM） |
 | 代码分支 | ktransformers `optimize-latest`；submodule third_party/sglang = **`dspark-kt` 分支**（2026-08-19 起生产用，见第 9 节；最初构建时为 kvcache-ai fork @ bc7f0058f，5.1 节补丁属于那个时期） |
 
 关键结论：
@@ -31,14 +40,14 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤，包括与官方文档
 > `312c1ee75`），否则装出来的是 dspark 源码、版本号与行为都不对。
 
 ```bash
-cd /home/wkgcass/ktransformers
+cd $KT_ROOT
 
 # 2.0 创建 venv（install.sh 只往当前激活的环境里装，不负责建 venv）
 python3.12 -m venv .venv          # 需系统 python3.12（本机 3.12.3）
 source .venv/bin/activate
 
 # (可选) pip 缓存挪到大盘，避免根分区被写满
-export PIP_CACHE_DIR=/var/pip-cache
+export PIP_CACHE_DIR=$HOME/.pip-cache
 
 # 2.1 初始化 submodule（仓库已带则跳过；旧栈需按上方时效说明检出 fork 时期指针）
 git submodule update --init --recursive
@@ -89,7 +98,7 @@ python -c "from transformers import DeepseekV4Config; print('ok')"   # transform
 启动命令与 `ds4f.service` 一致：
 
 ```bash
-cd /home/wkgcass/ktransformers
+cd $KT_ROOT
 
 # 架构变量：文档示例是 5090(SM_120)，4090/4090D 要改成 8.9
 export FLASHINFER_CUDA_ARCH_LIST=8.9
@@ -104,10 +113,10 @@ export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
 export SGLANG_OPT_USE_TOPK_V2=0
 export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
 
-/var/deepseek-v4-flash/venvs/dspark/bin/python -m sglang.launch_server \
+$DSPARK_VENV/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
-  --model /var/deepseek-v4-flash/0731 \
-  --kt-weight-path /var/deepseek-v4-flash/0731 \
+  --model $MODEL_DIR \
+  --kt-weight-path $MODEL_DIR \
   --kt-method MXFP4 \
   --kt-num-gpu-experts 0 \
   --kt-cpuinfer 48 \
@@ -197,7 +206,7 @@ Step 2（架构环境变量仍按上文 8.9 设置）。实测首请求 11.3 tok
 curl -s -X POST http://127.0.0.1:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "/var/deepseek-v4-flash/0731",
+    "model": "$MODEL_DIR",
     "messages": [{"role": "user", "content": "9.11和9.9哪个大？"}],
     "temperature": 0.0,
     "max_tokens": 400,
@@ -232,7 +241,7 @@ curl -s -X POST http://127.0.0.1:30000/generate \
 curl -s -X POST http://127.0.0.1:30000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "/var/deepseek-v4-flash/0731",
+    "model": "$MODEL_DIR",
     "messages": [{"role": "user", "content": "用三句话介绍一下你自己。"}],
     "temperature": 0.7,
     "max_tokens": 200
@@ -309,7 +318,7 @@ sudo systemctl restart ds4f    # 或 kill 主进程触发 on-failure 自动拉�
 安装（需要 sudo）：
 
 ```bash
-sudo cp /home/wkgcass/ktransformers/ds4f.service /etc/systemd/system/
+sudo cp $KT_ROOT/ds4f.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ds4f        # 开机自启 + 立即启动
 ```
@@ -337,7 +346,7 @@ nvidia-smi --query-gpu=memory.used --format=csv               # 确认显存归�
 > **与第 2 节的区别**：第 2 节是首次完整构建（`./install.sh`，带全部依赖和 extras）。
 > 本节是**改完代码后让改动生效**的正确姿势。两者不可混用——见下面的注意点 1。
 >
-> **2026-08-19 起**：生产栈 venv 是 `/var/deepseek-v4-flash/venvs/dspark`（不再
+> **2026-08-19 起**：生产栈 venv 是 `$DSPARK_VENV`（不再
 > 是 `.venv`）。其中 sglang 是 editable 安装（改 `third_party/sglang` 源码只需
 > 重启服务）；kt-kernel 是拷贝安装（改后需按 7.2 重编并把产物同步进该 venv）。
 > 以下命令中的 venv 激活请按目标栈选择。
@@ -350,7 +359,7 @@ nvidia-smi --query-gpu=memory.used --format=csv               # 确认显存归�
 
 ```bash
 source .venv/bin/activate
-export PIP_CACHE_DIR=/var/pip-cache
+export PIP_CACHE_DIR=$HOME/.pip-cache
 export SGLANG_KT_VERSION=0.6.4          # 与 install.sh 行为一致（读 ktransformers/version.py）
 cd third_party/sglang
 pip install --no-deps --no-build-isolation ./python
@@ -384,7 +393,7 @@ requirements pin 的是 torch 2.9.x，裸 `pip install .` 会做依赖解析并�
 torch 降级（2026-08-20 实际使用的流程）：
 
 ```bash
-source /var/deepseek-v4-flash/venvs/dspark/bin/activate
+source $DSPARK_VENV/bin/activate
 cd kt-kernel
 python3 -m pip install . --no-deps --no-build-isolation   # 增量重编+装入 venv
 # 需要清缓存全量重编时按旧法（--no-deps 同样要带）：
@@ -441,7 +450,7 @@ DeepSeek-V4-Flash 的 CPU 侧常驻权重（MXFP4 路由专家，每个 NUMA 约
 
 运维注意：
 - 模型更新后需手动 `rm -rf /var/lib/kt-hugepage-weights /dev/hugepages/kt_weights`（并重建属主
-  `wkgcass`），否则旧大页一直占用池子（每节点约 81 GiB）；
+  运行服务的用户），否则旧大页一直占用池子（每节点约 81 GiB）；
 - 大页池容量（当前 node0=300、node1=364 个 1 GiB 页）需 ≥ 常驻权重 + 其它大页用户；
 - 首次冷加载若中途崩溃，未写标记的层会在下次启动自动重写，无需人工干预。
 
@@ -452,16 +461,15 @@ root:root 755，8/19 08:58 虚机启动时挂载点被重建，`kt_weights/` 目
 MXFP4 layerwise prefill 的 host 写出兼容——它读转换后的 BufferB）。重新接通只需 root 一次性：
 
 ```bash
-sudo mkdir -p /dev/hugepages/kt_weights && sudo chown wkgcass:wkgcass /dev/hugepages/kt_weights
+sudo mkdir -p /dev/hugepages/kt_weights && sudo chown $USER:$USER /dev/hugepages/kt_weights
 # 陈旧标记已清理（2026-08-20）；下次启动冷加载约 1-2 分钟/全模型，之后 REUSED 秒级
 ```
 
 目录建好后可先离线验证（不碰 GPU、可与生产共存，产物直接被服务器复用）：
 
 ```bash
-cd /var/deepseek-v4-flash/venvs/dspark
-./bin/python /home/wkgcass/ktransformers/tests/hp_weight_check.py 0   # 第一遍:冷(转换+commit)
-./bin/python /home/wkgcass/ktransformers/tests/hp_weight_check.py 0   # 第二遍:热(打印 REUSED)
+KT_MODEL_DIR=$MODEL_DIR $DSPARK_VENV/bin/python $KT_ROOT/tests/hp_weight_check.py 0   # 第一遍:冷(转换+commit)
+KT_MODEL_DIR=$MODEL_DIR $DSPARK_VENV/bin/python $KT_ROOT/tests/hp_weight_check.py 0   # 第二遍:热(打印 REUSED)
 ```
 
 之后 ds4f 任意一次重启自然接通（冷一次，此后每次 REUSED、`load_weight` 显著缩短）。
@@ -511,7 +519,7 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
 
 ### 9.2 栈结构与关键修复
 
-- venv：`/var/deepseek-v4-flash/venvs/dspark`（torch 2.11.0+cu128、flashinfer
+- venv：`$DSPARK_VENV`（torch 2.11.0+cu128、flashinfer
   cu12 系、sgl-kernel/sgl-deep-gemm cu129 索引；sglang editable 指向
   third_party/sglang@`dspark-kt`，kt-kernel 以 torch 2.11 头文件重编）。
   生产旧栈 `.venv`（fork）保留可回滚。

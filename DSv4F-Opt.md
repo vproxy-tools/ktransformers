@@ -145,7 +145,7 @@ A/B 对照（8 个固定提示词，贪心，256 token，唯一变量=两个 FP8
 正式配置已显式写入仓库中的 **`ds4f.service`**（`--kt-cpuinfer 48` + 各 `Environment=` 行），
 安装到系统：
 ```
-sudo cp /home/wkgcass/ktransformers/ds4f.service /etc/systemd/system/ds4f.service
+sudo cp $KT_ROOT/ds4f.service /etc/systemd/system/ds4f.service
 sudo systemctl daemon-reload && sudo systemctl start ds4f
 ```
 `~/.config/sglang/env` 保留同名 KEY=VALUE 作为兜底（unit 未含对应行时才生效，
@@ -202,7 +202,7 @@ kvcache-ai fork（基于 2 月主线）没有 DSpark，因此开新分支 **`dsp
 
 ### 7.2 环境
 
-- 独立 venv：`/var/deepseek-v4-flash/venvs/dspark`（torch 2.11.0+cu128、
+- 独立 venv：`$DSPARK_VENV`（本机实际路径见 ds4f.service；torch 2.11.0+cu128、
   flashinfer 0.6.15.post1[cu12]、sgl-kernel/sgl-deep-gemm 自 docs.sglang.ai
   cu129 索引、transformers 5.12.1；sglang 为 editable、kt-kernel 为本地构建
   拷贝安装）。旧栈 `.venv`（torch 2.9.1）保留未动，仅作回滚。
@@ -292,6 +292,7 @@ checksum 对比；pinned 指针复用独立复现脚本。
 ## 9. 测试工具参考（开发者）
 
 面向开发者；普通用户视角的构建/部署/运行见 `DSv4Flash.md`（其 9.4 节有工具简表并指回本节）。
+命令中的 `$KT_ROOT` / `$MODEL_DIR` / `$DSPARK_VENV` 含义见 DSv4Flash.md 开头的路径约定。
 通用前提：所有探针/基准都向目标端口发**真实生成请求**（temperature=0 贪心），
 默认超时 600–1200s；除特别注明外用系统 python3 即可（只依赖 urllib）。
 
@@ -369,14 +370,16 @@ ds4f`，或 kill 主进程靠 systemd 30s 后拉起、注意 StartLimitBurst 预
   kt_kernel）。
 - **执行**：连跑两遍（必须是两个独立进程——同进程第二次 alloc 时 arena cursor 已
   前移，marker 偏移不再相等，测不出复用）：
-  `/var/deepseek-v4-flash/venvs/dspark/bin/python tests/hp_weight_check.py [layer_idx]`
+  `KT_MODEL_DIR=$MODEL_DIR $DSPARK_VENV/bin/python $KT_ROOT/tests/hp_weight_check.py [layer_idx]`
 - **清理**：**不需要，也不要清**——marker/大页内容留给服务器复用。只有换模型/换
   布局时才清 `/var/lib/kt-hugepage-weights` 与 `kt_weights/`（DSv4Flash.md 8）。
 - **解读**：第 1 遍应见 `[hugepage_weights] layer N tp X: ... allocated in persistent
   hugepages`（转换+commit，单层秒级）；第 2 遍 `[pre-check] check_reusable = True`、
   `weights REUSED from persistent hugepages (safetensors skipped)`、`... REUSED from
   persistent hugepages`、总耗时从数百 ms 掉到 ~60ms。marker 可核对
-  `pfp=9bcd0b02fd234216`（0731 模型 + AMXFP4_KGroup_MOE 的期望值）。
+  `pfp=9bcd0b02fd234216`（0731 模型 + AMXFP4_KGroup_MOE 的参考部署期望值；
+注意 pfp 的 stamp 含模型目录 realpath——**换路径部署后期望值会变**，以当次
+冷加载 commit 出的 marker 为准）。
 - **通过分界**：**第 2 遍打印 REUSED 且 check_reusable=True = 通过**；第 2 遍仍
   allocated（冷）= 复用链断（marker/指纹不一致，删除标记重跑）；日志完全没有
   `[hugepage_weights]` 行 = 缓存未启用（目录缺失或 KT_HUGEPAGE_WEIGHTS=0）。
@@ -388,7 +391,7 @@ ds4f`，或 kill 主进程靠 systemd 30s 后拉起、注意 StartLimitBurst 预
   cuda graph 5000 次回放应无崩溃无增长（捕获型 args 永生、回放零分配）。
 - **前提**：GPU 可用（占用 <1.5GB，**与生产共存安全**）；dspark venv python（编译进
   venv 的 .so 才是被测对象——先按 DSv4Flash.md 7.2 重编并装入 venv 再测源码改动）。
-- **执行**：`/var/deepseek-v4-flash/venvs/dspark/bin/python tests/sync_leak_check.py`，~2 分钟。
+- **执行**：`$DSPARK_VENV/bin/python $KT_ROOT/tests/sync_leak_check.py`，~2 分钟。
 - **清理**：无需（纯本地进程）。
 - **解读**：`[eager] ... (X B/次)` 与 `[graph] ... 无崩溃`；测量陷阱：紧循环 RSS 读数
   含"已 free 未归还"的驻留页（纯 C 跨线程 malloc/free 模式本身 ~28B/次），所以
