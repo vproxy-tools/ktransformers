@@ -268,9 +268,34 @@ norm）→ `per_token_group_quant` → `_w8a8_block_fp8_matmul`（wqa/wkv 投影
 → `fused_q_norm_rope` → **index_elementwise + direct_copy(cast)** →
 `fused_k_norm_rope_flashmla`。已排除：dedup（默认关）、显存压力
 （memfrac 0.78 余 11.5GB 仍崩）、DSpark（无亦崩）、多档捕获（单档亦损）、
-CUDA_LAUNCH_BLOCKING（与捕获互斥不可用）。下一步候选：对最小复现跑
-compute-sanitizer、逐内核排除 index/copy 与 rope 系、或上游咨询
-（DSV4 的 BCG 兼容声明只在全 GPU 栈上成立过）。
+CUDA_LAUNCH_BLOCKING（与捕获互斥不可用）。
+
+**第二轮深挖（同日续，sanitizer 路线受阻后的等效定位）**：
+- compute-sanitizer 与 sglang 多进程 spawn 死锁（TreeLauncher 起，
+  scheduler 子进程不产 GPU 工作，15min 无权重加载）——不可用于本服务形态。
+- 等效工具链（全部保留在分支）：`SGLANG_BCG_DEBUG_SPLIT=after_mlp,...`
+  （deepseek_v4.py 内空断点二分器）+ `SGLANG_BCG_NO_WEAK_REF=1`（禁弱引用）
+  + 既有 SYNC/KERNELS 转储。
+- **新修复（必要非充分）**：`_compute_kv_to_cache`（DSV4 k-norm+rope+
+  **直写分页 KV**，经 `set_swa_key_buffer_radix_fused_norm_rope`）加
+  `@eager_on_graph(True)`——录制进段则回放写陈旧 slot；与 attention 同类
+  的 KV 副作用，必须 eager。
+- **expandable_segments 定性**：关掉后 illegal access 消失（变静默损坏）——
+  崩溃=VMM unmap 已释放显存 + 录制内核悬垂指针；保留时崩溃点稳定在 MoE
+  断点后段（强引用也不救 → 悬垂不在断点参数里，在段间中间量）。
+- **损坏本质（no-expandable + grow_probe）**：8K 阶段 FAIL，模式=
+  `codeword=False / math=True / dup=0`——**前缀注意力跨 chunk 丢失**，
+  当前步正常；无 BCG 同配置对照 PASS（expandable 有无均 PASS，确认与
+  expandable 无关的纯 BCG 回放缺陷）。
+- 再排除：overlap 调度竞态（--disable-overlap-schedule 仍 FAIL）、
+  MAX_SEQ_LEN 钳制（=131072 全长）、元数据刷新面
+  （refresh_for_breakable_cuda_graph_replay_ 对 raw_out_loc/seq_lens/
+  positions/c4/c128/page_table/flashmla 字段全覆盖，审查未见缺口）。
+- 剩余嫌疑集中在：refresh 的 `reference_assign_fields`（page_table/
+  swa_page_indices/c128_page_indices/flashmla 元数据走**引用替换**而非
+  原地拷贝——若某录制内核按捕获期地址读这些张量，刷新换对象即失联）
+  与 c128 在线压缩的跨 chunk 状态机。下一步：对这两组字段做原地拷贝
+  实验、或上游 issue（DSV4 的 BCG 兼容声明只在全 GPU 栈上成立过）。
 
 **生产影响**：ds4f.service 无 BCG 参数，行为不变；cuda-python 12.9.7 下
 eager+decode 图路径已验证（bench_dspark 5/5 ALL PASS、短 prompt probe
