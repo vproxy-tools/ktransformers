@@ -200,7 +200,14 @@ DSpark 的 accept×~1.7 加速远超 3 个整层的带宽减负；且 4F+28U+DSp
   无法覆盖剩余差距。
 - prefill CUDA graph（本可消掉每层 ~4ms 串行 glue）三条路均不通：
   full 仅 decode；tc_piecewise 需 dynamo 可追踪（kt pybind 对象不可）；
-  breakable 需要驱动 >550（当前 550.144 报 CUDA error 35）。
+  breakable 卡点（2026-08-21 修正）：非驱动能力问题，是 venv 的
+  `cuda-python 13.3.1`（CUDA 13 绑定）对 <580 驱动一律报 error 35——
+  连 CUDA 10 时代的 `cudaStreamGetCaptureInfo` 都拒（13.3.1 复现）；
+  换 `cuda-python 12.8.*` 后同 API 在同一 550.144 驱动上通过（临时
+  venv 冒烟）。即**无需升级驱动/toolkit，降绑定包即可再试 BCG**
+  （注意 sglang pyproject 声明 cuda-python>=13.0，属偏离声明矩阵）。
+  BCG 的 API 面（cudaGraphExecUpdate/cuGraphGetNodes 等）均为 CUDA
+  11-12.4 时代，12.8 绑定理论上够。
 - 单卡 TBO 不适用（无通信可重叠）。
 
 ### 5.6 结果汇总（47K prompt，131072 ctx，DSpark）
