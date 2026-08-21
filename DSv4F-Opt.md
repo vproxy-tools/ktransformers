@@ -297,6 +297,23 @@ CUDA_LAUNCH_BLOCKING（与捕获互斥不可用）。
   与 c128 在线压缩的跨 chunk 状态机。下一步：对这两组字段做原地拷贝
   实验、或上游 issue（DSV4 的 BCG 兼容声明只在全 GPU 栈上成立过）。
 
+**第三轮（同日，收束）**：
+- `SGLANG_BCG_REFRESH_INPLACE=all`（reference_assign_fields 全量改原地
+  拷贝，deepseek_v4_backend.py，两段式防部分拷贝；默认关）：grow_probe
+  结果与引用替换**完全相同**（8K FAIL 同签名）——该假设**证伪**。工具
+  保留供后续逐字段二分。
+- tilelang 索引器对照（SGLANG_OPT_USE_TILELANG_INDEXER=0）在 ctx131072
+  下不可行：torch 回退路径捕获期 kvcache gather 峰值 OOM（2GB×，有无
+  expandable、memfrac 0.70-0.87 均炸）——此线关闭。
+- **单 chunk 图回放也损坏**（~819-token 数学题 prompt，pad 到 1024 档，
+  GRAPH，输出空）——损坏**并非前缀特有**，而是普遍性回放损坏；grow_probe
+  的"暗号丢失"只是其在长上下文下的表现。另观察到同次启动里图使用后的
+  短 eager 请求也出错（一次性样本，疑与捕获期 dummy 前向污染持久状态
+  有关，未深究）。
+- 结论：BCG 在 DSV4+kt 栈上是**多重损坏**（悬垂指针崩溃 + 普遍回放
+  数值损坏 + 疑似捕获期状态污染），远超单点修复；建议上游 issue 附
+  §5.9 全部证据（sglang 分支含全部诊断开关）。生产维持禁用。
+
 **生产影响**：ds4f.service 无 BCG 参数，行为不变；cuda-python 12.9.7 下
 eager+decode 图路径已验证（bench_dspark 5/5 ALL PASS、短 prompt probe
 CLEAN）；长 prefill eager 在 12.9.7 下建议上线前补一轮 grow_probe。
