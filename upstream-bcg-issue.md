@@ -1,7 +1,9 @@
 # Upstream issue draft: Breakable CUDA graph (BCG) prefill replay broken on DeepSeek-V4-Flash with KT hybrid CPU/GPU MoE
 
-> 准备提交 sglang 上游的 issue 草稿（提交前需人工过目；分支/提交号按实际
-> 公开仓库调整）。对应本地调查记录：DSv4F-Opt.md §5.9（三轮证据链）。
+> 留档：BCG 线已于 2026-08-21 经用户决策正式关闭（DSv4F-Opt.md §5.9），
+> 本草稿不再计划提交；若日后重启该线，贴上游前需先把含诊断开关的分支
+> （`305cc43ca` 及祖先）推到公开 fork。对应本地调查记录：DSv4F-Opt.md
+> §5.9（三轮证据链）。
 
 ---
 
