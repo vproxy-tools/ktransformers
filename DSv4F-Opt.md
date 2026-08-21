@@ -198,16 +198,11 @@ DSpark 的 accept×~1.7 加速远超 3 个整层的带宽减负；且 4F+28U+DSp
   单核 ~110 GMAC/s 已接近；in-situ 65-70，理论剩余 1.4×。
 - GPU 专家受显存限制（DSpark 共存时 ≤24-28 个 ≈ 9-11% 对），线性外推
   无法覆盖剩余差距。
-- prefill CUDA graph（本可消掉每层 ~4ms 串行 glue）三条路均不通：
-  full 仅 decode；tc_piecewise 需 dynamo 可追踪（kt pybind 对象不可）；
-  breakable 卡点（2026-08-21 修正）：非驱动能力问题，是 venv 的
-  `cuda-python 13.3.1`（CUDA 13 绑定）对 <580 驱动一律报 error 35——
-  连 CUDA 10 时代的 `cudaStreamGetCaptureInfo` 都拒（13.3.1 复现）；
-  换 `cuda-python 12.8.*` 后同 API 在同一 550.144 驱动上通过（临时
-  venv 冒烟）。即**无需升级驱动/toolkit，降绑定包即可再试 BCG**
-  （注意 sglang pyproject 声明 cuda-python>=13.0，属偏离声明矩阵）。
-  BCG 的 API 面（cudaGraphExecUpdate/cuGraphGetNodes 等）均为 CUDA
-  11-12.4 时代，12.8 绑定理论上够。
+- prefill CUDA graph（本可消掉每层 ~4ms 串行 glue）：2026-08-21 已深入到
+  图回放层并定位故障（详见 §5.9）——绑定包换 12.9.7 后捕获成功、kt MoE
+  以 eager 断点接入，但**任何真实图回放均产出损坏结果**（tier512 乱码 /
+  tier1024 illegal access），+14% 的吞吐是在损坏计算上测得，不可用。
+  维持禁用；生产不受影响。
 - 单卡 TBO 不适用（无通信可重叠）。
 
 ### 5.6 结果汇总（47K prompt，131072 ctx，DSpark）
@@ -225,6 +220,61 @@ DSpark 的 accept×~1.7 加速远超 3 个整层的带宽减负；且 4F+28U+DSp
 （相位切换 v1 的 prefill 493.9 带着竞态红利且 decode 静默缺 24 专家/层，
 不作数；v2 是全量正确下的诚实数字。）
 
+### 5.9 BCG prefill 图攻坚（2026-08-21）：换绑定成功、回放损坏已定位、未修
+
+**依赖变更（已生效并保留）**：venv `cuda-python/cuda-bindings 13.3.1 →
+12.9.7`。13.3.1（CUDA 13 绑定）对 550 驱动一律 error 35（连 CUDA 10 时代
+的 `cudaStreamGetCaptureInfo` 都拒）；12.9.7 同时满足 torch 声明的
+`>=12.9.4,<13` 与 550 驱动（cu12 minor 兼容）。注意 sglang pyproject 声明
+`cuda-python>=13.0`，本机属有意偏离。**换包前快照：
+`requirements-backup-20260821.txt`**（恢复：
+`.venv/bin/pip install -r requirements-backup-20260821.txt`）。
+
+**打通的部分**：
+1. error 35 消失，`--cuda-graph-backend-prefill breakable` 显式锁定可绕过
+   DSV4 自动禁用规则（server_args.py `_disable_breakable_cudagraph_...`
+   的规则对显式设置不生效）；捕获成功（单档 1024：6.3s/1.11GB；38 档全量
+   ~56-111s/~6GB，1F+28U+DSpark 显存装得下，memfrac 0.87）。
+2. **kt 混合 MoE 必须是 eager 断点**：`KTEPWrapperMethod.apply` 加
+   `@eager_on_graph(True)`（kt_ep_wrapper.py）——BCG 回放只重放录制段 +
+   标注断点，apply 的 host 编排（CPU 专家提交/路由元数据/同步）不标注则
+   回放吃陈旧状态（短 prompt 数学题复读式错误）。非 BCG 场景装饰器直接
+   透传，零开销。
+3. **上游 NamedTuple 弱引用 bug 修复**（breakable_cuda_graph.py
+   `_weak_ref_if_tensor`）：NamedTuple（StandardDispatchOutput/TopKOutput）
+   被拆成普通 tuple，断点回放 `dispatch_output.hidden_states` 直接
+   AttributeError；现按 `type(x)(*elems)` 重构。
+4. 调试工具（保留）：`SGLANG_BCG_DEBUG_SYNC=1` 每段/每断点后同步打点；
+   `SGLANG_BCG_DEBUG_KERNELS=1` 附带段内内核名转储（cuGraphGetNodes +
+   cuKernelGetName，需 keep_graph，已联动）。
+
+**未解决——图回放损坏（全部实测，1F+28U、无 radix、单请求）**：
+
+| 配置 | 真实图回放结果 |
+|---|---|
+| tier 1024 + ctx131072 + 无 DSpark | 首次回放即 illegal access（logits 处浮出） |
+| tier 1024 + ctx131072 + DSpark | 不崩但多 chunk 输出损坏（grow_probe 8K FAIL：暗号丢+数学错+复读 67） |
+| tier 512 + ctx131072 | 多 chunk 完成但输出乱码（"Repeat w0" → `" ( 8 (,1"`） |
+| 短 prompt（<chunk，走 eager） | 全部正确（probe CLEAN / bench 5/5）——曾经的"短 OK"均为 eager，非图 |
+
+bench_prefill 47K 实测 579.6 tok/s（+14.3%）是在损坏计算上的吞吐，
+**不可作为收益结论**。基线（同机同晚、无 BCG）grow_probe 同口径 PASS，
+损坏归因于 BCG 图回放本身。
+
+**定位数据**（SGLANG_BCG_DEBUG_SYNC 下，崩溃固定发生在第一个 MoE 断点后
+的 segment 2/87 回放；断点本体 apply 同步后通过）：segment 2 内核序列 =
+`Mul`（合并加权）→ `add`（残差）→ `mhc_post/pre_*_tilelang`（前后置融合
+norm）→ `per_token_group_quant` → `_w8a8_block_fp8_matmul`（wqa/wkv 投影）
+→ `fused_q_norm_rope` → **index_elementwise + direct_copy(cast)** →
+`fused_k_norm_rope_flashmla`。已排除：dedup（默认关）、显存压力
+（memfrac 0.78 余 11.5GB 仍崩）、DSpark（无亦崩）、多档捕获（单档亦损）、
+CUDA_LAUNCH_BLOCKING（与捕获互斥不可用）。下一步候选：对最小复现跑
+compute-sanitizer、逐内核排除 index/copy 与 rope 系、或上游咨询
+（DSV4 的 BCG 兼容声明只在全 GPU 栈上成立过）。
+
+**生产影响**：ds4f.service 无 BCG 参数，行为不变；cuda-python 12.9.7 下
+eager+decode 图路径已验证（bench_dspark 5/5 ALL PASS、短 prompt probe
+CLEAN）；长 prefill eager 在 12.9.7 下建议上线前补一轮 grow_probe。
 
 ## 1. DSpark 投机解码（主线 sglang 移植）
 
