@@ -187,6 +187,7 @@ fp8；log `DSV4 memory calculation` 行直接给出）。因此：
 decode 稳态 **28.73**（bench_dspark 27.78，5/5 PASS，vs 47.93，**−42%**）。
 DSpark 的 accept×~1.7 加速远超 3 个整层的带宽减负；且 4F+28U+DSpark =
 37.56+10.4GB > 48GB 物理装不下，二者只能二选一。**维持 1F+28U+DSpark**。
+（2026-08-22 起稳态已切换为 no-DSpark + 5F+28U，见 §5.10。）
 （复现：去掉 `--speculative-algorithm DSPARK` 与其 2 个专属 env，改
 `--kt-num-gpu-full-layers 4`；bench 口径同 §6.1/6.2，log /tmp/nodspark_4f.log）
 
@@ -325,6 +326,30 @@ CUDA_LAUNCH_BLOCKING（与捕获互斥不可用）。
 eager+decode 图路径已验证（bench_dspark 5/5 ALL PASS、短 prompt probe
 CLEAN）；长 prefill eager 在 12.9.7 下建议上线前补一轮 grow_probe。
 
+### 5.10 稳态切换（2026-08-22）：no-DSpark + 5F+28U
+
+**稳态配置变更为：关闭 DSpark，前 5 个 MoE 层整层上 GPU + 其余 38 层
+各 28 常驻专家（5F+28U，2344 专家），memfrac 0.90。** 背景与依据：
+
+- 触发：真实业务反馈开 DSpark 后 temp>0 输出异常（莫名完结、代码混乱）。
+  逐层排查结论见 §1.5——采样链路受探针覆盖的部分统计保真，问题轴
+  未定位，稳态先退回无 DSpark 观察。
+- **加载期瞬态修复（mxfp4_deepseek.py，只影响加载不影响运行）**：
+  整层常驻的 Marlin 打包原为"原始整层 + 打包整层"同时在场（~6.6GB
+  瞬态），而加载器在打包前已把全部原始权重放上 GPU，5+ 整层配置下
+  打包第 1 层即 OOM。修为逐张量 分配→转换→立即释放（峰值降到单张
+  w13 一份 ~2.2GB）。附 `SGLANG_V4_MEMDBG=1` 打点（默认关）。
+- **5F/6F 边界**：5F+28U = 2344 专家、目标权重 ~42.5GB，是 48GB 卡
+  上限；6F 在 create_weights 阶段即 OOM（即便有上面的瞬态修复）。
+- memfrac 0.87→0.90：无 DSpark draft（省 ~10.6GB）后把余量喂给专家
+  权重；0.90 是实测可稳定完成图捕获的上限，再往上挤压图捕获工作区。
+- 折中方案（减 uniform 专家换更多整层，如 3F+17U）实验后放弃
+  （log /tmp/exp_3f17u.log）——最终选择保持每层 28 个 uniform 专家
+  不动，只用纯余显存叠加整层。
+- 性能预期：prefill 随整层数线性 +~8.5 tok/s/层（4F 实测 532.4），
+  decode 无 DSpark 加速、约 28-29 tok/s（§5.8 A/B）。恢复 DSpark 的
+  完整步骤写在 ds4f.service 注释里。
+
 ## 1. DSpark 投机解码（主线 sglang 移植）
 
 ### 1.1 背景与路线
@@ -389,6 +414,33 @@ CLEAN）；长 prefill eager 在 12.9.7 下建议上线前补一轮 grow_probe�
 - 把主线自带的 SGLANG_OPT_FP8_WO_A_GEMM 等消费者级优化在 SM89 上验证开启
   （SGLANG_KT_WOA_FP8_TRITON / SGLANG_KT_FP8_LMHEAD 已判定不可用，见 §4）。
 - SPS 置信度调度表（`--speculative-dspark-sps-table-path`）离线构建。
+
+### 1.5 temp>0 分布保真排查（2026-08-22）：采样路径无统计学偏差
+
+起因：真实业务反馈开 DSpark 后输出"莫名其妙完结、代码混乱"。对
+temp=1.0 采样做了逐层排查（脚本在 /tmp：`dist_prefix.py` / `dist_prefix2.py` /
+`dist_cmp.py` / `finish_test.py` / `test_chain_kernel.py`，置换检验 N=400-800）：
+
+- **accept kernel**（`chain_speculative_sampling_triton`）：受控 p/q 单测与 CPU
+  精确参考逐位一致，TV=0.0000。
+- **folded 图内 draft 采样**（`SGLANG_DSPARK_FOLDED_SAMPLING=0` 对照）与
+  **torch.multinomial 采样路径**（`SGLANG_DSPARK_FAST_SAMPLING=0`）：均无影响。
+- **Marlin/GPU 专家**：全 CPU verify（`SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=1`）
+  下结论不变，排除。
+- **固定前缀第 1 token**（extend 路径，N=800）：on vs off TV=0.068，
+  p=0.52，无差异。同配置重复采样噪声地板 TV≈0.10（p=0.66）。
+- **第 2 token 联合分布**（verify 5-token 前向路径，N=800）：TV=0.101，
+  p=0.115，无差异。
+- **提前完结**（数到 30 任务，N=100）：on/off 均 100% finish=stop、
+  长度恒定 60 token，无差异。
+- 早期"链深位置分布偏移 p=0.0005"被证伪：**两条合法 decode 路径**
+  （全 CPU decode vs Marlin decode，都关 DSpark）之间差异同样 p=0.0005
+  ——该指标会把微小数值差沿轨迹混沌放大，不能用作 bug 判据。
+
+结论：DSpark 的 extend/verify/accept/采样全链路在受探针覆盖的场景下
+统计保真。**未覆盖的轴**：thinking 开启、流式、工具调用、并发批处理。
+若业务问题重现，需要一份具体失败样本（prompt、采样参数、是否流式、
+并发度、输出）来定位。
 
 ## 2. 相关文件
 - 测试工具：全部在 `tests/`（探针/基准/巨页与泄漏回归等，见 §3）；

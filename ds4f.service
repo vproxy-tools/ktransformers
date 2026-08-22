@@ -1,5 +1,5 @@
 [Unit]
-Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, CPU experts + DSpark)
+Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 5F+28U 稳态, no DSpark)
 Documentation=file:///home/wkgcass/ktransformers/DSv4Flash.md
 After=network.target
 # 若机器启用了 nvidia-persistenced，取消下面两行注释可避免冷启动时驱动未就绪
@@ -29,10 +29,10 @@ Environment=TORCH_CUDA_ARCH_LIST=8.9+PTX
 # 单请求可用 chat_template_kwargs {"thinking": false} 覆盖关闭
 Environment=SGLANG_DEFAULT_THINKING=1
 
-# --- DSpark + SM89 回退栈必需 ---
-Environment=SGLANG_RAGGED_VERIFY_MODE=static
+# --- DSpark 专属 verify env（稳态无 DSpark，注释保留；重新启用 DSpark 时恢复）---
+# Environment=SGLANG_RAGGED_VERIFY_MODE=static
 # verify 元数据图外构建（ctx>111.4K 图内录制会损坏生成，见 DSv4Flash.md 9.3）
-Environment=SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1
+# Environment=SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1
 # 131072（513 页宽）prefill 的 indexer gather 峰值需要小 chunk + 消碎片
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # SM89: deep_gemm (SM90+) 路径关闭，走 torch/triton 回退
@@ -56,7 +56,8 @@ Environment=SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0
 #      （只发给 scheduler 进程！systemctl kill -s USR2 会打到无处理器的
 #       进程导致服务退出）；4) python3 tests/analyze_dist.py 分析。
 # 开启时开销实测：prefill 不变（507.8 vs 506.7），decode 步时不变。
-# Environment=KT_EXPERT_DIST_TRACK=1
+# 【当前已启用：真实业务负载路由分布测量】测完记得注释回去并重启。
+Environment=KT_EXPERT_DIST_TRACK=1
 
 # 早期部署的 8 个 perf env 已逐一复验（DSv4Flash.md §10）：
 #   4 个默认已开（FUSE_WQA_WKV / USE_JIT_NORM / USE_MULTI_STREAM_OVERLAP /
@@ -83,14 +84,14 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --kt-weight-path /var/deepseek-v4-flash/0731 \
   --kt-method MXFP4 \
   --kt-expert-placement-strategy hybrid \
-  --kt-num-gpu-full-layers 1 \
+  --kt-num-gpu-full-layers 5 \
   --kt-num-gpu-experts 28 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
   --context-length 131072 \
   --attention-backend flashinfer \
-  --mem-fraction-static 0.87 \
+  --mem-fraction-static 0.90 \
   --max-total-tokens 135168 \
   --chunked-prefill-size 1024 \
   --max-prefill-tokens 1024 \
@@ -100,18 +101,18 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --trust-remote-code \
   --disable-radix-cache \
   --skip-server-warmup \
-  --speculative-algorithm DSPARK \
   --reasoning-parser deepseek-v4 \
   --tool-call-parser deepseekv4
 
-# cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。
-# 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：每层
-#   28 个常驻专家（~15GB，Marlin 计算 prefill+decode）+ 第 1 个 MoE 层整层
-#   （~3.2GB，零 GPU-CPU 通信，decode 走 Marlin 省整层 CPU 带宽）。叠加式：
-#   整层用的是 uniform-28 之外的真余显存（matmul_ogs 时代整层负收益，
-#   Marlin 解锁后净赚）。实测 prefill 506.9 / decode 47.9 tok/s。
-# MEMFRAC 0.87：DSpark draft（~10.6GB）+ 专家（~18.4GB）计入预算；实测总
-#   占用约 42.0GB / 48GB（再填一层 3.2GB 会挤压图捕获，勿超）。
+# cuda graph 默认开启；无 DSpark 时无 verify 图，仅 decode/prefill 图。
+# 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：前 5 个
+#   MoE 层整层上 GPU（5×256=1280 专家）+ 其余 38 层各 28 个常驻专家（Marlin
+#   计算 prefill+decode），合计 2344 专家、目标权重 ~42.5GB——这是 48GB 卡的
+#   上限，6F 在 create_weights 阶段即 OOM（DSv4F-Opt.md §5.10）。
+# MEMFRAC 0.90：无 DSpark draft（省 ~10.6GB）后把余量喂给专家权重；0.90 是
+#   实测可稳定完成图捕获的上限，再往上会挤压图捕获工作区。
+# 重新启用 DSpark：恢复 --speculative-algorithm DSPARK + 上面 2 个 verify env，
+#   并退回 --kt-num-gpu-full-layers 1 + MEMFRAC 0.87（5F 与 draft 共存装不下）。
 # CHUNKED-PREFILL 1024（原 512）：tilelang 索引器 + expandable_segments 下，
 #   >100K 重预填充实测安全（grow_probe 到 125K 通过）。
 #   若换更大 KV 占用的配置出现 >100K prefill OOM，回退 512。
