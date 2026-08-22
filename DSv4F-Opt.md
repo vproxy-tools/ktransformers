@@ -187,7 +187,8 @@ fp8；log `DSV4 memory calculation` 行直接给出）。因此：
 decode 稳态 **28.73**（bench_dspark 27.78，5/5 PASS，vs 47.93，**−42%**）。
 DSpark 的 accept×~1.7 加速远超 3 个整层的带宽减负；且 4F+28U+DSpark =
 37.56+10.4GB > 48GB 物理装不下，二者只能二选一。**维持 1F+28U+DSpark**。
-（2026-08-22 起稳态已切换为 no-DSpark + 5F+28U，见 §5.10。）
+（2026-08-22 起为双稳态并存：no-DSpark 5F+28U 在线 / 本节 1F+28U+DSpark
+为备选稳态，见 §5.10。）
 （复现：去掉 `--speculative-algorithm DSPARK` 与其 2 个专属 env，改
 `--kt-num-gpu-full-layers 4`；bench 口径同 §6.1/6.2，log /tmp/nodspark_4f.log）
 
@@ -326,14 +327,30 @@ CUDA_LAUNCH_BLOCKING（与捕获互斥不可用）。
 eager+decode 图路径已验证（bench_dspark 5/5 ALL PASS、短 prompt probe
 CLEAN）；长 prefill eager 在 12.9.7 下建议上线前补一轮 grow_probe。
 
-### 5.10 稳态切换（2026-08-22）：no-DSpark + 5F+28U
+### 5.10 双稳态配置（2026-08-22）：no-DSpark 5F+28U 与 DSpark 1F+28U 并存
 
-**稳态配置变更为：关闭 DSpark，前 5 个 MoE 层整层上 GPU + 其余 38 层
-各 28 常驻专家（5F+28U，2344 专家），memfrac 0.90。** 背景与依据：
+**仓库提供两个并存的稳态 unit，二选一部署：**
+
+| 文件 | 配置 | prefill | decode | 适用 |
+|---|---|---|---|---|
+| `ds4f.service`（当前在线） | 无 DSpark，5F+28U（2344 专家），memfrac 0.90 | ~530+（随整层线性，4F 实测 532.4） | ~28-29 | temp>0 业务行为观察期 |
+| `ds4f-dspark.service` | DSpark，1F+28U（1292 专家），memfrac 0.87 | 506.9 | 47.9（accept×~1.7） | 追求 decode 吞吐 |
+
+切换（两份文件除 DSpark 相关行外完全一致）：
+
+```bash
+sudo cp <选定的 unit> /etc/systemd/system/ds4f.service
+sudo systemctl daemon-reload && sudo systemctl restart ds4f
+```
+
+二者互斥的物理原因：DSpark draft 占 ~10.6GB，4F+28U+DSpark =
+37.56+10.4GB > 48GB 装不下（§5.8），所以 DSpark 稳态只能 1F。
+
+背景与依据：
 
 - 触发：真实业务反馈开 DSpark 后 temp>0 输出异常（莫名完结、代码混乱）。
   逐层排查结论见 §1.5——采样链路受探针覆盖的部分统计保真，问题轴
-  未定位，稳态先退回无 DSpark 观察。
+  未定位，no-DSpark 稳态用于对照观察。
 - **加载期瞬态修复（mxfp4_deepseek.py，只影响加载不影响运行）**：
   整层常驻的 Marlin 打包原为"原始整层 + 打包整层"同时在场（~6.6GB
   瞬态），而加载器在打包前已把全部原始权重放上 GPU，5+ 整层配置下
@@ -341,14 +358,12 @@ CLEAN）；长 prefill eager 在 12.9.7 下建议上线前补一轮 grow_probe�
   w13 一份 ~2.2GB）。附 `SGLANG_V4_MEMDBG=1` 打点（默认关）。
 - **5F/6F 边界**：5F+28U = 2344 专家、目标权重 ~42.5GB，是 48GB 卡
   上限；6F 在 create_weights 阶段即 OOM（即便有上面的瞬态修复）。
-- memfrac 0.87→0.90：无 DSpark draft（省 ~10.6GB）后把余量喂给专家
-  权重；0.90 是实测可稳定完成图捕获的上限，再往上挤压图捕获工作区。
+- memfrac 0.87→0.90（仅 no-DSpark 稳态）：无 draft 省 ~10.6GB，余量
+  喂给专家权重；0.90 是实测可稳定完成图捕获的上限，再往上挤压图
+  捕获工作区。
 - 折中方案（减 uniform 专家换更多整层，如 3F+17U）实验后放弃
   （log /tmp/exp_3f17u.log）——最终选择保持每层 28 个 uniform 专家
   不动，只用纯余显存叠加整层。
-- 性能预期：prefill 随整层数线性 +~8.5 tok/s/层（4F 实测 532.4），
-  decode 无 DSpark 加速、约 28-29 tok/s（§5.8 A/B）。恢复 DSpark 的
-  完整步骤写在 ds4f.service 注释里。
 
 ## 1. DSpark 投机解码（主线 sglang 移植）
 

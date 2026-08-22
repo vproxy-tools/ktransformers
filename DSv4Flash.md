@@ -250,9 +250,14 @@ DSpark 单请求吞吐参考区间 32–36 tok/s，口径见 3.1）。
 | 输出损坏（复读/数学错） | 先跑 `tests/probe_dspark.py`，损坏与 ctx 相关时用 `tests/bisect_ctx.sh` 二分 | 已知两类损坏均已修复（DSv4F-Opt.md §4）；复现即新问题 |
 ## 6. 服务管理（systemd）
 
-工程根目录提供了 `ds4f.service`（内容即 3.1 节的启动命令 + 必需环境变量），
-崩溃自动拉起（30s 延迟；限流 `StartLimitIntervalSec=86400` / `StartLimitBurst=500`，
-即每天最多 500 次重启）。
+工程根目录提供了两个并存的稳态 unit（二选一部署，差异与切换方法见
+`DSv4F-Opt.md` §5.10）：
+
+- `ds4f.service` —— no-DSpark + 5F+28U（当前在线的稳态）
+- `ds4f-dspark.service` —— DSpark + 1F+28U（decode 吞吐优先）
+
+均为崩溃自动拉起（30s 延迟；限流 `StartLimitIntervalSec=86400` /
+`StartLimitBurst=500`，即每天最多 500 次重启）。
 
 安装（需要 sudo）：
 
