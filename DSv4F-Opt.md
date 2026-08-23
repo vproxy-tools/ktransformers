@@ -327,15 +327,17 @@ CUDA_LAUNCH_BLOCKING（与捕获互斥不可用）。
 eager+decode 图路径已验证（bench_dspark 5/5 ALL PASS、短 prompt probe
 CLEAN）；长 prefill eager 在 12.9.7 下建议上线前补一轮 grow_probe。
 
-### 5.10 双稳态配置（2026-08-22）：no-DSpark 5F+28U 与 DSpark 1F+28U 并存
+### 5.10 双稳态配置（2026-08-23 更新）：no-DSpark 与 DSpark 并存，均为 3F+40U
 
 **仓库提供两个并存的稳态 unit，二选一部署：**
 
 | 文件 | 配置 | prefill | decode | 适用 |
 |---|---|---|---|---|
-| `ds4f.service` | 无 DSpark，5F+28U（2344 专家），memfrac 0.90 | ~530+（随整层线性，4F 实测 532.4） | ~28-29 | temp>0 业务行为观察期 |
-| `ds4f-dspark.service`（当前在线） | DSpark + CPU draft，4F+28U（2088 专家），memfrac 0.89 | ~530（5F 实测 533.3） | 步时 70.3ms（bench 41.7） | decode 吞吐 + prefill 兼顾 |
-| （备选）DSpark GPU draft 1F+28U，memfrac 0.87 | 上一版 DSpark 稳态 | 506.9 | 47.9（accept×~1.7） | 极致 decode 步时 |
+| `ds4f.service` | 无 DSpark，3F+40U（2368 专家），memfrac 0.90 | ~540（DSpark 口径实测 540.1，§5.13） | ~28-29 | temp>0 业务行为观察期 |
+| `ds4f-dspark.service`（当前在线） | DSpark + CPU draft，3F+40U（2368 专家），memfrac 0.95 | 540.1 | bench 41.29（贪心） | decode 吞吐 + prefill 兼顾 |
+| （备选）同上下调 3F+28U | 长上下文 prefill OOM 时的回退（减 480 专家 ~6GB） | ~525 | 噪声内相同 | 显存余量敏感时 |
+| （历史）5F+28U | 2026-08-23 前稳态；§5.13 证明与 3F+40U 性能无差 | 539.6 | 42.51 | — |
+| （历史）DSpark GPU draft 1F+28U，memfrac 0.87 | 上一版 DSpark 稳态 | 506.9 | 47.9（accept×~1.7） | 极致 decode 步时 |
 
 切换（两份文件除 DSpark 相关行外完全一致）：
 
@@ -396,11 +398,14 @@ accept len 2.1-3.9 正常波动，证明 CPU 上的 draft 专家计算结果正�
 DSpark+多整层**物理上可行**（0.87→0.89 即可过 KV 分配线 0.8754），
 prefill 受益、decode 付出代价，按业务侧重点选用。
 
-**4F+28U 追加实测（2026-08-23，生产配置）**：5F 稳态 43.2GB 余量太薄，
-降为 4F——稳态 **40.9GB**（余 ~8.2GB），probe CLEAN、bench 5/5 PASS
-41.73 tok/s，decode 步时 **70.3ms**（vs 5F 84.2ms、1F CPU draft
-68.8ms）——4F 的 decode 基本回到 1F 水平，prefill 仍吃整层红利。
-现为 `ds4f-dspark.service` 生产配置。
+**4F/5F 追加实测（2026-08-22/23）**：5F 稳态 43.2GB 余量偏薄曾降为 4F；
+随业务默认切贪心（§1.6 末尾，generation_config temperature=0.0），
+DSpark 走 folded greedy accept，5F decode 步时从 84.2ms（temp=1.0 eager
+采样 accept）降到 **70.1ms**（bench 44.55 tok/s，5/5 PASS）——与 4F 的
+70.3ms 持平，5F 重新成为生产配置（memfrac 0.95；KV 池被
+--max-total-tokens 封顶，0.95 仅抬高预算线过分配检查，物理占用与
+0.89 相同）。注意 bench 数字此时是贪心口径，与历史 temp=1.0 口径
+（38-43 tok/s）不可直接比。
 
 **实现要点**：
 
@@ -426,6 +431,114 @@ prefill 受益、decode 付出代价，按业务侧重点选用。
   捕获内嵌 CPU 专家 host node 的模式与 target verify 图相同，已验证。
 - 巨页缓存：draft stage 以 L1000/L1001/L1002 键入 persistent hugepages
   （每 stage 2.21GB×2 NUMA），首启冷转换后热启复用。
+
+### 5.12 整层数扫描（2026-08-23）：3F/4F/5F prefill/decode 对比
+
+同一配置只改 `--kt-num-gpu-full-layers`：DSpark + CPU draft
+（`SGLANG_KT_DSPARK_CPU_EXPERTS=1`）+ hybrid 28U + Marlin partial +
+memfrac 0.95，贪心（bench 显式 temp=0）。三轮均 5/5 PASS。
+
+| 配置 | 稳态显存 | prefill（47.3K tok ×3 均值） | decode（bench_dspark 总计） |
+|---|---|---|---|
+| 3F+28U | 38.1 GB | 523.0 tok/s | 42.30 tok/s |
+| 4F+28U | 41.0 GB | 529.3 tok/s | 40.64 tok/s |
+| 5F+28U | 43.9 GB | 539.6 tok/s | 42.51 tok/s |
+
+结论：
+
+- **prefill 随整层数单调上升**：3F→5F 共 +3.2%（每层约 +8 tok/s），
+  稳定但有限——与 §5.11 中 1F→5F +5.2% 的趋势一致。
+- **decode 对整层数无可分辨影响**：三组 40.6~42.5 tok/s 全在
+  bench_dspark 的噪声带内（prompt 4/5 生成长度每次不同，分母不稳；
+  4F 最低即噪声）。贪心口径下 decode 瓶颈仍在 CPU 侧专家带宽，
+  不再像 temp=1.0 eager accept 时那样随整层数恶化（§5.11 的
+  84.2ms→70.1ms 变化）。
+- **显存每层约 +2.9GB**（38.1→41.0→43.9）。
+
+选用建议：显存充裕选 5F 买 prefill；紧张时 3F/4F 的 decode 不吃亏。
+测量脚本 `/tmp/bench_F_sweep.sh`（逐配置启停 + 两个 bench），原始日志
+`/tmp/bench_F{3,4,5}.log`。
+
+### 5.13 自定义放置（custom 策略）与 NF+topN 全扫描（2026-08-23）
+
+**背景**：§5.12 的连续常驻（id0-27）对路由质量的捕获纯属碰运气——按
+8-21 真实业务分布快照（`/tmp/expert_hit_probs.csv`，SIGUSR2 dump 导出，
+每层 256 专家、每层总 pairs 恒等 1,061,826），连续 28U 每层只覆盖
+7~16%。本节实现任意逐层放置并全参数扫描。
+
+**新增启动参数**（sglang dspark-kt，`server_args.py` + `kt_ep_wrapper.py`）：
+
+```
+--kt-expert-placement-strategy custom \
+--kt-expert-placement-map "0=F,1=F,2=F,3=0-2-4"
+```
+
+key = MoE 层序号（0 起，只数 MoE 层）；`F` = 整层上 GPU，否则短横线
+分隔的专家 id；未列出的层 0 常驻。custom 下 `--kt-num-gpu-experts`
+不再需要（总数从 map 推导）。非法输入（越界/重复 key/残缺列表）全部
+启动即报错；mask 下游本来就吃任意布尔形状（frequency 策略先例），
+无需其他改动。解析器单测 + "custom 复现 hybrid 5F+28U 逐位等价"已验证。
+
+**转换脚本** `tests/gen_placement.py`：CSV → map spec。
+
+```
+SPEC=$(python3 tests/gen_placement.py /tmp/expert_hit_probs.csv \
+       --max-experts 1579 --full-layers 0,1,2)
+```
+
+`--full-layers` 整层；`--max-experts` = 非整层的常驻名额预算，按
+share_of_layer_pairs **全局贪心**选优（每层总质量相等，share 跨层可比，
+贪心即最大捕获分配；与每层等额配额实测差 <0.5pt，见下）。spec 走
+stdout、统计走 stderr，可直接 shell 替换。
+
+**每层方差**（选择整层的依据）：layer 0-2（hash-MoE 前层）var≈3.5e-6
+结构性均匀；layer 3+ 2e-5~7e-5 且随深度走高（最高 37/38/26/36/28）。
+方差最小 10 层：2,1,0,19,9,3,5,21,11,10。低方差层任何部分常驻最多吃
+23~41%，整层是唯一 GPU 化手段；高方差层 top-28 频率选优即可吃 50~61%。
+
+**NF+topN 扫描**（固定 ~2347 GPU 专家包络 ≈ 44GB；整层按方差最小序列
+递进，其余名额全局 top；DSpark + CPU draft + Marlin + memfrac 0.95，
+贪心；全部 5/5 PASS）：
+
+| 配置 | 整层 | topN | 预测捕获质量 | 稳态显存 | prefill | decode |
+|---|---|---|---|---|---|---|
+| 3F+top1579 | 0,1,2 | 1579 | 59.6% | 44.2 GB | 530.6 | 42.79 |
+| 4F+top1323 | +19 | 1323 | 57.5% | 44.2 GB | 533.0 | 42.53 |
+| 5F+top1067 | +9 | 1067 | 54.8% | 44.1 GB | 533.5 | 40.20 |
+| 6F+top811 | +3 | 811 | 51.5% | 44.1 GB | 528.2 | 39.90 |
+| 7F+top555 | +5 | 555 | 47.0% | 44.1 GB | 530.5 | 41.26 |
+| 8F+top299 | +21 | 299 | 40.1% | 44.0 GB | 529.3 | 43.45 |
+| 9F+top43 | +11 | 43 | 26.5% | 43.9 GB | 530.0 | 39.04 |
+
+最干净的对照（同 3F、同 ~44GB 包络，唯一变量 = 频率选优 vs 连续）：
+
+| 3F 对照 | 预测捕获质量 | 稳态显存 | prefill | decode |
+|---|---|---|---|---|
+| +top1579 频率选优 | 59.6% | 44.2 GB | 530.6 | 42.79 |
+| +40U 连续（hybrid，每层 id0-39） | 22.5% | 44.2 GB | **540.1** | 41.29 |
+
+参照（§5.12，连续 28U，捕获 22.2%）：5F+28U = 539.6 / 42.51 tok/s。
+
+结论：
+
+- **放置方式对性能无可分辨影响**：捕获质量 22%~60% 的巨大差异完全不
+  转化为速度——prefill 全部落在 528~534 tok/s（含 9 个整层也没有超过
+  连续 5F 的 539.6，"整层越多 prefill 越快"在 5F 以上不成立），decode
+  全部落在 39~43.5 噪声带。decode 瓶颈不在"多少专家对落在 CPU"（M=1
+  下 CPU MoE 边际成本非主导项，步时被 draft/verify、同步、attention
+  等固定开销吃掉）。
+- 3F 直接 A/B 为此提供了最硬的证据：捕获质量差 2.6 倍（59.6% vs
+  22.5%），速度反而是连续版略优（prefill 540.1 vs 530.6，decode 噪声
+  内）——540.1 也是全部 9 组实测中的 prefill 最高值。
+- 因此在固定包络下**放置选择只看显存预算**；custom + 频率选优的价值
+  在于压显存场景（如退回 38GB 以下）捕获质量 3× 于连续常驻，
+  degradation 更小。
+- 注意频率放置会随业务漂移"腐烂"，需定期重测刷新（SIGUSR2 →
+  kt-distribute.txt → CSV → gen_placement.py）。
+
+spec 样例 `/tmp/placement_{3F_1579,4F_1323,5FL_1067,6F_811,7F_555,8F_299,9F_43}.txt`，
+日志 `/tmp/bench_{custom3F,4Ftop,custom5FL,6Ftop,7Ftop,8Ftop,custom9F,3F40U}.log`，
+扫描脚本 `/tmp/bench_NFtop_sweep.sh`、`/tmp/bench_3F40U.sh`。
 
 ## 1. DSpark 投机解码（主线 sglang 移植）
 
@@ -518,6 +631,44 @@ temp=1.0 采样做了逐层排查（脚本在 /tmp：`dist_prefix.py` / `dist_pr
 统计保真。**未覆盖的轴**：thinking 开启、流式、工具调用、并发批处理。
 若业务问题重现，需要一份具体失败样本（prompt、采样参数、是否流式、
 并发度、输出）来定位。
+
+### 1.6 EOS 收尾专项审计（2026-08-23）：算法无 EOS 改写，贪心全上下文干净
+
+起因：业务（temp=1.0）反馈句尾多出残片（"Three.js + add"）/ 突然完结，
+仅开 DSpark 时出现。两轮代码审计 + 三组探针：
+
+- **算法链无 EOS 改写**：draft 采样（dspark_draft.py / SampleStepTokens）、
+  accept 内核（accept_greedy / 链式拒绝采样）、bonus 落位
+  （BuildOutTokens）、commit 切片（accept_lens=correct_len+1）、scheduler
+  收尾（_check_token_based_finish 逐 token 扫描本步全部接受 token、
+  finished_len 截断）均为教科书实现，无任何 EOS 屏蔽/替换/跳过逻辑。
+- **"阈值"答疑**：chain_speculative_sampling_triton 的
+  threshold_single/threshold_acc=1.0 实际未被 classic 内核使用（形参
+  保留），拒绝判定就是标准的 coin·q < p；confidence/cap 阈值只缩 verify
+  窗口（影响速度），截断处正确重取 target 分布的 bonus，不改分布。
+- **folded 图内 accept 只走 greedy**（dspark_worker_v2.py 有显式守卫：
+  `sampling_info.is_all_greedy` 才 fold，temp>0 批次强制 eager accept）。
+- **temp=0 A/B**（/tmp/greedy_battery.py，8 题；同 4F+28U 放置）：DSpark
+  vs 无 DSpark 内容 7/8 分叉但双侧均连贯、正常 stop——分叉是 verify 窗
+  前向与逐 token decode 的数值差沿轨迹放大，非 bug 特征。
+- **长上下文收尾 A/B**（/tmp/longctx_probe.py，temp=0，一句话总结任务）：
+  18K 双侧干净收尾；DSpark 侧 61.5K、111.5K 亦干净（finish=stop、
+  语义正确、无残尾）。
+
+结论：temp=0 下 0~111K 上下文 DSpark 收尾无缺陷；EOS 被改写/吞掉的
+假设证伪。业务 temp>0 症状若仍复现，剩余嫌疑集中在**采样接受路径在
+真实业务参数组合下的保真度**（§1.5 未覆盖轴）。判别实验：同一批句尾
+场景 N 次，统计"K token 内以句号/EOS 收尾"比例，DSpark 开/关对照。
+另可开 SGLANG_DSPARK_ENABLE_SPS_RECORD / STS_COLLECT_PATH 在生产抓取
+真实失败样本。
+
+**后续处置（2026-08-23）**：模型目录 `generation_config.json` 改为
+`temperature=0.0, do_sample=false`（原件备份 `generation_config.json.bak`），
+不显式传 temperature 的请求默认走贪心——同时让 DSpark 落在验证最充分的
+folded greedy accept 路径上。实测：默认值与显式 temperature=0 行为一致
+（低/中熵 prompt 三次输出逐字相同）；高熵开放题仍有逐 run 分叉（内核
+非确定性的近似平票翻转，非 bug）。显式传 temperature 的客户端不受影响。
+回退：恢复 .bak 并重启 ds4f。
 
 ## 2. 相关文件
 - 测试工具：全部在 `tests/`（探针/基准/巨页与泄漏回归等，见 §3）；

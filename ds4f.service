@@ -1,5 +1,5 @@
 [Unit]
-Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 5F+28U 稳态, no DSpark)
+Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 3F+40U 稳态, no DSpark)
 Documentation=file:///home/wkgcass/ktransformers/DSv4Flash.md
 After=network.target
 # 若机器启用了 nvidia-persistenced，取消下面两行注释可避免冷启动时驱动未就绪
@@ -86,8 +86,8 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --kt-weight-path /var/deepseek-v4-flash/0731 \
   --kt-method MXFP4 \
   --kt-expert-placement-strategy hybrid \
-  --kt-num-gpu-full-layers 5 \
-  --kt-num-gpu-experts 28 \
+  --kt-num-gpu-full-layers 3 \
+  --kt-num-gpu-experts 40 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
@@ -109,10 +109,13 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
 # 本文件 = no-DSpark 稳态配置（与 ds4f-dspark.service 的 DSpark 1F+28U 稳态
 #   并存，二选一部署，切换方法见 DSv4F-Opt.md §5.10）。
 # cuda graph 默认开启；无 DSpark 时无 verify 图，仅 decode/prefill 图。
-# 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：前 5 个
-#   MoE 层整层上 GPU（5×256=1280 专家）+ 其余 38 层各 28 个常驻专家（Marlin
-#   计算 prefill+decode），合计 2344 专家、目标权重 ~42.5GB——这是 48GB 卡的
-#   上限，6F 在 create_weights 阶段即 OOM（DSv4F-Opt.md §5.10）。
+# 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：前 3 个
+#   MoE 层整层（hash-MoE 层，分布均匀、部分常驻无意义）+ 其余 40 层各 40 个
+#   常驻专家（Marlin 计算 prefill+decode），合计 2368 专家。2026-08-23 起从
+#   5F+28U 改为 3F+40U：§5.13 九组放置扫描证明放置方式对性能无可分辨影响
+#   （DSpark 口径 3F+40U 实测 prefill 540.1 / decode 41.29 tok/s，为全部实测
+#   中 prefill 最高值），3F+40U 与 5F+28U 同包络但少 2 个整层的加载/打包
+#   开销。
 # MEMFRAC 0.90：无 DSpark draft（省 ~10.6GB）后把余量喂给专家权重；0.90 是
 #   实测可稳定完成图捕获的上限，再往上会挤压图捕获工作区。
 # CHUNKED-PREFILL 1024（原 512）：tilelang 索引器 + expandable_segments 下，

@@ -1,5 +1,5 @@
 [Unit]
-Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 4F+28U + DSpark + CPU draft 稳态)
+Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 3F+40U + DSpark + CPU draft 稳态)
 Documentation=file:///home/wkgcass/ktransformers/DSv4Flash.md
 After=network.target
 # 若机器启用了 nvidia-persistenced，取消下面两行注释可避免冷启动时驱动未就绪
@@ -87,14 +87,14 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --kt-weight-path /var/deepseek-v4-flash/0731 \
   --kt-method MXFP4 \
   --kt-expert-placement-strategy hybrid \
-  --kt-num-gpu-full-layers 4 \
-  --kt-num-gpu-experts 28 \
+  --kt-num-gpu-full-layers 3 \
+  --kt-num-gpu-experts 40 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
   --context-length 131072 \
   --attention-backend flashinfer \
-  --mem-fraction-static 0.89 \
+  --mem-fraction-static 0.95 \
   --max-total-tokens 135168 \
   --chunked-prefill-size 1024 \
   --max-prefill-tokens 1024 \
@@ -111,12 +111,18 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
 # 本文件 = DSpark 稳态配置（与 ds4f.service 的 no-DSpark 5F+28U 稳态并存，
 #   二选一部署，切换方法见 DSv4F-Opt.md §5.10）。
 # cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。
-# 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：每层
-#   28 个常驻专家（~15GB，Marlin 计算 prefill+decode）+ 前 4 个 MoE 层整层
-#   （4×3.23GB）。整层预算来自 SGLANG_KT_DSPARK_CPU_EXPERTS=1（draft 专家挪
-#   CPU 省 ~9.5GB，见 §5.11）。5F 实测稳态 43.2GB 余量太薄，降为 4F。
-# MEMFRAC 0.89：5F 配置下 KV 分配最低线 0.8754（0.87 起不来）；4F 权重更轻
-#   但保持 0.89 不动（余量进 KV/图捕获）。不要再往上抬，会挤压图捕获工作区。
+# 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：前 3 个
+#   MoE 层整层（hash-MoE 层，分布均匀、部分常驻无意义）+ 其余 40 层各 40 个
+#   常驻专家（Marlin 计算 prefill+decode），合计 2368 专家。2026-08-23 起从
+#   5F+28U 改为 3F+40U：§5.13 九组放置扫描证明放置方式对性能无可分辨影响
+#   （3F+40U 实测 prefill 540.1 / decode 41.29 tok/s，为全部实测中 prefill
+#   最高值），3F+40U 与 5F+28U 同包络但少 2 个整层的加载/打包开销。
+#   整层预算来自 SGLANG_KT_DSPARK_CPU_EXPERTS=1（draft 专家挪
+#   CPU 省 ~9.5GB，见 §5.11）。实测稳态 44.2GB（余 ~4.9GB）；
+#   若长上下文 prefill 出现 OOM 回退 3F+28U（减 480 专家 ~6GB）。
+# MEMFRAC 0.95：KV 池已被 --max-total-tokens 135168 封顶（~1.25GB），
+#   0.95 只是抬高纸面预算线保证专家权重+KV 通过分配检查（0.87 会拒），
+#   物理占用与 0.89 相同。
 # CHUNKED-PREFILL 1024（原 512）：tilelang 索引器 + expandable_segments 下，
 #   >100K 重预填充实测安全（grow_probe 到 125K 通过）。
 #   若换更大 KV 占用的配置出现 >100K prefill OOM，回退 512。
