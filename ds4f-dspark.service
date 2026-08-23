@@ -1,5 +1,5 @@
 [Unit]
-Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 1F+28U + DSpark 稳态)
+Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 4F+28U + DSpark + CPU draft 稳态)
 Documentation=file:///home/wkgcass/ktransformers/DSv4Flash.md
 After=network.target
 # 若机器启用了 nvidia-persistenced，取消下面两行注释可避免冷启动时驱动未就绪
@@ -50,6 +50,9 @@ Environment=SGLANG_V4_MARLIN_PARTIAL=1
 # Marlin 常驻模式下关闭"decode 全 CPU"的相位切换（Marlin decode 47.9 >
 # 全 CPU 41.4；仅在 MARLIN_PARTIAL=0 时才应设回 1）
 Environment=SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0
+# DSpark draft（mtp.0/1/2）专家全挪 CPU（DSv4F-Opt.md §5.11）：draft GPU 占用
+# 10.37→~0.9GB，省 ~9.5GB 喂给整层；decode 步时 +1~3ms。回退开关：置 0
+Environment=SGLANG_KT_DSPARK_CPU_EXPERTS=1
 # 专家分布统计（测量用，默认关闭=零开销，DSv4F-Opt.md §6.10）：
 #   1) 取消下一行注释并重启服务；2) 跑真实负载；
 #   3) pkill -USR2 -f 'sglang::scheduler'   → /tmp/kt-distribute.txt
@@ -84,14 +87,14 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --kt-weight-path /var/deepseek-v4-flash/0731 \
   --kt-method MXFP4 \
   --kt-expert-placement-strategy hybrid \
-  --kt-num-gpu-full-layers 1 \
+  --kt-num-gpu-full-layers 4 \
   --kt-num-gpu-experts 28 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
   --context-length 131072 \
   --attention-backend flashinfer \
-  --mem-fraction-static 0.87 \
+  --mem-fraction-static 0.89 \
   --max-total-tokens 135168 \
   --chunked-prefill-size 1024 \
   --max-prefill-tokens 1024 \
@@ -109,13 +112,11 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
 #   二选一部署，切换方法见 DSv4F-Opt.md §5.10）。
 # cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。
 # 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：每层
-#   28 个常驻专家（~15GB，Marlin 计算 prefill+decode）+ 第 1 个 MoE 层整层
-#   （~3.2GB，零 GPU-CPU 通信，decode 走 Marlin 省整层 CPU 带宽）。叠加式：
-#   整层用的是 uniform-28 之外的真余显存。实测 prefill 506.9 / decode 47.9 tok/s。
-#   显存约束：DSpark draft（~10.6GB）与多整层不可兼得，DSpark 稳态只能 1F
-#   （4F+28U+DSpark = 37.56+10.4GB > 48GB 物理装不下，DSv4F-Opt.md §5.8）。
-# MEMFRAC 0.87：DSpark draft + 专家（~18.4GB）计入预算；实测总占用约
-#   42.0GB / 48GB（再填一层 3.2GB 会挤压图捕获，勿超）。
+#   28 个常驻专家（~15GB，Marlin 计算 prefill+decode）+ 前 4 个 MoE 层整层
+#   （4×3.23GB）。整层预算来自 SGLANG_KT_DSPARK_CPU_EXPERTS=1（draft 专家挪
+#   CPU 省 ~9.5GB，见 §5.11）。5F 实测稳态 43.2GB 余量太薄，降为 4F。
+# MEMFRAC 0.89：5F 配置下 KV 分配最低线 0.8754（0.87 起不来）；4F 权重更轻
+#   但保持 0.89 不动（余量进 KV/图捕获）。不要再往上抬，会挤压图捕获工作区。
 # CHUNKED-PREFILL 1024（原 512）：tilelang 索引器 + expandable_segments 下，
 #   >100K 重预填充实测安全（grow_probe 到 125K 通过）。
 #   若换更大 KV 占用的配置出现 >100K prefill OOM，回退 512。

@@ -333,8 +333,9 @@ CLEAN）；长 prefill eager 在 12.9.7 下建议上线前补一轮 grow_probe�
 
 | 文件 | 配置 | prefill | decode | 适用 |
 |---|---|---|---|---|
-| `ds4f.service`（当前在线） | 无 DSpark，5F+28U（2344 专家），memfrac 0.90 | ~530+（随整层线性，4F 实测 532.4） | ~28-29 | temp>0 业务行为观察期 |
-| `ds4f-dspark.service` | DSpark，1F+28U（1292 专家），memfrac 0.87 | 506.9 | 47.9（accept×~1.7） | 追求 decode 吞吐 |
+| `ds4f.service` | 无 DSpark，5F+28U（2344 专家），memfrac 0.90 | ~530+（随整层线性，4F 实测 532.4） | ~28-29 | temp>0 业务行为观察期 |
+| `ds4f-dspark.service`（当前在线） | DSpark + CPU draft，4F+28U（2088 专家），memfrac 0.89 | ~530（5F 实测 533.3） | 步时 70.3ms（bench 41.7） | decode 吞吐 + prefill 兼顾 |
+| （备选）DSpark GPU draft 1F+28U，memfrac 0.87 | 上一版 DSpark 稳态 | 506.9 | 47.9（accept×~1.7） | 极致 decode 步时 |
 
 切换（两份文件除 DSpark 相关行外完全一致）：
 
@@ -345,6 +346,8 @@ sudo systemctl daemon-reload && sudo systemctl restart ds4f
 
 二者互斥的物理原因：DSpark draft 占 ~10.6GB，4F+28U+DSpark =
 37.56+10.4GB > 48GB 装不下（§5.8），所以 DSpark 稳态只能 1F。
+（2026-08-22 起有第三条路：`SGLANG_KT_DSPARK_CPU_EXPERTS=1` 把 draft
+专家挪 CPU，draft 显存降到 ~0.9GB，DSpark+多整层成为可能，见 §5.11。）
 
 背景与依据：
 
@@ -364,6 +367,65 @@ sudo systemctl daemon-reload && sudo systemctl restart ds4f
 - 折中方案（减 uniform 专家换更多整层，如 3F+17U）实验后放弃
   （log /tmp/exp_3f17u.log）——最终选择保持每层 28 个 uniform 专家
   不动，只用纯余显存叠加整层。
+
+### 5.11 DSpark draft 专家挪 CPU（2026-08-22）：`SGLANG_KT_DSPARK_CPU_EXPERTS=1`
+
+**功能**：开关开启时，DSpark draft（mtp.0/1/2 三个 stage）的 256 个路由
+专家全部走 KT CPU 引擎，draft 不再在 GPU 上放专家权重。默认关（维持
+纯 GPU draft 现状）。
+
+**收益与代价（实测，1F+28U+DSpark，memfrac 0.87）**：
+
+| 指标 | GPU draft（基线） | CPU draft | 变化 |
+|---|---|---|---|
+| 稳态显存 | 42.0 GB | **32.2 GB** | **−9.8 GB** |
+| decode 步时（accept÷tok/s） | ~66-67.8 ms | ~68.8 ms | +1~3 ms（≈3%） |
+| bench_dspark | 38.1-42.75 tok/s | 43.11 tok/s | 噪声带内 |
+| 正确性 | — | probe CLEAN + bench 5/5 PASS | — |
+
+accept len 2.1-3.9 正常波动，证明 CPU 上的 draft 专家计算结果正确
+（否则 accept 会塌到 ~1）。省下的 9.8GB 约等于 3 个完整专家层
+（§5.8 换算）。
+
+**5F+28U+DSpark+CPU draft 实测（2026-08-22，memfrac 0.89）**：启动成功，
+稳态 **43.2GB**；probe CLEAN、bench 5/5 PASS。prefill **533.3 tok/s**
+（vs 1F DSpark 506.9，+5.2%，追平 no-DSpark 4F 的 532.4）；但 decode
+步时 **84.2ms**（bench 36.37 tok/s），比 1F CPU draft 的 68.8ms 慢
+~15ms——与 §5.3 规律一致（M=1 下 GPU 专家的 routing 构建 + matmul_ogs
+开销主导，整层越多 decode 越慢；3F+17U 当年 71.1ms 同理）。结论：
+DSpark+多整层**物理上可行**（0.87→0.89 即可过 KV 分配线 0.8754），
+prefill 受益、decode 付出代价，按业务侧重点选用。
+
+**4F+28U 追加实测（2026-08-23，生产配置）**：5F 稳态 43.2GB 余量太薄，
+降为 4F——稳态 **40.9GB**（余 ~8.2GB），probe CLEAN、bench 5/5 PASS
+41.73 tok/s，decode 步时 **70.3ms**（vs 5F 84.2ms、1F CPU draft
+68.8ms）——4F 的 decode 基本回到 1F 水平，prefill 仍吃整层红利。
+现为 `ds4f-dspark.service` 生产配置。
+
+**实现要点**：
+
+- 开关：`environ.py` `SGLANG_KT_DSPARK_CPU_EXPERTS`（EnvBool，默认 False）。
+  开启时 `draft_worker_common.py` 用 `dspark_draft_cpu_experts_context()`
+  替代 `speculative_kt_ep_disabled_context()` 构建 draft。
+- `kt_ep_wrapper.py`：`create_kt_config_from_server_args` 在 draft 构建
+  全局置位时返回全 CPU 配置——`gpu_experts_mask` 全 False、
+  `weight_base_key="mtp.{stage}"`、`wrapper_layer_idx=1000+stage`。
+  合成 idx 是为了避开巨页 marker（`L{idx}`）与 target 层 0-2 碰撞；
+  sglang 侧簿记（dist 统计、last-layer 逻辑）仍用真实 stage id。
+  draft 的 physical_to_logical_map 强制恒等（不借 target 的放置表）；
+  draft 不参与专家分布统计（避免污染 target 层 0-2 的统计）。
+- kt-kernel（需 `pip install . --no-deps --no-build-isolation` 重装）：
+  `KTMoEWrapper`/`BaseMoEWrapper`/`NativeMoEWrapper` 增加
+  `weight_base_key` 透传；设置后 safetensors 查找直接用
+  `{base}.ffn.experts.*`（命中 `mtp.N.ffn.experts.*`），不再试
+  `model.layers.{idx}` 前缀。
+- 顺修 `mxfp4_deepseek.py`：0 常驻专家层（全 CPU）跳过 Marlin/TK 转换
+  并释放原始占位张量——此前 MARLIN_PARTIAL=1 下 0 专家维度的 repack
+  直接 CUDA invalid configuration 崩溃。
+- draft 与 target 共享全局 CPUInfer 单例（48 线程/2 池），decode 图
+  捕获内嵌 CPU 专家 host node 的模式与 target verify 图相同，已验证。
+- 巨页缓存：draft stage 以 L1000/L1001/L1002 键入 persistent hugepages
+  （每 stage 2.21GB×2 NUMA），首启冷转换后热启复用。
 
 ## 1. DSpark 投机解码（主线 sglang 移植）
 

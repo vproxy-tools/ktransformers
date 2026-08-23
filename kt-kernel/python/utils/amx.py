@@ -569,6 +569,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         numa_nodes: Optional[List[int]] = None,
         swiglu_limit: float = 0.0,
         swiglu_alpha: float = 0.0,
+        weight_base_key: Optional[str] = None,
     ):
         self._swiglu_alpha = float(swiglu_alpha)
         # Defence in depth: reject swiglu_limit on non-MXFP4/MXFP8 methods even
@@ -652,6 +653,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             method=method,
             numa_nodes=numa_nodes,
             swiglu_limit=swiglu_limit,
+            weight_base_key=weight_base_key,
         )
 
         if NativeMoEWrapper._native_loader_instance is None:
@@ -724,11 +726,15 @@ class NativeMoEWrapper(BaseMoEWrapper):
             if not isinstance(self.loader, MXFP4SafeTensorLoader):
                 return None
             group_size = None
-            for base in (
-                f"model.layers.{self.layer_idx}",
-                f"language_model.model.layers.{self.layer_idx}",
-                f"model.language_model.layers.{self.layer_idx}",
-            ):
+            if self.weight_base_key:
+                bases = (self.weight_base_key,)
+            else:
+                bases = (
+                    f"model.layers.{self.layer_idx}",
+                    f"language_model.model.layers.{self.layer_idx}",
+                    f"model.language_model.layers.{self.layer_idx}",
+                )
+            for base in bases:
                 for cand in self.loader._experts_prefix_candidates(base):
                     key = f"{cand}.0.w1.scale"
                     if self.loader.has_tensor(key):
@@ -818,11 +824,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 )
                 return
 
-        _candidates = [
-            f"model.layers.{self.layer_idx}",
-            f"language_model.model.layers.{self.layer_idx}",
-            f"model.language_model.layers.{self.layer_idx}",
-        ]
+        if self.weight_base_key:
+            _candidates = [self.weight_base_key]
+        else:
+            _candidates = [
+                f"model.layers.{self.layer_idx}",
+                f"language_model.model.layers.{self.layer_idx}",
+                f"model.language_model.layers.{self.layer_idx}",
+            ]
         weights = None
         for base_key in _candidates:
             try:

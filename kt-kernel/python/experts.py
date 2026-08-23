@@ -155,6 +155,10 @@ class KTMoEWrapper:
         # MiniMax M3 swigluoai sigmoid alpha. 0.0 = standard silu (default).
         # Non-zero triggers gate * sigmoid(gate * alpha) * (up + 1) in act_fn.
         swiglu_alpha: float = 0.0,
+        # Optional explicit safetensors base key for expert weights, e.g.
+        # "mtp.0" for DSpark draft stages (keys mtp.0.ffn.experts.*).
+        # When set, overrides the default model.layers.{layer_idx} candidates.
+        weight_base_key: Optional[str] = None,
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -179,6 +183,8 @@ class KTMoEWrapper:
             numa_nodes: Explicit list of NUMA node IDs for subpool mapping. If None, defaults to sequential.
             method: Backend method (see INFERENCE_METHODS and SFT_METHODS)
             mode: Operation mode ("inference" or "sft")
+            weight_base_key: Optional explicit safetensors base key for expert weights
+                             (inference only, NativeMoEWrapper backends)
             lora_rank: LoRA rank (SFT only)
             lora_alpha: LoRA scaling factor (SFT only)
             max_cache_depth: Maximum forward cache depth (SFT only)
@@ -227,6 +233,7 @@ class KTMoEWrapper:
                 numa_nodes=numa_nodes,
                 swiglu_limit=swiglu_limit,
                 swiglu_alpha=swiglu_alpha,
+                weight_base_key=weight_base_key,
             )
         else:  # mode == "sft"
             # SFT factory does not plumb swiglu_limit; reject non-zero
@@ -326,6 +333,7 @@ def _create_inference_wrapper(
     numa_nodes: Optional[List[int]] = None,
     swiglu_limit: float = 0.0,
     swiglu_alpha: float = 0.0,
+    weight_base_key: Optional[str] = None,
 ) -> BaseMoEWrapper:
     """
     Create an inference wrapper based on the method.
@@ -377,6 +385,10 @@ def _create_inference_wrapper(
             f"environment while the current launch does not actually use "
             f"MXFP4/MXFP8 weights — either unset the env or pass --kt-method MXFP4/MXFP8."
         )
+    # weight_base_key only affects safetensors key lookup, which only the
+    # NativeMoEWrapper (compressed-safetensor) backends perform.
+    if backend_cls is NativeMoEWrapper and weight_base_key is not None:
+        extra_kwargs["weight_base_key"] = weight_base_key
     return backend_cls(
         layer_idx=layer_idx,
         num_experts=num_experts,
