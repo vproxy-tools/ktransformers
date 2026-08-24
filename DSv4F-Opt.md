@@ -670,6 +670,48 @@ folded greedy accept 路径上。实测：默认值与显式 temperature=0 行�
 非确定性的近似平票翻转，非 bug）。显式传 temperature 的客户端不受影响。
 回退：恢复 .bak 并重启 ds4f。
 
+### 1.7 DSpark decode 期 SWA 窗口驱逐缺失（2026-08-23）：长生成 retract abort 的根因与修复
+
+症状：生产（3F+40U DSpark）长生成时报
+`Out of memory even after retracting all other requests in the decode
+batch. Aborting the last request.` journal 显示同类 abort 自 8-21 起已有
+5 次（4F/5F 时代同样存在，非 3F+40U 引入）。
+
+根因链：
+
+- DSv4 混合注意力分 full/swa 两 KV 池；`swa_full_tokens_ratio` 对
+  DeepseekV4 自动取 0.1，`--max-total-tokens 135168` 封顶 full 池
+  → **swa 池仅 13312 槽**。
+- decode 期 SWA 窗口驱逐只在两条路径存在：非投机
+  `alloc_for_decode`（allocation.py:547）与 EAGLE
+  （`eagle_prepare_for_decode` 开头一行 `batch.maybe_evict_swa()`）。
+- **DSpark/DFLASH 路径绕过了二者**：
+  `prepare_for_decode → spec_prepare_for_decode → is_dflash_family()
+  → DFlashDraftInputV2.prepare_for_decode`（dflash_info_v2.py），
+  后者从不调 `maybe_evict_swa()`，也从不递增 `req.decode_batch_idx`
+  （而驱逐闸门要求 `decode_batch_idx >= 1`）。
+- 后果：DSpark 下长生成的 swa 足迹 ~1:1 随 seqlen 增长，越过 ~13K
+  即 abort。铁证：同进程探针请求 full=111616 时 swa 仅 2304（增长在
+  prefill 期、prefill 驱逐正常），出事请求 full=14080 时 swa=13312
+  （0.95×seqlen，零驱逐）。
+
+修复（third_party/sglang `dflash_info_v2.py`
+`DFlashDraftInputV2.prepare_for_decode`，镜像 EAGLE）：
+
+1. 方法开头加 `batch.maybe_evict_swa()`；
+2. per-req 循环内 `req.decode_batch_idx += 1`。
+
+安全性：驱逐只动窗口外槽位；DSpark reserved_len = committed +
+2×block_size 的 over-allocation 语义不受影响。
+
+验证（30001，DSpark+CPU draft+3F+40U+memfrac 0.95，/tmp/bench_swa_fix*.sh）：
+
+- "数到 3500"：finish=stop，seqlen 9543，swa 占用峰值 0.04~0.08
+  （修复前同位置 ~0.7），0 retract；
+- **越界决定性用例"数到 6000"**：finish=stop，seqlen **17047 >
+  13312**，输出完整至 6000，全程 swa 占用 0.04~0.08，0 retract；
+- 正确性回归 bench_dspark 5/5 PASS（42.83 tok/s）。
+
 ## 2. 相关文件
 - 测试工具：全部在 `tests/`（探针/基准/巨页与泄漏回归等，见 §3）；
   GPU 微基准 `tests/bench_gpu_ops.py` / `tests/bench_gpu_cold.py` /
