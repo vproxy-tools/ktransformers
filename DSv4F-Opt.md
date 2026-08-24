@@ -712,6 +712,45 @@ batch. Aborting the last request.` journal 显示同类 abort 自 8-21 起已有
   13312**，输出完整至 6000，全程 swa 占用 0.04~0.08，0 retract；
 - 正确性回归 bench_dspark 5/5 PASS（42.83 tok/s）。
 
+### 1.8 流式 tool_call 响应 content 截断（2026-08-24）：detector 丢弃前导文本
+
+症状：业务（streaming）content 在 tool_call 前突然中断，如
+"…then build the "（半截子句）、"…download Three"（截在词中）。
+仅开 DSpark 时出现。
+
+排查与定位（level-3 请求日志抓现行，日志含原始 text + output_ids）：
+
+- 非流式复现 0/57；token 层面 `" Three"`(13475) 与 `".js"`(15135)
+  是独立 token，一度怀疑模型自选断点。
+- `--log-requests --log-requests-level 3` 抓到三类实例对比：
+  - fin2：原始 token 流含完整 "…then build the project.\n\n"，但客户端
+    收到 "…then build the " —— **服务端在流式路径丢了 "project."**；
+  - fin6/fin7：原始 token 流本身就是 "…Let me fix it\n\n" + DSML ——
+    模型在该贪心轨迹上自主选择直接进工具调用（无句读），服务端忠实转发。
+- 根因（deepseekv32_detector.py `parse_streaming_increment`，v4 detector
+  的父类）：当某个流式 delta 同时含 content 尾部与 DSML 起始标记时，
+  进入 invoke 匹配循环后**返回值恒为 `normal_text=""`**，缓冲区里
+  标记前的正文被静默丢弃。
+- 为何只在大块 delta 下出现：非投机逐 token 流式时 DSML 标记几乎总是
+  独占一个 delta（正文此前已流出）；DSpark 每步提交 ~5 token，
+  "project.\n\n<｜DSML｜tool_calls>" 常落在同一 delta → 稳定触发。
+
+修复（同文件，invoke 匹配循环开头）：找到缓冲区中第一个 `"<｜DSML｜"`
+标记，将其前的正文剥离（并像 early-return 路径一样剥掉 eot/invoke_end
+残留标记）后随 `normal_text` 返回；异常路径同理保留已剥离前缀。
+
+验证：
+
+- 单元级（直接驱动 DeepSeekV4Detector）：逐字符、整段单 blob、30 组
+  随机 burst 切分、双工具调用夹正文，33/33 通过——修复前 single-blob
+  场景 content 返回空串；
+- 实机流式 10/10 content 完整收尾、tool args 为合法 JSON（其中 1 例为
+  模型发并行双 invoke，客户端拼接显示问题，非服务端）；
+- 模型侧"裸断句"类（fin6/fin7）仍会偶发，属贪心轨迹选择，非丢 token。
+
+注：排查期间在 ds4f.service 临时加了 `--log-requests --log-requests-level 3`
+（全量输入输出+token ids 落 journal，量大），确认无复发后可撤掉。
+
 ## 2. 相关文件
 - 测试工具：全部在 `tests/`（探针/基准/巨页与泄漏回归等，见 §3）；
   GPU 微基准 `tests/bench_gpu_ops.py` / `tests/bench_gpu_cold.py` /
