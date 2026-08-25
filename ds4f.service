@@ -1,5 +1,5 @@
 [Unit]
-Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 3F+40U 稳态, no DSpark)
+Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 3F+35U + DSpark + CPU draft 稳态)
 Documentation=file:///home/wkgcass/ktransformers/DSv4Flash.md
 After=network.target
 # 若机器启用了 nvidia-persistenced，取消下面两行注释可避免冷启动时驱动未就绪
@@ -28,13 +28,15 @@ Environment=TORCH_CUDA_ARCH_LIST=8.9+PTX
 # --- 思考模式默认开启（输出侧切分由 dspark-kt 分支的 serving_chat 补丁保证）---
 # 单请求可用 chat_template_kwargs {"thinking": false} 覆盖关闭
 Environment=SGLANG_DEFAULT_THINKING=1
+# 思考等级默认拉满：请求不传 reasoning_effort 时按 "max" 编码
+# （official profile：low/high/max；checkpoint 自带默认是 low。
+#  单请求可用请求体 reasoning_effort: "low"/"high" 覆盖降级）
+Environment=SGLANG_DSV4_REASONING_EFFORT=max
 
-# --- DSpark 专属 verify env（本文件 = no-DSpark 稳态，注释保留）---
-# 切换到 DSpark 稳态不需要改本文件：直接部署 ds4f-dspark.service 即可
-# （双稳态并存，切换方法见 DSv4F-Opt.md §5.10）。
-# Environment=SGLANG_RAGGED_VERIFY_MODE=static
+# --- DSpark + SM89 回退栈必需 ---
+Environment=SGLANG_RAGGED_VERIFY_MODE=static
 # verify 元数据图外构建（ctx>111.4K 图内录制会损坏生成，见 DSv4Flash.md 9.3）
-# Environment=SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1
+Environment=SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1
 # 131072（513 页宽）prefill 的 indexer gather 峰值需要小 chunk + 消碎片
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # SM89: deep_gemm (SM90+) 路径关闭，走 torch/triton 回退
@@ -52,6 +54,23 @@ Environment=SGLANG_V4_MARLIN_PARTIAL=1
 # Marlin 常驻模式下关闭"decode 全 CPU"的相位切换（Marlin decode 47.9 >
 # 全 CPU 41.4；仅在 MARLIN_PARTIAL=0 时才应设回 1）
 Environment=SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0
+# DSpark draft（mtp.0/1/2）专家全挪 CPU（DSv4F-Opt.md §5.11）：draft GPU 占用
+# 10.37→~0.9GB，省 ~9.5GB 喂给整层；decode 步时 +1~3ms。回退开关：置 0
+Environment=SGLANG_KT_DSPARK_CPU_EXPERTS=1
+# DSpark 上下文上限：batch 内任一请求上下文达到该值后整 batch 退化为普通
+# decode（DSpark >256K 输出不稳定，DSv4F-Opt.md §5.17；0=永不禁用，
+# 默认 262144）。【当前置 0：门控关闭，长上下文也跑 DSpark】
+Environment=SGLANG_DSPARK_MAX_CTX=0
+# HiCache 磁盘 L3 存储目录（NVMe；勿用 /tmp——根分区已满）。配套
+# --enable-hierarchical-cache 等参数见 ExecStart。
+Environment=SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/var/hicache
+# 磁盘缓存限额（默认无限制，会长满盘）：LRU 总量上限 200G，超了驱逐到
+# 90% 水位；同时保底磁盘剩余 100G。实测磁盘占用 ~11GB / 1M token。
+# 【2026-08-25 起默认关闭】已切换 --hicache-manual-mode：自动写回/自动
+# 预取不再发生，限额失去意义；如需恢复自动模式，去掉 --hicache-manual-mode
+# 并取消下面两行注释。
+# Environment=SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE=200G
+# Environment=SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE=100G
 # 专家分布统计（测量用，默认关闭=零开销，DSv4F-Opt.md §6.10）：
 #   1) 取消下一行注释并重启服务；2) 跑真实负载；
 #   3) pkill -USR2 -f 'sglang::scheduler'   → /tmp/kt-distribute.txt
@@ -78,8 +97,10 @@ Environment=KT_EXPERT_DIST_TRACK=1
 Environment=HOME=/home/wkgcass
 Environment=PATH=/home/wkgcass/ktransformers/.venv/bin:/usr/local/bin:/usr/bin:/bin
 
-# ctx=131072：>111K 的 verify 损坏已由 SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1
-# 修复（DSv4Flash.md 9.3），131072 = 模型上限，端到端验证过 125K 增长探针
+# ctx=524288（512K，35U 腾显存）：>111K 的 verify 损坏已由
+# SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1 修复（DSv4Flash.md 9.3）；
+# DSpark 在 >256K 上下文输出不稳定（2026-08-25 观察），由
+# SGLANG_DSPARK_MAX_CTX（见下）在 256K 处动态关闭 DSpark 解决
 ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --model /var/deepseek-v4-flash/0731 \
@@ -87,37 +108,86 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --kt-method MXFP4 \
   --kt-expert-placement-strategy hybrid \
   --kt-num-gpu-full-layers 3 \
-  --kt-num-gpu-experts 40 \
+  --kt-num-gpu-experts 35 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
-  --context-length 131072 \
+  --context-length 524288 \
   --attention-backend flashinfer \
-  --mem-fraction-static 0.90 \
-  --max-total-tokens 135168 \
+  --mem-fraction-static 0.96 \
+  --max-total-tokens 528384 \
   --chunked-prefill-size 1024 \
   --max-prefill-tokens 1024 \
-  --max-running-requests 1 \
+  --max-running-requests 2 \
   --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \
   --trust-remote-code \
-  --disable-radix-cache \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-storage-backend file \
+  --hicache-storage-prefetch-policy wait_complete \
+  --hicache-manual-mode \
+  --enable-metrics \
   --skip-server-warmup \
+  --speculative-algorithm DSPARK \
   --reasoning-parser deepseek-v4 \
   --tool-call-parser deepseekv4
 
-# 本文件 = no-DSpark 稳态配置（与 ds4f-dspark.service 的 DSpark 1F+28U 稳态
-#   并存，二选一部署，切换方法见 DSv4F-Opt.md §5.10）。
-# cuda graph 默认开启；无 DSpark 时无 verify 图，仅 decode/prefill 图。
+# 本文件 = DSpark 稳态配置（与 ds4f.service 的 no-DSpark 5F+28U 稳态并存，
+#   二选一部署，切换方法见 DSv4F-Opt.md §5.10）。
+# cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。
 # 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：前 3 个
-#   MoE 层整层（hash-MoE 层，分布均匀、部分常驻无意义）+ 其余 40 层各 40 个
-#   常驻专家（Marlin 计算 prefill+decode），合计 2368 专家。2026-08-23 起从
+#   MoE 层整层（hash-MoE 层，分布均匀、部分常驻无意义）+ 其余 40 层各 35 个
+#   常驻专家（Marlin 计算 prefill+decode），合计 2168 专家。2026-08-23 起从
 #   5F+28U 改为 3F+40U：§5.13 九组放置扫描证明放置方式对性能无可分辨影响
-#   （DSpark 口径 3F+40U 实测 prefill 540.1 / decode 41.29 tok/s，为全部实测
-#   中 prefill 最高值），3F+40U 与 5F+28U 同包络但少 2 个整层的加载/打包
-#   开销。
-# MEMFRAC 0.90：无 DSpark draft（省 ~10.6GB）后把余量喂给专家权重；0.90 是
-#   实测可稳定完成图捕获的上限，再往上会挤压图捕获工作区。
+#   （3F+40U 实测 prefill 540.1 / decode 41.29 tok/s，为全部实测中 prefill
+#   最高值）；2026-08-25 为开 512K 上下文减到 35U（见下）。
+#   整层预算来自 SGLANG_KT_DSPARK_CPU_EXPERTS=1（draft 专家挪
+#   CPU 省 ~9.5GB，见 §5.11）。
+#   若出现长上下文 prefill OOM：减 U（每 U ≈ 0.5GB）或缩小
+#   --max-total-tokens。
+# 上下文 512K（2026-08-25，320K→512K，40U→35U）：KV 池边际实测 7.7KB/token
+#   （含 swa/c4/c128/state 侧池）。开 radix 后池容量由 profiled 值封顶
+#   （memfrac 直接决定池大小，0.95→358K、0.97→467K，公式见
+#   kv_cache_configurator.py _profile_available_bytes）；且长上下文 prefill
+#   的瞬时占用随上下文增长（~1.15GB 固定 + ~1.9B/token）：
+#   512K+38U 时 450K prefill 在 ~360K 处 OOM 崩过一次（avail 1.82GB 不够），
+#   512K+35U 实测通过（avail 3.27GB、全程 free ≥1.3GB）——本配置即该组合。
+#   容量对照与各档完整参数表见 DSv4F-Opt.md §5.17。
+#   **DSpark >256K 输出不稳定**（重复字符/复读倾向，2026-08-25 观察，根因
+#   未查，与 §1.7 的 SWA 驱逐 bug 是不同现象）：不再压上下文上限，改由
+#   SGLANG_DSPARK_MAX_CTX=262144 在请求上下文达到 256K 时动态禁用该
+#   请求的投机解码（256K 以内正常 DSpark）。
+#   512K 实测：450K 冷 prefill ~1190s（均 ~378 tok/s，注意力随上下文
+#   变慢），命中缓存后 ~7.5s；超长请求 400 优雅拒绝。
+#   模型 max_position_embeddings=1048576（YaRN 自 64K 外推）。
+# 并发 2（2026-08-25，--max-running-requests 1→2）：KV 池 ~528K token，
+#   装不下两个满 512K 上下文——实际是"一大一小"或两个中短文档并行；
+#   两条都接近满上下文时第二条会在队列里等池空间（不会 OOM，调度器按
+#   可用 token 准入）。
+# HiCache 磁盘 KV 缓存（2026-08-24 起）：去掉 --disable-radix-cache 后 tree
+#   cache 走 UnifiedRadixCache（FULL+SWA 双组件，上游 DSv4 专用 HiCache 栈），
+#   host 池 = 2×device（--hicache-ratio 2，驻 RAM），L3 = /var/hicache 文件
+#   后端（write_through 异步落盘，重启后仍可命中；wait_complete 预取）。
+#   prefill 命中统计：--enable-metrics 后 /metrics 查
+#   sglang:cached_tokens_total（按 device/host/storage 细分），
+#   prefill 日志行 #cached-token 为每 batch 命中数。
+#   回退：恢复 ds4f.service.bak-pre-hicache 并 daemon-reload + 重启。
+# 【2026-08-25 起 manual mode】--hicache-manual-mode 关闭自动写回（D→H→磁盘）
+#   与请求到达时的自动预取，消除 bench 干扰、快照时机完全可控；磁盘持久化
+#   改为显式接口（均要求服务空闲，非空闲返回 400）：
+#     POST /hicache/snapshot/save  {"path": "/var/hicache-snap1"}  # 树→磁盘+manifest
+#     POST /hicache/snapshot/load  {"path": "/var/hicache-snap1"}  # flush 后按 manifest 灌回
+#     POST /flush_cache                                           # 清空 GPU/host/树（不动磁盘）
+#   磁盘上的页文件是纯哈希命名、不含 token 序列，manifest.json 记录树结构，
+#   快照目录整体可复制/归档。恢复自动模式：去掉 --hicache-manual-mode 并恢复
+#   上面两行限额 env。
+# MEMFRAC 0.96：开 radix 后该值直接决定 KV 池的 profiled 上限
+#   （slack = 47.02GB × (1-memfrac)，见上文"上下文 512K"段），不再是
+#   纯纸面预算线——改动它就是在调 KV 池大小。
 # CHUNKED-PREFILL 1024（原 512）：tilelang 索引器 + expandable_segments 下，
 #   >100K 重预填充实测安全（grow_probe 到 125K 通过）。
 #   若换更大 KV 占用的配置出现 >100K prefill OOM，回退 512。

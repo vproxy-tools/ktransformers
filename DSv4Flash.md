@@ -24,7 +24,7 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤。
 | 系统 | Ubuntu 24.04，gcc 13.3，cmake 3.28，ninja |
 | Python venv | 仓库根 `.venv`（Python 3.12，torch 2.11.0+cu128） |
 | 模型 | `$MODEL_DIR`（0731 版 checkpoint，156GB，48 个 safetensors 分片，DeepseekV4ForCausalLM） |
-| 代码分支 | ktransformers `optimize-latest`；submodule third_party/sglang = **`dspark-kt` 分支**（见第 9 节） |
+| 代码分支 | ktransformers `optimize-latest`；submodule third_party/sglang = **`dspark-kt` 分支**（见第 9 节；2026-08-25 已 merge 官方 main `d06762282`，见 DSv4F-Opt.md §5.18） |
 
 关键结论：
 
@@ -63,6 +63,11 @@ git submodule update --init --recursive
 #     下面的 -e 安装让 sglang 依赖其 pyproject 解析；若个别 cu13 系
 #     依赖与驱动不匹配（本机驱动仅支持 CUDA 12.x），参照 pip freeze
 #     的实测版本手动 pin。
+#     2026-08-25 上游拉齐后注意（DSv4F-Opt.md §5.18）：
+#     a) editable 重装要 venv 里有 setuptools-scm，且 submodule 需先
+#        git fetch sgl --tags（否则版本号回退 0.0.0）；
+#     b) sglang-kernel 版本下限已被 fork 放宽到 0.4.5（本地 cu129 构建），
+#        不要照 pyproject 装 0.4.6.post1（cu13-only，550 驱动加载不了）。
 pip install -e third_party/sglang/python
 
 # 2.3 编译安装 kt-kernel（自动检测 CPU：NATIVE + AMX=OFF + AVX512 全家桶 ON）
@@ -78,7 +83,9 @@ kt doctor    # 应全部"正常"，kt-kernel 显示 v0.6.4
 ### 3.1 本机调优配置（DSpark 投机解码 + cuda graph，日常使用）
 
 生产使用 DSpark 投机解码栈（sglang `dspark-kt` 分支，详见第 9 节）。
-启动命令与 `ds4f.service` 一致：
+**2026-08-25 起稳态为 3F+35U + 512K 上下文 + 并发 2 + HiCache 手动快照模式**
+（完整参数组合见 DSv4F-Opt.md §5.14/§5.17；以仓库根 `ds4f.service` 为准，
+本节命令是 131072 档的历史参考配置）：
 
 ```bash
 cd $KT_ROOT
@@ -248,13 +255,13 @@ DSpark 单请求吞吐参考区间 32–36 tok/s，口径见 3.1）。
 | 手动 kill 后服务 30s 拉起失败循环 | ExecStart 指向的 venv/路径失效，或 StartLimitBurst(500/天) 耗尽 | `systemctl reset-failed ds4f && systemctl start ds4f`（sudo） |
 | RSS 看起来持续增长 | 紧循环测量含"已 free 未归还"驻留页 | 以 malloc_trim 后读数为准（DSv4F-Opt.md 3.6） |
 | 输出损坏（复读/数学错） | 先跑 `tests/probe_dspark.py`，损坏与 ctx 相关时用 `tests/bisect_ctx.sh` 二分 | 已知两类损坏均已修复（DSv4F-Opt.md §4）；复现即新问题 |
+| 升级 sglang 后启动报 `sglang-kernel ... less than 0.4.6.post1` | 上游抬高了启动期版本下限，但 PyPI 0.4.6.post1 wheel 是 CUDA 13 构建（`libcudart.so.13`，需 580+ 驱动），本机 550 驱动装不上 | fork 已放宽下限到 0.4.5（dspark-kt `3c4c5c59f`，本地 0.4.5+cu129 构建符号审计无缺口）；要真正上 0.4.6+ 需从 `python/sglang/kernels/aot` 用 CUDA 12 工具链本地构建 |
 ## 6. 服务管理（systemd）
 
-工程根目录提供了两个并存的稳态 unit（二选一部署，差异与切换方法见
-`DSv4F-Opt.md` §5.10）：
-
-- `ds4f.service` —— no-DSpark + 5F+28U（当前在线的稳态）
-- `ds4f-dspark.service` —— DSpark + 1F+28U（decode 吞吐优先）
+工程根目录的 `ds4f.service` 即当前稳态 unit（**DSpark + 3F+35U + 512K +
+并发 2 + HiCache 手动快照模式**，2026-08-25 定型，演进过程见
+`DSv4F-Opt.md` §5.10/§5.17；`ds4f-dspark.service` 为早期 DSpark 专用
+unit，仅留档参考）。曾并存过 no-DSpark 与 DSpark 双 unit，现已合一。
 
 均为崩溃自动拉起（30s 延迟；限流 `StartLimitIntervalSec=86400` /
 `StartLimitBurst=500`，即每天最多 500 次重启）。
@@ -387,7 +394,10 @@ GPU 参数同样缓存到持久巨页：`third_party/sglang` 新增
 ## 9. DSpark / 推测解码（speculative decoding）支持情况
 
 **已支持并在生产启用。** sglang 走 `dspark-kt` 分支（third_party/sglang，
-主线基底 4ad990ba7 + kt CPU 专家引擎移植），DSpark 投机解码 + cuda graph
+kt CPU 专家引擎移植；2026-08-25 merge 官方 main `d06762282`（+986 提交），
+带入上游三修复——`4a5d7d3` draft tokens > 4 的静默 KV/compressed-state 损坏、
+`8549cce` c128 ragged prefill 竞态、`154f0ac` DSpark+DP/EP metadata；详见
+DSv4F-Opt.md §5.18），DSpark 投机解码 + cuda graph
 全部打通：**39.6 tok/s**（无投机基线 26.0，+52%；eager 模式 34.3）。
 `--speculative-algorithm DSPARK` 一个参数即可，0731 自带 draft（`mtp.0.*`，
 4705 个权重键；config: block_size=5, markov_rank=256, target_layers=[40,41,42]）。
@@ -407,7 +417,9 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
   cu12 系、sgl-kernel/sgl-deep-gemm cu129 索引；sglang editable 指向
   third_party/sglang@`dspark-kt`，kt-kernel 以 torch 2.11 头文件重编）。
 - SM89 适配：sparse 注意力走 Triton 回退、索引器 logits 走 torch 回退、
-  topk v1、paged_mqa_metadata smem 钳制（详见 DSv4F-Opt.md §1）。
+  topk v1（详见 DSv4F-Opt.md §1）。`paged_mqa_metadata` 的 smem 钳制已被
+  上游 2026-08-25 合并带来的批次自适应三 kernel 重写取代（tiny/small
+  静态 smem + 大 batch 走 workspace scratch，SM89 天然安全）。
 - draft 保持纯 GPU（约 10.6GB，MEMFRAC 需 ≥0.60），target 专家全在 CPU。
 - **kt-kernel pinned-buffer 生命周期修复**（graph 损坏的根因）：CPU 专家的
   pinned 中转 buffer 曾走单槽 temp 缓存，graph 捕获后任何 prefill 换槽都会
@@ -450,13 +462,13 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
 
 | env | 本栈状态 | 结论 |
 |---|---|---|
-| `SGLANG_OPT_FUSE_WQA_WKV=1` | `environ.py:1303` 默认 `EnvBool(True)` | 冗余，不设即开 |
-| `SGLANG_OPT_USE_JIT_NORM=1` | `environ.py:1316` 默认 `EnvBool(True)` | 冗余，不设即开 |
-| `SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1` | `environ.py:1317` 默认 `EnvBool(True)`（仅 HIP 分支强制关） | 冗余，不设即开 |
-| `SGLANG_OPT_USE_FUSED_STORE_CACHE=1` | `environ.py:1315` 默认 `EnvBool(True)` | 冗余，不设即开 |
+| `SGLANG_OPT_FUSE_WQA_WKV=1` | `environ.py:1393` 默认 `EnvBool(True)` | 冗余，不设即开 |
+| `SGLANG_OPT_USE_JIT_NORM=1` | `environ.py:1583` 默认 `EnvBool(True)` | 冗余，不设即开 |
+| `SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=1` | `environ.py:1394` 默认 `EnvBool(True)`（仅 HIP 分支强制关） | 冗余，不设即开 |
+| `SGLANG_OPT_USE_FUSED_STORE_CACHE=1` | `environ.py:1582` 默认 `EnvBool(True)` | 冗余，不设即开 |
 | `SGLANG_KT_WOA_FP8_TRITON=1` | 无任何读取点（仅 environ.py 定义+docstring） | 已废弃 |
 | `SGLANG_OPT_USE_OVERLAP_STORE_CACHE=1` | 无任何读取点 | 已废弃 |
 | `SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD=1` | 默认 False；**无融合消费方**，=1 只是跳过 `output.mul_(rsf)` | **禁用**：模型 rsf=1.5，=1 会静默丢掉 ×1.5，三处 GPU MoE 路径（marlin/triton_kernels/trtllm）全部算错 |
-| `SGLANG_KT_FP8_LMHEAD=1` | 读取点在 `logits_processor.py:788`（head.weight BF16 129280×4096 满足条件） | **禁用**：见下 |
+| `SGLANG_KT_FP8_LMHEAD=1` | 读取点在 `logits_processor.py:756`（head.weight BF16 129280×4096 满足条件） | **禁用**：见下 |
 
 审计与实测依据见 `DSv4F-Opt.md` §4；ds4f.service 注释中已标注禁止引入。

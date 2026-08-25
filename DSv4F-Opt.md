@@ -720,6 +720,73 @@ bs=[1,2] 捕获、双请求并行 decode 生效（日志 `#running-req: 2`）。
 `--max-total-tokens` 封顶、所有并发会话共享，两条都接近满上下文的请求
 会排队等池空间（按可用 token 准入，不会 OOM）。
 
+> **2026-08-25 晚补记（上游拉齐后）**：本节记录的 ">256K 输出不稳定
+> （根因未查）" 头号嫌疑即上游 `4a5d7d3` —— DSv4 speculative decoding
+> 在 **draft tokens > 4** 时的静默 KV / compressed-state 损坏；本机
+> `speculative_num_draft_tokens=6` 恰好踩中，且上下文越长损坏概率越
+> 可观测。该修复已随 §5.18 合并进入生产，**升级后 grow_probe 240K/280K
+> 级已复测干净**（详见 §5.18）。`SGLANG_DSPARK_MAX_CTX` 当前仍置 0
+> （门控关闭）；若后续业务长上下文持续无异常，可保持 0 跑满投机收益，
+> 也可恢复 262144 默认值作为保险丝（两种都合理，按风险偏好选）。
+
+### 5.18 上游拉齐（2026-08-25 晚）：merge sgl/main d06762282，带入 DSpark/DSv4 三修复
+
+动机与范围：把 `third_party/sglang`（`dspark-kt` 分支）从 8-06 基底
+（`4ad990ba7` + 25 个自研提交）merge 官方 main `d06762282`（+986 提交），
+目标修复——`4a5d7d3`（**DSv4 投机解码 draft tokens > 4 的静默 KV /
+compressed-state 损坏**，本机 6 draft tokens 踩中，§5.17 ">256K 不稳定"
+的头号嫌疑）、`8549cce`（c128 ragged prefill 压缩计划 GPU 竞态）、
+`154f0ac`（DSpark + DP/EP metadata）。`eb4f9c2`（SM120 mHC/NCCL buffer
+alias）为 SM120 专属，本机 SM89 跳过。merge commit `0c7838d6c`（submodule），
+父仓库指针 `42b3fd3`。
+
+合并要点（11 个冲突文件，详见 merge commit message）：
+
+- 三个修复承载文件（`c_plan.cuh` / `deepseek_v4_memory_pool.py` /
+  `pool_configurator.py` / `dspark_draft.py`）与上游逐字节一致，零覆盖；
+- `dflash_info_v2.py` 取上游 `page_aligned_decode_alloc_lens` 重构，§1.7
+  的 SWA 驱逐修复存活（重复调用已去重）；
+- DSML 流式检测器（§1.8 修复）保留 fork `normal_parts` 方案 + 采纳上游
+  异常路径加固（清 buffer 防重发），功能级单测通过；
+- `paged_mqa_metadata.cuh` 取上游批次自适应三 kernel 重写，SM89 smem
+  钳制（§1）被取代（新设计 tiny/small 静态 smem + 大 batch workspace
+  scratch，天然 SM89 安全）；
+- fork 全部 25 个自研提交（KT 引擎、max-ctx 门控、hicache 手动快照、
+  SM89 路径等）与所有自研文件完好。
+
+sglang-kernel 版本门（dspark-kt `3c4c5c59f`）：上游启动期硬性要求
+`>= 0.4.6.post1`，但 PyPI 该版本 wheel 是 CUDA 13 构建（`libcudart.so.13`，
+需 580+ 驱动），本机 550 驱动无法加载；fork 放宽下限到 0.4.5（本地
+`0.4.5+cu129` 构建）。符号级审计：排除 NPU 路径与 aot 构建树后，运行时
+代码引用的全部 `sgl_kernel` 符号在 0.4.5 均存在。长期项：用
+`python/sglang/kernels/aot` + CUDA 12 工具链本地构建 0.4.6+cu129 后
+恢复上游下限。
+
+依赖取舍：torch 2.11.0+cu128（上游 pin 2.13.0，受驱动约束保留）、
+sglang-kernel / humming-kernels / tilelang / quack-kernels / cuda-tile
+维持现装版本（懒加载可选路径，深度 import 链验证不触发）；新增 termcolor、
+setuptools-scm；flashinfer 维持不装（sgl-kernel 自带 flash_ops）。
+备份：submodule 分支 `backup/dspark-kt-pre-sync-20260825` +
+`~/sglang-upgrade-backup-20260825/`（前后 pip freeze）。
+
+升级后验证（2026-08-25 晚，生产 30000 实例，512K+35U+DSpark+CPU draft）：
+
+- 语法/导入：合并涉及全部 .py 编译通过；serving 全链 import 通过；
+- `tests/probe_dspark.py 30000`：**CLEAN**；
+- `tests/bench_dspark.py 30000`：**5/5 ALL PASS**，预热后 **37.33 tok/s**
+  （首跑 29.89 含 JIT 预热；参考区间 32–36，勿把单次吞吐当回归）；
+- `tests/test_dspark_max_ctx.py` / `tests/test_hicache_snapshot_manifest.py`
+  （10 例）/ `tests/test_routing_v4.py`（含图捕获）：**全 PASS**；
+- 启动链路：hugepages 权重 REUSED（target 31.9s / draft 6.9s），verify
+  图 bs=[1,2] 捕获正常，`spec_num_draft_tokens=6` 下 verify 37 次无异常；
+- 长上下文 `grow_probe.py 30000 --stages=8,120,240,280`（跨 >111K 历史
+  损坏边界与 §5.17 >256K 不稳定区）：**4/4 全 PASS**（codeword 回忆 /
+  数学 / 重复度逐级干净，exit=0）。280K 级为升级后首次在 >256K 上下文
+  得到干净输出——印证 §5.17 补记的 `4a5d7d3` 嫌疑判断；探针期间
+  spec_accept_length 3.4 / verify 971 次无异常。prefill 计时备查：
+  120K 新前缀 235s、120K→240K 增量 303s、240K→280K 增量 114s
+  （hicache 前缀复用生效）。
+
 ## 1. DSpark 投机解码（主线 sglang 移植）
 
 ### 1.1 背景与路线
@@ -880,6 +947,11 @@ batch. Aborting the last request.` journal 显示同类 abort 自 8-21 起已有
 
 1. 方法开头加 `batch.maybe_evict_swa()`；
 2. per-req 循环内 `req.decode_batch_idx += 1`。
+
+> 2026-08-25 上游拉齐注记（§5.18）：上游同期独立加了同样的
+> `maybe_evict_swa()`（放在 `bs==0` 早退之后），merge 时两处已去重
+> （保留上游位置 + 本节注释）；`decode_batch_idx` 递增改由上游重构后的
+> 循环后统一 tick 承担，语义不变。单测 + bench 复验通过。
 
 安全性：驱逐只动窗口外槽位；DSpark reserved_len = committed +
 2×block_size 的 over-allocation 语义不受影响。
