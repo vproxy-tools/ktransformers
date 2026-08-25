@@ -337,6 +337,7 @@ DSpark 单请求吞吐参考区间 32–36 tok/s，口径见 3.1）。
 | 手动 kill 后服务 30s 拉起失败循环 | ExecStart 指向的 venv/路径失效，或 StartLimitBurst(500/天) 耗尽 | `systemctl reset-failed ds4f && systemctl start ds4f`（sudo） |
 | RSS 看起来持续增长 | 紧循环测量含"已 free 未归还"驻留页 | 以 malloc_trim 后读数为准（DSv4F-Opt.md 3.6） |
 | 输出损坏（复读/数学错） | 先跑 `tests/probe_dspark.py`，损坏与 ctx 相关时用 `tests/bisect_ctx.sh` 二分 | 已知两类损坏均已修复（DSv4F-Opt.md §4）；复现即新问题 |
+| 刷屏 `Received output for rid=... but the state was deleted`，且 `#running-req` 不降 | 客户端断连后请求变僵尸继续解码（§5.18 合并引入，详见 DSv4F-Opt.md §1.9） | 已修复（submodule `0960802076`）。修复前清场：`curl -X POST /abort_request -d '{"abort_all": true}'`（连所有在跑请求一起停） |
 | 升级 sglang 后启动报 `sglang-kernel ... less than 0.4.6.post1` | 上游抬高了启动期版本下限，但 PyPI 0.4.6.post1 wheel 是 CUDA 13 构建（`libcudart.so.13`，需 580+ 驱动），本机 550 驱动装不上 | fork 已放宽下限到 0.4.5（dspark-kt `3c4c5c59f`，本地 0.4.5+cu129 构建符号审计无缺口）；要真正上 0.4.6+ 需从 `python/sglang/kernels/aot` 用 CUDA 12 工具链本地构建 |
 ## 6. 服务管理（systemd）
 

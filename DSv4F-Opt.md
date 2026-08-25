@@ -1003,6 +1003,41 @@ batch. Aborting the last request.` journal 显示同类 abort 自 8-21 起已有
 注：排查期间在 ds4f.service 临时加了 `--log-requests --log-requests-level 3`
 （全量输入输出+token ids 落 journal，量大），确认无复发后可撤掉。
 
+### 1.9 客户端断连后僵尸解码（2026-08-25 晚）："state was deleted" 刷屏的根因与修复
+
+症状：journal 刷 `Received output for rid=... but the state was deleted in
+TokenizerManager`（实测 ~15 行/秒/请求），Decode batch 显示
+`#running-req` 不降——**客户端早已断开的请求在调度器里继续解码直到
+max_tokens**（生产实测两个僵尸请求烧了 15+ 分钟 GPU、占满并发槽）。
+复现：流式请求 + 客户端中途 kill，必现。
+
+根因链（两环都来自 §5.18 的上游合并）：
+
+1. `tokenizer_manager.generate_request` 的 `except BaseException` 清理
+   （本意是清理"未到达调度器就失败"的请求 state）把客户端断连的
+   `CancelledError` 也一并捕获——**把正在调度器里解码的请求的 state
+   先删了**（该清理来自上游，旧代码无此行为，故旧代码断连不产生僵尸）；
+2. 2 秒后 `create_abort_task`（StreamingResponse 的 background 兜底
+   abort）发现 rid 已不在 `rid_to_state`，命中
+   `tokenizer_worker_num==1 → return` 早退守卫（上游 revert #32588 留下
+   的捷径）——**调度器永远不知道要停**。
+
+修复（submodule `0960802076`，双保险）：
+
+- `CancelledError/GeneratorExit` 单独处理：已派发（dispatched）的请求
+  保留 state，由后台 abort → 调度器 abort 回声正常删除（未派发的仍
+  立即清理，防泄漏）；
+- `create_abort_task` 改传 `force=True`：即使 state 已被别处删除也
+  强制派发 AbortReq（调度器对未知 rid 是 no-op，已核实）。
+
+验证（生产 30000 实例重启后）：断连复现 0 条错误、Decode 在断连时刻
+即停；正常流式请求 `[DONE]` 正常收尾；probe_dspark CLEAN。
+
+运维注记：修复部署前如再遇到僵尸（特征：running-req 不降 +
+"state was deleted" 每秒多条同 rid），单 rid 的 `/abort_request` 会被
+同一守卫挡住，用 `curl -X POST /abort_request -d '{"abort_all": true}'`
+清场（会连所有在跑请求一起停，挑空闲窗口）。
+
 ## 2. 相关文件
 - 测试工具：全部在 `tests/`（探针/基准/巨页与泄漏回归等，见 §3）；
   GPU 微基准 `tests/bench_gpu_ops.py` / `tests/bench_gpu_cold.py` /
