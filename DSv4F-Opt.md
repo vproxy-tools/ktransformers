@@ -540,6 +540,186 @@ spec 样例 `/tmp/placement_{3F_1579,4F_1323,5FL_1067,6F_811,7F_555,8F_299,9F_43
 日志 `/tmp/bench_{custom3F,4Ftop,custom5FL,6Ftop,7Ftop,8Ftop,custom9F,3F40U}.log`，
 扫描脚本 `/tmp/bench_NFtop_sweep.sh`、`/tmp/bench_3F40U.sh`。
 
+### 5.14 HiCache 磁盘 KV 缓存 + prefill 命中统计 + 320K 上下文（2026-08-24）
+
+一次落地三件事（ds4f 稳态，全部实测验证）。上下文先开到 512K 后回收到
+320K，过程如下。
+
+**配置变更**（ds4f-dspark.service）：
+
+- 上下文 128K→**320K**（`--context-length 327680`、`--max-total-tokens
+  331776`；曾试 512K，见容量调参）；
+- 去掉 `--disable-radix-cache`（首部署起的保守默认，无技术原因），tree
+  cache 切到 **UnifiedRadixCache**（FULL+SWA 双组件）；
+- 启用 **HiCache 磁盘 L3**：`--enable-hierarchical-cache --hicache-ratio 2
+  --hicache-write-policy write_through --hicache-io-backend kernel
+  --hicache-mem-layout page_first --hicache-storage-backend file
+  --hicache-storage-prefetch-policy wait_complete`，存储目录
+  `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/var/hicache`（**勿用默认
+  /tmp：根分区 97% 满**；/var 是 NVMe 余量 1.1TB）。走的是上游为 DSv4 专门
+  实现的 HiCache 栈（`build_deepseek_v4_hicache_stack`，KV+SWA+C4/C128 压缩
+  池+DSpark draft 池全覆盖，回归测试自带 DSv4-Flash-DSpark+L3 file 配置）；
+- `--enable-metrics`：prefill 命中统计现成——`/metrics` 的
+  `sglang:cached_tokens_total`（按 device/host/storage 来源细分）、
+  `sglang:prompt_tokens_total`，另有每 batch 日志 `#cached-token` 与每请求
+  `meta_info.cached_tokens`。
+
+**容量调参（关键坑）**：开 radix 后 KV 池由 profiled 值封顶
+（`kv_cache_configurator.py _profile_available_bytes`：预算 = 权重后 avail
+− 47.02GB×(1−memfrac)），memfrac 从此变成真实旋钮：0.95→池 358K、0.97→467K、
+0.96+减 2U（38U）→满池 528384。DSv4 池真实边际 **7.7KB/token**（含
+swa/c4/c128/state 侧池，比只算 KV 的 5.7KB 大）。长上下文 prefill 的瞬时
+占用随上下文增长（~1.15GB 固定 + ~1.9B/token，chunk 1024 并不封顶它）：
+38U 时启动 avail 仅 1.82GB，450K prefill 在 ~360K 上下文处 OOM 崩服务；
+35U（avail 3.27GB）实测 450K 全程 free ≥1.3GB。容量对照：**35U≈512K、
+38U≈400K、40U≈320K**（建议值，各留 ~0.7GB 峰值余量）。因 35U↔40U 无可测
+性能差（decode 42.28 vs 41.29 tok/s 噪声带内），最终按用户选择定
+**3F+40U + memfrac 0.96 + 320K**：启动 avail 2.66GB，300K 边界压测
+714.2s 冷 / 6.7s 热，无 OOM。
+
+**实测结果**：
+
+- 缓存命中：100K 前缀冷 209.4s → 热 3.5s（~60×），
+  `cached_tokens_total{cache_source="device"}` 增长；
+- **磁盘持久化**：重启后同前缀 2.4s，
+  `cache_source="storage_HiCacheFile"` 命中（/var/hicache 落盘 2169
+  页/2.4GB per 100K；注意目录属主必须是运行用户，root 创建会 EACCES，
+  只在日志报 "Failed to save tensor"）；
+- 512K 时代实测（santi.txt/wxkb.txt 各截 450K token，35U 配置）：冷 prefill
+  **1190s/1194s**（全程均 ~378 tok/s——吞吐随上下文增长从 ~540 衰减到
+  ~320，注意力成本使然），热 **7.5s/7.6s**；2316K 超长请求 HTTP 400 优雅
+  拒绝。320K 边界压测（40U，santi 截 300K）：冷 714.2s（~420 tok/s）、
+  热 6.7s；
+- 回归（radix 新路径零覆盖，重点复验）：bench_dspark 5/5 PASS；
+  长生成 seqlen 17075（>13312 SWA 池界）finish=stop、0 retract（§1.7 修复
+  在 radix 路径下成立）；流式 session-request 3/3 content 完整（§1.8 修复
+  不受影响）；
+- 已知代价：启动时间 50s→~80s（host 池分配）；device 池装不下多篇超长
+  文档时跨文档靠磁盘层命中（write_through 落盘即持久）；
+- 磁盘限额：`SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE=200G` +
+  `MIN_FREE_SPACE=100G`（默认无上限会长满盘；实测磁盘占用 ~11GB/1M
+  token，200G ≈ 18M token 前缀，LRU 超上限驱逐到 90% 水位）；
+- 性能复测（干净环境）：decode 42.28 tok/s（历史 41.29 噪声带内，radix+
+  HiCache 无可测开销）、热 prefill ~75K tok/s；35U 时冷 prefill 527.9
+  tok/s（47.3K，较 540.1 低 2%，补回 40U 后应回到 ~540）。注意 HiCache
+  写回线程活跃时会干扰基准（曾测出 32.67 的假象），测性能要等写回落后。
+
+### 5.15 HiCache 手动快照模式（2026-08-25）：`--hicache-manual-mode` + save/load 接口
+
+**动机**：自动 write_through 写回在 prefill 期间异步落盘会干扰基准（§5.14
+末尾的 32.67 假象），且快照时机不可控。改为显式手动控制：自动保存/加载/
+限额/自动清理逻辑全部保留但默认不触发。
+
+**实现**（third_party/sglang）：
+
+- `server_args.py` 新增 `--hicache-manual-mode`（默认 False）。开启后：
+  `_finish_write_through_ack`（unified_radix_cache.py，唯一自动 H→磁盘
+  写回点）与 `scheduler._prefetch_kvcache`（唯一请求到达自动预取点）被
+  旁路；host 层、load_back H→D、LRU/限额逻辑不变。
+- 两个管理接口（均要求 `is_fully_idle()`，非空闲返回 400）：
+  - `POST /hicache/snapshot/save {"path": ...}`：排空 D→H 后 DFS 整树，
+    把所有 backuped 节点的页（KV+SWA+C4/C128+state+draft 全池）写入
+    `{path}`（新建独立 HiCacheFile 实例，max_size=0 不自清，不动主
+    backend），并把树结构写 `{path}/manifest.json`；
+  - `POST /hicache/snapshot/load {"path": ...}`：先 flush（清树/device/
+    host，不动磁盘），再按 manifest 父先子后逐节点复用
+    `prefetch_from_storage` 灌回 host 并挂树（期间临时把
+    storage_backend 指向快照目录、threshold→1、容量限制放开，finally
+    恢复）；
+  - 清空 GPU 侧用现有 `POST /flush_cache`，不新增。
+- **关键约束**：磁盘页文件名是纯内容哈希（`{sha256链}[.{pool}]{suffix}.bin`），
+  文件本身不含 token 序列，离开 radix 树无法反解前缀——manifest 因此必须
+  存树结构（紧凑格式：每节点只存自己的 token_ids + parent 下标，父先于子，
+  O(总 token 数)）。实现见新文件 `mem_cache/hicache_snapshot.py`（纯
+  stdlib，原子写，10 例单测 `tests/test_hicache_snapshot_manifest.py`）。
+- 配置配套（ds4f-dspark.service）：加 `--hicache-manual-mode`；限额 env
+  `SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE/MIN_FREE_SPACE` 注释关闭（manual
+  模式下无自动写，限额失去意义；恢复快照外自动模式时再开）。
+
+**典型工作流**：跑业务/prefill → 空闲时 snapshot/save 到指定目录 → 随便
+测别的（/flush_cache 清场）→ 需要时 snapshot/load 秒级恢复现场。快照目录
+整体可复制归档（内容寻址，同前缀跨快照天然去重）。
+
+**实测**（2026-08-25，3F+40U + 320K 稳态，276K token 快照）：
+
+- manual mode 下多轮 prefill 全程 /var/hicache 文件数不变（36047），自动
+  写回确已关闭；请求到达也不再自动预取（重启后同前缀需显式 load）；
+- save：540 节点 / 275,968 token / 4690 页 / 2.38GB，**0.72s**（页已在
+  host 池，纯 H→盘）；二次 save 幂等去重（只写新增页）；
+- flush_cache：清树/device/host，磁盘不动；
+- load：**275,968 token 全量回挂在 0.13~2.8s**（NVMe 冷/热页缓存差异），
+  回放后同前缀请求 TTFT **1.1~1.2s**（对照：全冷 prefill ~9 分钟）；
+- save → flush → load → 请求 完整往返两轮稳定，probe_dspark CLEAN；
+- 修掉的两个 bug（初版实测暴露）：(a) 逐节点回放会被 TRAILING_PAGES 池
+  （swa/state，只有窗口尾部页有文件）的尾部存在性门控全部否决——回放粒度
+  改为 root→leaf 整路径（对齐正常请求的查询语义）；(b) manifest JSON 出来
+  的 list 直接挂树会与正常请求的 `array("q")` key 撞上
+  `RadixKey.match` 的严格类型断言（Scheduler 崩）——回放全程保持 array。
+- 注意：回放后树结构是"每路径一个合并大节点"（再次 save 时 nodes=2），
+  前缀匹配语义等价；快照目录 `/var/hicache-snap1`（2.4GB）留作样本。
+
+### 5.16 思考等级默认拉满 + 默认 temperature 回 1.0（2026-08-25）
+
+- **思考等级**：DSv4 编码器（`encoding_dsv4.py`）本就有 `reasoning_effort`
+  概念——请求体可传 `reasoning_effort`（本模型 checkpoint 检测为
+  official profile：**low / high / max** 三档，靠 system prompt 注入不同
+  努力程度指令实现）；请求不传时读 env `SGLANG_DSV4_REASONING_EFFORT`
+  兜底（serving_chat.py:1225-1237）。checkpoint 自带默认是 **low**。
+  现稳态在 ds4f-dspark.service 设 `SGLANG_DSV4_REASONING_EFFORT=max`，
+  即默认最高档；单请求可用 `reasoning_effort: "low"/"high"` 降级。
+- **默认 temperature 回到 0**：bench 复现期曾把模型目录
+  `generation_config.json` 改成 `temperature: 0.0, do_sample: false`，
+  2026-08-25 白天短暂恢复过 1.0（`.bak` 原值），同日按用户决定**改回
+  0.0**（确定性输出优先；请求显式传 temperature 仍优先）。
+
+### 5.17 上下文档位调整、并发 2 与 DSpark 长上下文门控（2026-08-25）
+
+一天内走了 320K→512K→（短暂 256K 作罢）→**512K+35U+并发2+DSpark
+门控**的最终形态。过程：上午从 40U+320K 改到 **35U+512K**（§5.14 已
+验证的组合）并把 `--max-running-requests 1→2`；实测 512K 期间发现
+**DSpark 在 >256K 上下文输出不稳定（重复字符/复读倾向明显增加，根因
+未查——与 §1.7 已修复的 SWA 驱逐 bug 是不同现象）**；一度准备把上下文
+上限压回 256K，最终改为动态门控方案，上下文保持 512K。
+
+**DSpark 长上下文门控**：`SGLANG_DSPARK_MAX_CTX`（默认 **262144**，
+0=永不禁用；实现在 `dspark_worker_v2.py`，单测
+`tests/test_dspark_max_ctx.py`）。batch 内任一请求上下文达到阈值 → 整
+batch 退化为普通 eager decode（越线请求只升不降；长请求结束后 batch
+自动恢复投机，日志 `degrading to plain target decode` /
+`resuming speculative decode`）。切换点在 worker 的 `_forward_decode`
+顶部（`_forward_decode_plain` 补齐 input_ids/out_cache_loc、target
+forward + `inject_target_hidden` 保持 draft KV 同步，verify 图宽度
+不匹配自动走 eager）。per-request 混合判定为不可行（ragged verify 里留
+越线请求仍走 verify 专用 attention 路径——>111K 损坏史（§9.3）恰恰出
+在那里），故取 batch 级语义。
+
+GPU 验证（阈值临时设 4096）：(a) prompt 7999 越线 → 首个 decode 步即
+降级，accept len 1.00、eager、~12.4 tok/s；(b) prompt 2626 + 长生成
+中途跨过 4096 → 日志在 ctx_lens=[4097] 处准点降级；(c) 越线请求结束
+后同 batch 恢复投机（accept len 回升 5.8+、83 tok/s）；(d) 降级路径
+输出质量正常（8K 文档总结请求，思考链/正文/收尾全正常）；(e) 修掉
+一个首测崩溃：spec 路径 `sampling_info.penalizer_orchestrator` 恒为
+None（forward-only 副本），降级步不能引用它。**已知代价**：降级步
+~12.4 tok/s（eager + 每步 draft KV 注入，比非投机图基线 ~34 慢）——
+长上下文求稳的代价；越线请求的 draft KV 成为死重（请求结束才释放）。
+
+512K 档实测备查：池 528384 token、启动 avail 3.21GB、verify 图按
+bs=[1,2] 捕获、双请求并行 decode 生效（日志 `#running-req: 2`）。
+
+**各上下文档位的完整参数组合**（改动时三个参数一起换，memfrac 0.96 不动）：
+
+| 场景 | `--kt-num-gpu-experts` | `--context-length` | `--max-total-tokens` | 启动 avail |
+|------|------------------------|--------------------|----------------------|-----------|
+| 512K（当前，配 DSpark 门控） | 35 | 524288 | 528384 | ~3.2GB |
+| 400K | 38 | 409600 | 413696 | ~2.7GB（推算：38U+512K 实测 1.82GB + 池缩小 0.86GB） |
+| 320K | 40 | 327680 | 331776 | ~2.66GB |
+| 256K | 40 | 262144 | 266240 | 充裕（池比 320K 档还小 0.5GB） |
+
+320K 档（40U）即 2026-08-24 的稳态：池 331776 ≈ 2.56GB，300K 边界
+压测 714.2s 冷 / 6.7s 热通过（§5.14）。并发注意：KV 池由
+`--max-total-tokens` 封顶、所有并发会话共享，两条都接近满上下文的请求
+会排队等池空间（按可用 token 准入，不会 OOM）。
+
 ## 1. DSpark 投机解码（主线 sglang 移植）
 
 ### 1.1 背景与路线
