@@ -99,8 +99,9 @@ Environment=PATH=/home/wkgcass/ktransformers/.venv/bin:/usr/local/bin:/usr/bin:/
 
 # ctx=524288（512K，35U 腾显存）：>111K 的 verify 损坏已由
 # SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1 修复（DSv4Flash.md 9.3）；
-# DSpark 在 >256K 上下文输出不稳定（2026-08-25 观察），由
-# SGLANG_DSPARK_MAX_CTX（见下）在 256K 处动态关闭 DSpark 解决
+# DSpark >256K 输出不稳定（2026-08-25 观察）根因已定位为上游
+# 4a5d7d3（draft tokens>4 静默 KV 损坏），随 §5.18 合并修复并经
+# grow_probe 280K 复测干净；SGLANG_DSPARK_MAX_CTX 当前置 0（见下）
 ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --model /var/deepseek-v4-flash/0731 \
@@ -136,8 +137,10 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --reasoning-parser deepseek-v4 \
   --tool-call-parser deepseekv4
 
-# 本文件 = DSpark 稳态配置（与 ds4f.service 的 no-DSpark 5F+28U 稳态并存，
-#   二选一部署，切换方法见 DSv4F-Opt.md §5.10）。
+# 本文件 = 唯一稳态 unit（DSpark + 3F+35U + 512K + HiCache 手动快照模式；
+#   2026-08-25 前曾与 no-DSpark 稳态双 unit 并存（DSv4F-Opt.md §5.10），
+#   已合一，ds4f-dspark.service 留档不部署）。
+#   2026-08-25 晚 sglang 已 merge 官方 main d06762282（DSv4F-Opt.md §5.18）。
 # cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。
 # 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：前 3 个
 #   MoE 层整层（hash-MoE 层，分布均匀、部分常驻无意义）+ 其余 40 层各 35 个
@@ -157,10 +160,10 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
 #   512K+38U 时 450K prefill 在 ~360K 处 OOM 崩过一次（avail 1.82GB 不够），
 #   512K+35U 实测通过（avail 3.27GB、全程 free ≥1.3GB）——本配置即该组合。
 #   容量对照与各档完整参数表见 DSv4F-Opt.md §5.17。
-#   **DSpark >256K 输出不稳定**（重复字符/复读倾向，2026-08-25 观察，根因
-#   未查，与 §1.7 的 SWA 驱逐 bug 是不同现象）：不再压上下文上限，改由
-#   SGLANG_DSPARK_MAX_CTX=262144 在请求上下文达到 256K 时动态禁用该
-#   请求的投机解码（256K 以内正常 DSpark）。
+#   **DSpark >256K 输出不稳定**（重复字符/复读倾向，2026-08-25 观察）：
+#   根因后经定位为上游 4a5d7d3（draft tokens>4 静默 KV 损坏），已随
+#   §5.18 上游拉齐修复，grow_probe 280K 复测干净。SGLANG_DSPARK_MAX_CTX
+#   保险丝保留可用（262144），当前置 0 跑满投机。
 #   512K 实测：450K 冷 prefill ~1190s（均 ~378 tok/s，注意力随上下文
 #   变慢），命中缓存后 ~7.5s；超长请求 400 优雅拒绝。
 #   模型 max_position_embeddings=1048576（YaRN 自 64K 外推）。

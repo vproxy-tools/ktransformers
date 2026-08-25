@@ -64,11 +64,16 @@ git submodule update --init --recursive
 #     依赖与驱动不匹配（本机驱动仅支持 CUDA 12.x），参照 pip freeze
 #     的实测版本手动 pin。
 #     2026-08-25 上游拉齐后注意（DSv4F-Opt.md §5.18）：
-#     a) editable 重装要 venv 里有 setuptools-scm，且 submodule 需先
+#     a) 【重要】上游 pyproject 已 pin torch==2.13.0 + 多个 cu13 wheel
+#        （sglang-kernel 0.4.6.post1 / humming-kernels / cutlass-dsl 等），
+#        在本机（驱动 550，仅支持 CUDA 12）裸 pip install -e 会把 venv
+#        装坏——重装一律加 --no-deps；重建全新 venv 以仓库根
+#        requirements-freeze-2026-08-25.txt 为基线；
+#     b) editable 重装要 venv 里有 setuptools-scm，且 submodule 需先
 #        git fetch sgl --tags（否则版本号回退 0.0.0）；
-#     b) sglang-kernel 版本下限已被 fork 放宽到 0.4.5（本地 cu129 构建），
+#     c) sglang-kernel 版本下限已被 fork 放宽到 0.4.5（本地 cu129 构建），
 #        不要照 pyproject 装 0.4.6.post1（cu13-only，550 驱动加载不了）。
-pip install -e third_party/sglang/python
+pip install -e third_party/sglang/python --no-deps --no-build-isolation
 
 # 2.3 编译安装 kt-kernel（自动检测 CPU：NATIVE + AMX=OFF + AVX512 全家桶 ON）
 #     必须带 --no-deps：kt-kernel 的 requirements pin 老 torch，裸装会降级依赖
@@ -83,9 +88,86 @@ kt doctor    # 应全部"正常"，kt-kernel 显示 v0.6.4
 ### 3.1 本机调优配置（DSpark 投机解码 + cuda graph，日常使用）
 
 生产使用 DSpark 投机解码栈（sglang `dspark-kt` 分支，详见第 9 节）。
-**2026-08-25 起稳态为 3F+35U + 512K 上下文 + 并发 2 + HiCache 手动快照模式**
-（完整参数组合见 DSv4F-Opt.md §5.14/§5.17；以仓库根 `ds4f.service` 为准，
-本节命令是 131072 档的历史参考配置）：
+**当前稳态（2026-08-25 定型）：3F+35U + 512K 上下文 + 并发 2 + HiCache
+手动快照模式**，与仓库根 `ds4f.service` 完全一致（各 env 的注释、回退
+开关、显存/池测算原始记录都在该文件与 DSv4F-Opt.md §5.14/§5.17）：
+
+```bash
+cd $KT_ROOT
+
+# 架构变量：文档示例是 5090(SM_120)，4090/4090D 要改成 8.9
+export FLASHINFER_CUDA_ARCH_LIST=8.9
+export TORCH_CUDA_ARCH_LIST="8.9+PTX"
+
+# 思考模式默认开启 + 等级拉满（单请求可用请求体 reasoning_effort 覆盖）
+export SGLANG_DEFAULT_THINKING=1
+export SGLANG_DSV4_REASONING_EFFORT=max
+
+# DSpark + SM89 回退栈必需（缺一不可，见 DSv4F-Opt.md §1）
+export SGLANG_RAGGED_VERIFY_MODE=static
+# verify 元数据图外构建（ctx>111K 图内录制损坏生成，见 9.3）
+export SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1
+# 长上下文 prefill 的 indexer gather 峰值需要消碎片
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
+export SGLANG_OPT_USE_TOPK_V2=0
+export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
+# 索引器 tilelang 融合内核（prefill 主力项，见 DSv4F-Opt.md §5.2）
+export SGLANG_OPT_USE_TILELANG_INDEXER=1
+# 部分常驻专家层 Marlin + 关闭 decode 全 CPU 相位切换（见 §5.7）
+export SGLANG_V4_MARLIN_PARTIAL=1
+export SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0
+# DSpark draft 专家挪 CPU（见 §5.11，省 ~9.5GB 显存）
+export SGLANG_KT_DSPARK_CPU_EXPERTS=1
+# DSpark 长上下文门控：0=关闭（>256K 已随上游 4a5d7d3 修复验证干净，
+# 见 DSv4F-Opt.md §5.17/§5.18；要保险丝可设 262144）
+export SGLANG_DSPARK_MAX_CTX=0
+# HiCache 磁盘 L3 目录（NVMe；勿用 /tmp——根分区已满）
+export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=/var/hicache
+# 注：KT_EXPERT_DIST_TRACK=1 是临时测量项（DSv4F-Opt.md §6.10），平时不开
+
+$KT_ROOT/.venv/bin/python -m sglang.launch_server \
+  --host 0.0.0.0 --port 30000 \
+  --model $MODEL_DIR \
+  --kt-weight-path $MODEL_DIR \
+  --kt-method MXFP4 \
+  --kt-expert-placement-strategy hybrid \
+  --kt-num-gpu-full-layers 3 \
+  --kt-num-gpu-experts 35 \
+  --kt-cpuinfer 48 \
+  --kt-threadpool-count 2 \
+  --tensor-parallel-size 1 \
+  --context-length 524288 \
+  --attention-backend flashinfer \
+  --mem-fraction-static 0.96 \
+  --max-total-tokens 528384 \
+  --chunked-prefill-size 1024 \
+  --max-prefill-tokens 1024 \
+  --max-running-requests 2 \
+  --watchdog-timeout 1200 \
+  --disable-shared-experts-fusion \
+  --trust-remote-code \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-storage-backend file \
+  --hicache-storage-prefetch-policy wait_complete \
+  --hicache-manual-mode \
+  --enable-metrics \
+  --skip-server-warmup \
+  --speculative-algorithm DSPARK \
+  --reasoning-parser deepseek-v4 \
+  --tool-call-parser deepseekv4
+```
+
+512K 档实测备查（DSv4F-Opt.md §5.14/§5.17）：450K 冷 prefill ~1190s
+（均 ~378 tok/s）、命中缓存后 ~7.5s；KV 池 528384 token；启动 avail
+~3.2GB；并发 2 为"一大一小"或两条中短文档并行（两条满上下文会排队
+等池空间，不会 OOM）。
+
+**以下为 131072 档（1F+28U）历史参考配置与当时实测（保留备查）：**
 
 ```bash
 cd $KT_ROOT
@@ -189,7 +271,7 @@ Step 2（架构环境变量仍按上文 8.9 设置）。该配置未在本机当
 | 全局默认开（本服务已启用） | 启动环境变量 `SGLANG_DEFAULT_THINKING=1` | 已写入 `ds4f.service`；输出侧的 `</think>` 切分依赖 dspark-kt 分支对 `serving_chat.py` 的补丁（explicit_thinking 探测模式下输出侧原本忽略该 env） |
 | 单请求开启 | 请求体加 `"chat_template_kwargs": {"thinking": true}` | 不设环境变量时的开启方式 |
 | 单请求关闭 | `"chat_template_kwargs": {"thinking": false}` | 覆盖环境变量的全局默认 |
-| 推理强度 | `"reasoning_effort": "low"/"medium"/"high"/"xhigh"/"max"` | 按官方文档映射：low→low（简洁思考前缀），medium/xhigh→high，high→high（默认档），max→max（最大强度前缀）。也可用环境变量 `SGLANG_REASONING_EFFORT` |
+| 推理强度 | `"reasoning_effort": "low"/"medium"/"high"/"xhigh"/"max"` | 按官方文档映射：low→low（简洁思考前缀），medium/xhigh→high，high→high（默认档），max→max（最大强度前缀）。也可用环境变量 `SGLANG_DSV4_REASONING_EFFORT`（ds4f.service 已设 max；旧名 `SGLANG_REASONING_EFFORT` 仍被接受但已标记废弃） |
 | 官方开关写法 | `"thinking": {"type": "enabled"}` 或 `{"type": "disabled"}` | 与 `chat_template_kwargs.thinking` 等效，对齐 api-docs.deepseek.com |
 | Anthropic 风格 | `"reasoning": {"effort": "none"}` / `{"effort": "max"}` | effort=none 关思考；也接受 `"enabled": true/false` |
 
@@ -413,8 +495,9 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
 
 ### 9.2 栈结构与关键修复
 
-- venv：仓库根 `.venv`（torch 2.11.0+cu128、flashinfer
-  cu12 系、sgl-kernel/sgl-deep-gemm cu129 索引；sglang editable 指向
+- venv：仓库根 `.venv`（torch 2.11.0+cu128；flashinfer 未单独安装，
+  flash-ops 由 sgl-kernel 0.4.5+cu129 本地构建提供；sgl-deep-gemm
+  cu129 索引；sglang editable 指向
   third_party/sglang@`dspark-kt`，kt-kernel 以 torch 2.11 头文件重编）。
 - SM89 适配：sparse 注意力走 Triton 回退、索引器 logits 走 torch 回退、
   topk v1（详见 DSv4F-Opt.md §1）。`paged_mqa_metadata` 的 smem 钳制已被
