@@ -847,6 +847,16 @@ ctx_ladder 备忘：`--stages` 覆盖阶梯、`--no-flush --assume-rung K`
 失败时不落盘快照（进度保持在上一个通过档）。
 
 
+### 5.21 freeze_gc 启动自检竞态修复（2026-08-26，dspark-kt-fix）
+
+`--skip-server-warmup` 下 `_wait_and_warmup` 跳过真实预热后立刻向
+`/freeze_gc` 自发 HTTP 请求，与 uvicorn bind 竞态——毫秒级输掉时
+`ConnectionRefused`，gc.freeze 静默未生效（08-25 以来日志出现 6 次，
+调度器/detokenizer 启动期对象一直被 gen2 GC 扫描）。修复：连接失败
+按 1s 重试至多 60s（`post-warmup freeze_gc ok` 成功日志）；其它请求
+错误仍快速失败。同秒日志证据：`Uvicorn running` / `freeze_gc failed`
+/ `fired up` 同秒相邻。
+
 ### 5.20 131072 档（1F+28U）历史配置与实测备查（2026-08-26 自部署文档移入）
 
 早期 DSpark GPU-draft 稳态（2026-08-2x，memfrac 0.87 / ctx 131072 / 并发 1，
