@@ -710,7 +710,8 @@ bs=[1,2] 捕获、双请求并行 decode 生效（日志 `#running-req: 2`）。
 
 | 场景 | `--kt-num-gpu-experts` | `--context-length` | `--max-total-tokens` | 启动 avail |
 |------|------------------------|--------------------|----------------------|-----------|
-| 512K（当前，配 DSpark 门控） | 35 | 524288 | 528384 | ~3.2GB |
+| **1M（当前，2026-08-26 定档）** | **27**（最大可适配 U，28U 800K 崩） | 1048576 | 1052672 | ~2.85GB |
+| 512K | 35 | 524288 | 528384 | ~3.2GB |
 | 400K | 38 | 409600 | 413696 | ~2.7GB（推算：38U+512K 实测 1.82GB + 池缩小 0.86GB） |
 | 320K | 40 | 327680 | 331776 | ~2.66GB |
 | 256K | 40 | 262144 | 266240 | 充裕（池比 320K 档还小 0.5GB） |
@@ -786,6 +787,55 @@ setuptools-scm；flashinfer 维持不装（sgl-kernel 自带 flash_ops）。
   spec_accept_length 3.4 / verify 971 次无异常。prefill 计时备查：
   120K 新前缀 235s、120K→240K 增量 303s、240K→280K 增量 114s
   （hicache 前缀复用生效）。
+
+### 5.19 1M 上下文定档战役 + HiCache 快照恢复修复（2026-08-26）
+
+目标：为 `--context-length 1048576`（模型顶格）找到能通过完整阶梯的
+**最大 U**。工具为 `tests/ctx_ladder.py`（重写自 grow_probe 思路，专为
+快照续测设计，见下），逐档成败全部记录在 `/var/ctx1m/u*.json`（日志
+`/var/ctx1m/u*.log`，快照 `/var/hicache-snaps/ctx1m`，~24GB/1M token）。
+
+**阶梯设计**：确定性会话（填充文本按 rung 种子生成、助手回复固定为
+"已记录。"、每档 token 数经 /tokenize 校准 ±24），保证跨重启/跨 U 档
+字节稳定 → 前缀 KV 完整复用；rung = 20,100,200,300,400,500,575,650,
+700,750,800,850,900,950,1000（K token）；每档：增量填充（只 prefill
+本档增量）→ 三重检查（20K 处暗号 XK-42Q7 长程回忆 / 新数学题 / 重复度）
+→ `POST /hicache/snapshot/save` 落盘 → 更新进度。已过档不重测；换 U
+档重启后 `flush → snapshot load → 载入档复查 → 续爬`。1000K 处
+prompt 1,023,707，距 ctx 上限余 ~25K。
+
+**各档位结果（成败账本）**：
+
+| 档位 | 结果 | 细节 |
+|------|------|------|
+| **28U** | **FAIL @ 800K** | 20→750K 全过（检查全绿，prefill 522→209 tok/s 衰减，idle free 780→18MiB 递减后 expandable_segments 回收到 956MiB）；800K prefill 至 ~767K 上下文时 `torch.OutOfMemoryError`（申请 770MiB 连续块、free 773MiB 碎片化拿不出）→ 调度器崩溃、systemd 自动拉起。类目 `server_recovered` |
+| **27U** | **PASS 全阶梯** | 从 750K 快照续测（载入 772K tokens、复查 29s 过）；800→1000K 五档全过，检查全绿；prefill 218→186 tok/s，idle free 468→202MiB；1000K 暗号回忆仍正确（28U 算的 KV 跨档复用无损） |
+
+**结论：1M 上下文最大 U = 27**（每 +1U ≈ -0.542GB 边际，28U 差 ~0.5GB
+于 800K 的 prefill 瞬时峰值）。稳态即 ds4f.service 当前形态。
+
+**快照恢复截断 bug 与修复（本次战役的前置修复，dspark-kt-fix 7f1d2e98）**：
+首跑 27U 时发现 load 快照后 750K 复查只命中 102,400 token（其余 664K
+全部重新 prefill，~35 分钟——快照恢复形同虚设）。逐层定位：DSv4 栈的
+SWA host write-through 只写各备份区间尾窗、手动快照的 save 侧完全不落
+SWA 页（快照盘点：KV/c4/c4_indexer/c128 各 3026 页全覆盖，c4_state/
+c4_indexer_state 1518 页，**SWA 0 页**）→ load 出来的节点全是 SWA
+tombstone → SWA match validator（有状态累积型，要求边界节点尾窗
+`>= sliding_window_size` 覆盖）把每个恢复节点都拒绝 → 匹配边界卡在
+最后一个有 SWA 覆盖的区域（102400 = rung-100 填充链尾）。修复采用与
+上游 `unified_compress_only_hicache` 布局相同的语义：`load_hicache_
+snapshot` 成功后置 `swa_restore_reprefill_tail` 标记 → (a) SWA validator
+放行 backuped tombstone 作为匹配边界；(b) `swa_reprefill_tail_tokens()`
+返回 128（模型 sliding_window）→ 匹配 key 截掉尾窗、请求自己重填 ring；
+(c) SWA LOAD_BACK 祖先遍历遇覆盖缺口提前停止（原为 assert，会崩）。
+验证：204K 探针 2.3s 全命中（修复前 240s 全量重 prefill）、750K 完整
+历史 7.0s 恢复（767,488 token 命中）且暗号回忆正确。注意：该标记仅在
+快照 load 后生效，常规服务路径零改动。
+
+ctx_ladder 备忘：`--stages` 覆盖阶梯、`--no-flush --assume-rung K`
+进程内中继（换档重启前用同构请求把主干重新 device 常驻后免快照续爬，
+本次定位期间用过一次）、save 需服务完全空闲（内部自动重试 24×5s）、
+失败时不落盘快照（进度保持在上一个通过档）。
 
 ## 1. DSpark 投机解码（主线 sglang 移植）
 

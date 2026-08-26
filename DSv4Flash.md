@@ -88,7 +88,7 @@ kt doctor    # 应全部"正常"，kt-kernel 显示 v0.6.4
 ### 3.1 本机调优配置（DSpark 投机解码 + cuda graph，日常使用）
 
 生产使用 DSpark 投机解码栈（sglang `dspark-kt` 分支，详见第 9 节）。
-**当前稳态（2026-08-25 定型）：3F+35U + 512K 上下文 + 并发 2 + HiCache
+**当前稳态（2026-08-26 定型）：3F+27U + 1M 上下文 + 并发 2 + HiCache
 手动快照模式**，与仓库根 `ds4f.service` 完全一致（各 env 的注释、回退
 开关、显存/池测算原始记录都在该文件与 DSv4F-Opt.md §5.14/§5.17）：
 
@@ -133,14 +133,14 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
   --kt-method MXFP4 \
   --kt-expert-placement-strategy hybrid \
   --kt-num-gpu-full-layers 3 \
-  --kt-num-gpu-experts 35 \
+  --kt-num-gpu-experts 27 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
-  --context-length 524288 \
+  --context-length 1048576 \
   --attention-backend flashinfer \
   --mem-fraction-static 0.96 \
-  --max-total-tokens 528384 \
+  --max-total-tokens 1052672 \
   --chunked-prefill-size 1024 \
   --max-prefill-tokens 1024 \
   --max-running-requests 2 \
@@ -162,10 +162,12 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
   --tool-call-parser deepseekv4
 ```
 
-512K 档实测备查（DSv4F-Opt.md §5.14/§5.17）：450K 冷 prefill ~1190s
-（均 ~378 tok/s）、命中缓存后 ~7.5s；KV 池 528384 token；启动 avail
-~3.2GB；并发 2 为"一大一小"或两条中短文档并行（两条满上下文会排队
-等池空间，不会 OOM）。
+1M 档实测备查（DSv4F-Opt.md §5.17/§5.19）：**27U 是 1M 上下文的最大 U**
+（28U 在 800K prefill 中 torch OOM 崩溃、27U 全阶梯通过到 1000K，三重
+检查全绿）；KV 池 1052672 token、启动 avail ~2.85GB；1000K 处 prefill
+~186 tok/s、全阶梯吞吐 522→186 tok/s 随上下文衰减；单请求上限仍是
+"一大一小"（两条接近 1M 会排队等池空间）。512K 档（35U）历史实测：
+450K 冷 prefill ~1190s（均 ~378 tok/s）、命中缓存后 ~7.5s。
 
 **以下为 131072 档（1F+28U）历史参考配置与当时实测（保留备查）：**
 

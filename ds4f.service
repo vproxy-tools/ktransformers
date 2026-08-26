@@ -1,5 +1,5 @@
 [Unit]
-Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 3F+35U + DSpark + CPU draft 稳态)
+Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 3F+27U + DSpark + 1M ctx 稳态)
 Documentation=file:///home/wkgcass/ktransformers/DSv4Flash.md
 After=network.target
 # 若机器启用了 nvidia-persistenced，取消下面两行注释可避免冷启动时驱动未就绪
@@ -97,11 +97,15 @@ Environment=KT_EXPERT_DIST_TRACK=1
 Environment=HOME=/home/wkgcass
 Environment=PATH=/home/wkgcass/ktransformers/.venv/bin:/usr/local/bin:/usr/bin:/bin
 
-# ctx=524288（512K，35U 腾显存）：>111K 的 verify 损坏已由
-# SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1 修复（DSv4Flash.md 9.3）；
-# DSpark >256K 输出不稳定（2026-08-25 观察）根因已定位为上游
-# 4a5d7d3（draft tokens>4 静默 KV 损坏），随 §5.18 合并修复并经
-# grow_probe 280K 复测干净；SGLANG_DSPARK_MAX_CTX 当前置 0（见下）
+# ctx=1048576（1M 稳态，2026-08-26 定档：27U 为 1M 上下文最大可适配 U）：
+#   模型 max_position_embeddings=1048576 正好顶格。阶梯实测（DSv4F-Opt.md
+#   §5.19，tests/ctx_ladder.py，20→1000K 十五档三重检查）：
+#   28U 通过 750K、800K prefill 中 torch OOM 崩（申请 770MiB 连续块失败）；
+#   27U 从 750K 快照续测 800→1000K 全过（idle free 468→202MiB，prefill
+#   218→186 tok/s，1000K 暗号回忆正确）。每 +1U ≈ -0.542GB 边际。
+#   >111K verify 损坏已由 SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1 修复
+#   （DSv4Flash.md 9.3）；DSpark >256K 损坏根因（上游 4a5d7d3）已随
+#   §5.18 上游拉齐修复并经全阶梯复测干净；SGLANG_DSPARK_MAX_CTX 保持 0。
 ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --model /var/deepseek-v4-flash/0731 \
@@ -109,14 +113,14 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --kt-method MXFP4 \
   --kt-expert-placement-strategy hybrid \
   --kt-num-gpu-full-layers 3 \
-  --kt-num-gpu-experts 35 \
+  --kt-num-gpu-experts 27 \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
-  --context-length 524288 \
+  --context-length 1048576 \
   --attention-backend flashinfer \
   --mem-fraction-static 0.96 \
-  --max-total-tokens 528384 \
+  --max-total-tokens 1052672 \
   --chunked-prefill-size 1024 \
   --max-prefill-tokens 1024 \
   --max-running-requests 2 \
@@ -137,38 +141,40 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --reasoning-parser deepseek-v4 \
   --tool-call-parser deepseekv4
 
-# 本文件 = 唯一稳态 unit（DSpark + 3F+35U + 512K + HiCache 手动快照模式；
+# 本文件 = 唯一稳态 unit（DSpark + 3F+27U + 1M ctx + HiCache 手动快照模式；
 #   2026-08-25 前曾与 no-DSpark 稳态双 unit 并存（DSv4F-Opt.md §5.10），
 #   已合一，ds4f-dspark.service 留档不部署）。
-#   2026-08-25 晚 sglang 已 merge 官方 main d06762282（DSv4F-Opt.md §5.18）。
+#   2026-08-25 晚 sglang 已 merge 官方 main d06762282（DSv4F-Opt.md §5.18）；
+#   2026-08-26 hicache 快照恢复截断修复（§5.19，dspark-kt-fix 7f1d2e98）。
 # cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。
 # 专家放置（hybrid，配合 SGLANG_V4_MARLIN_PARTIAL=1、PREFILL_ONLY=0）：前 3 个
-#   MoE 层整层（hash-MoE 层，分布均匀、部分常驻无意义）+ 其余 40 层各 35 个
-#   常驻专家（Marlin 计算 prefill+decode），合计 2168 专家。2026-08-23 起从
+#   MoE 层整层（hash-MoE 层，分布均匀、部分常驻无意义）+ 其余 40 层各 27 个
+#   常驻专家（Marlin 计算 prefill+decode）。2026-08-23 起从
 #   5F+28U 改为 3F+40U：§5.13 九组放置扫描证明放置方式对性能无可分辨影响
 #   （3F+40U 实测 prefill 540.1 / decode 41.29 tok/s，为全部实测中 prefill
-#   最高值）；2026-08-25 为开 512K 上下文减到 35U（见下）。
+#   最高值）；2026-08-25 为开 512K 上下文减到 35U；2026-08-26 为开 1M
+#   上下文减到 27U（28U 阶梯 800K 崩，见上文 ctx 注释与 §5.19）。
 #   整层预算来自 SGLANG_KT_DSPARK_CPU_EXPERTS=1（draft 专家挪
 #   CPU 省 ~9.5GB，见 §5.11）。
 #   若出现长上下文 prefill OOM：减 U（每 U ≈ 0.5GB）或缩小
 #   --max-total-tokens。
-# 上下文 512K（2026-08-25，320K→512K，40U→35U）：KV 池边际实测 7.7KB/token
-#   （含 swa/c4/c128/state 侧池）。开 radix 后池容量由 profiled 值封顶
-#   （memfrac 直接决定池大小，0.95→358K、0.97→467K，公式见
-#   kv_cache_configurator.py _profile_available_bytes）；且长上下文 prefill
-#   的瞬时占用随上下文增长（~1.15GB 固定 + ~1.9B/token）：
-#   512K+38U 时 450K prefill 在 ~360K 处 OOM 崩过一次（avail 1.82GB 不够），
-#   512K+35U 实测通过（avail 3.27GB、全程 free ≥1.3GB）——本配置即该组合。
-#   容量对照与各档完整参数表见 DSv4F-Opt.md §5.17。
+# 上下文容量账（历史实测）：KV 池边际 7.7KB/token（含 swa/c4/c128/state
+#   侧池）；开 radix 后池容量由 profiled 值封顶（memfrac 直接决定池大小，
+#   公式见 kv_cache_configurator.py _profile_available_bytes）；长上下文
+#   prefill 瞬时占用随上下文增长（~1.15GB 固定 + ~1.9B/token）。
+#   历史档位：512K+38U 在 450K prefill ~360K 处 OOM 崩过（avail 1.82GB），
+#   512K+35U 通过；1M+28U 在 800K 崩（torch OOM 770MiB 连续块），
+#   1M+27U 全阶梯通过（本配置）。容量对照与各档完整参数表见
+#   DSv4F-Opt.md §5.17，1M 定档战役详见 §5.19。
 #   **DSpark >256K 输出不稳定**（重复字符/复读倾向，2026-08-25 观察）：
 #   根因后经定位为上游 4a5d7d3（draft tokens>4 静默 KV 损坏），已随
-#   §5.18 上游拉齐修复，grow_probe 280K 复测干净。SGLANG_DSPARK_MAX_CTX
+#   §5.18 上游拉齐修复，1M 全阶梯复测干净。SGLANG_DSPARK_MAX_CTX
 #   保险丝保留可用（262144），当前置 0 跑满投机。
-#   512K 实测：450K 冷 prefill ~1190s（均 ~378 tok/s，注意力随上下文
-#   变慢），命中缓存后 ~7.5s；超长请求 400 优雅拒绝。
+#   1M 实测：全阶梯 prefill 522→186 tok/s 随上下文衰减（注意力变慢）；
+#   快照恢复后 750K 前缀 7s 命中 767K token（§5.19 修复后）。
 #   模型 max_position_embeddings=1048576（YaRN 自 64K 外推）。
-# 并发 2（2026-08-25，--max-running-requests 1→2）：KV 池 ~528K token，
-#   装不下两个满 512K 上下文——实际是"一大一小"或两个中短文档并行；
+# 并发 2（2026-08-25，--max-running-requests 1→2）：KV 池 ~1.05M token，
+#   装不下两个满 1M 上下文——实际是"一大一小"或两个中短文档并行；
 #   两条都接近满上下文时第二条会在队列里等池空间（不会 OOM，调度器按
 #   可用 token 准入）。
 # HiCache 磁盘 KV 缓存（2026-08-24 起）：去掉 --disable-radix-cache 后 tree
