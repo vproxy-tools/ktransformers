@@ -1,5 +1,5 @@
 [Unit]
-Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt, RTX 4090D, hybrid 3F+27U + DSpark + 1M ctx 稳态)
+Description=DeepSeek-V4-Flash SGLang server (ktransformers dspark-kt-fix, RTX 4090D, hybrid 3F+27U + DSpark + 1M ctx 稳态)
 Documentation=file:///home/wkgcass/ktransformers/DSv4Flash.md
 After=network.target
 # 若机器启用了 nvidia-persistenced，取消下面两行注释可避免冷启动时驱动未就绪
@@ -19,13 +19,15 @@ WorkingDirectory=/home/wkgcass/ktransformers
 
 # --- DSpark 投机解码栈（DSv4Flash.md 第 3.1/9 节）---
 # venv: 仓库根 .venv（torch 2.11+cu128；sglang 为
-# editable 安装，指向 third_party/sglang 的 dspark-kt 分支——不要切分支！）
+# editable 安装，指向 third_party/sglang 的 dspark-kt-fix 分支
+# （官方 main d06762282 + 自研补丁线性化谱系，见 DSv4F-Opt.md §5.18
+# 补记）——不要切分支！）
 
 # --- 架构变量（SM_89）---
 Environment=FLASHINFER_CUDA_ARCH_LIST=8.9
 Environment=TORCH_CUDA_ARCH_LIST=8.9+PTX
 
-# --- 思考模式默认开启（输出侧切分由 dspark-kt 分支的 serving_chat 补丁保证）---
+# --- 思考模式默认开启（输出侧切分由本 fork 的 serving_chat 补丁保证）---
 # 单请求可用 chat_template_kwargs {"thinking": false} 覆盖关闭
 Environment=SGLANG_DEFAULT_THINKING=1
 # 思考等级默认拉满：请求不传 reasoning_effort 时按 "max" 编码
@@ -196,7 +198,7 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
 #   快照目录整体可复制/归档。恢复自动模式：去掉 --hicache-manual-mode 并恢复
 #   上面两行限额 env。
 # MEMFRAC 0.96：开 radix 后该值直接决定 KV 池的 profiled 上限
-#   （slack = 47.02GB × (1-memfrac)，见上文"上下文 512K"段），不再是
+#   （slack = 47.02GB × (1-memfrac)，见上文"上下文容量账"段），不再是
 #   纯纸面预算线——改动它就是在调 KV 池大小。
 # CHUNKED-PREFILL 1024（原 512）：tilelang 索引器 + expandable_segments 下，
 #   >100K 重预填充实测安全（grow_probe 到 125K 通过）。

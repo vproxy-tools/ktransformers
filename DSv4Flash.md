@@ -1,6 +1,6 @@
 # DeepSeek-V4-Flash 构建与启动实录（RTX 4090D / ktransformers optimize-latest 分支）
 
-本文记录从源码构建 ktransformers（sglang `dspark-kt` + kt-kernel）并启动
+本文记录从源码构建 ktransformers（sglang `dspark-kt-fix` fork + kt-kernel）并启动
 DeepSeek-V4-Flash-0731 推理服务的完整步骤。
 
 ## 1. 环境信息
@@ -24,7 +24,7 @@ DeepSeek-V4-Flash-0731 推理服务的完整步骤。
 | 系统 | Ubuntu 24.04，gcc 13.3，cmake 3.28，ninja |
 | Python venv | 仓库根 `.venv`（Python 3.12，torch 2.11.0+cu128） |
 | 模型 | `$MODEL_DIR`（0731 版 checkpoint，156GB，48 个 safetensors 分片，DeepseekV4ForCausalLM） |
-| 代码分支 | ktransformers `optimize-latest`；submodule third_party/sglang = **`dspark-kt` 分支**（见第 9 节；2026-08-25 已 merge 官方 main `d06762282`，见 DSv4F-Opt.md §5.18） |
+| 代码分支 | ktransformers `optimize-latest`；submodule third_party/sglang = **`dspark-kt-fix` 分支**（官方 main `d06762282` + 27 个自研补丁的线性化谱系，见第 9 节与 DSv4F-Opt.md §5.18 补记） |
 
 关键结论：
 
@@ -52,7 +52,7 @@ python3.12 -m venv .venv && source .venv/bin/activate
 # (可选) pip 缓存挪到大盘，避免根分区被写满
 export PIP_CACHE_DIR=$HOME/.pip-cache
 
-# 2.1 初始化 submodule（dspark-kt 分支，指针已记录在仓库）
+# 2.1 初始化 submodule（dspark-kt-fix 分支，指针已记录在仓库）
 git submodule update --init --recursive
 
 # 2.2 安装依赖 + sglang（editable）
@@ -87,7 +87,7 @@ kt doctor    # 应全部"正常"，kt-kernel 显示 v0.6.4
 
 ### 3.1 本机调优配置（DSpark 投机解码 + cuda graph，日常使用）
 
-生产使用 DSpark 投机解码栈（sglang `dspark-kt` 分支，详见第 9 节）。
+生产使用 DSpark 投机解码栈（sglang `dspark-kt-fix` 分支，详见第 9 节）。
 **当前稳态（2026-08-26 定型）：3F+27U + 1M 上下文 + 并发 2 + HiCache
 手动快照模式**，与仓库根 `ds4f.service` 完全一致（各 env 的注释、回退
 开关、显存/池测算原始记录都在该文件与 DSv4F-Opt.md §5.14/§5.17）：
@@ -169,91 +169,8 @@ $KT_ROOT/.venv/bin/python -m sglang.launch_server \
 "一大一小"（两条接近 1M 会排队等池空间）。512K 档（35U）历史实测：
 450K 冷 prefill ~1190s（均 ~378 tok/s）、命中缓存后 ~7.5s。
 
-**以下为 131072 档（1F+28U）历史参考配置与当时实测（保留备查）：**
-
-```bash
-cd $KT_ROOT
-
-# 架构变量：文档示例是 5090(SM_120)，4090/4090D 要改成 8.9
-export FLASHINFER_CUDA_ARCH_LIST=8.9
-export TORCH_CUDA_ARCH_LIST="8.9+PTX"
-
-# 思考模式默认开启
-export SGLANG_DEFAULT_THINKING=1
-
-# DSpark + SM89 回退栈必需（缺一不可，见 DSv4F-Opt.md §1）
-export SGLANG_RAGGED_VERIFY_MODE=static
-export SGLANG_OPT_DEEPGEMM_HC_PRENORM=0
-export SGLANG_OPT_USE_TOPK_V2=0
-export SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
-# 索引器 tilelang 融合内核（prefill 383→493 tok/s 的主力项，见 DSv4F-Opt.md §5.2）
-export SGLANG_OPT_USE_TILELANG_INDEXER=1
-# 部分常驻专家层用 Marlin 内核：常驻 GPU 专家在 decode 分摊 CPU 带宽（见 §5.7）
-export SGLANG_V4_MARLIN_PARTIAL=1
-# Marlin 常驻模式下关闭"decode 全 CPU"的相位切换
-export SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0
-
-$KT_ROOT/.venv/bin/python -m sglang.launch_server \
-  --host 0.0.0.0 --port 30000 \
-  --model $MODEL_DIR \
-  --kt-weight-path $MODEL_DIR \
-  --kt-method MXFP4 \
-  --kt-expert-placement-strategy hybrid \
-  --kt-num-gpu-full-layers 1 \
-  --kt-num-gpu-experts 28 \
-  --kt-cpuinfer 48 \
-  --kt-threadpool-count 2 \
-  --tensor-parallel-size 1 \
-  --context-length 131072 \
-  --attention-backend flashinfer \
-  --mem-fraction-static 0.87 \
-  --max-total-tokens 135168 \
-  --chunked-prefill-size 1024 \
-  --max-prefill-tokens 1024 \
-  --max-running-requests 1 \
-  --watchdog-timeout 1200 \
-  --disable-shared-experts-fusion \
-  --trust-remote-code \
-  --disable-radix-cache \
-  --skip-server-warmup \
-  --speculative-algorithm DSPARK \
-  --reasoning-parser deepseek-v4 \
-  --tool-call-parser deepseekv4
-```
-
-实测（47K prompt / DSpark + hybrid 放置[28/层 + 1 整层] + partial Marlin + tilelang）：
-**prefill 506.9 tok/s**（优化前 306，+66%）、decode **47.9 tok/s**（+21%）、
-显存约 **42.0GB / 48GB**、start→ready 约 60~100s。
-吞吐口径澄清与逐项优化记录见 DSv4F-Opt.md §5。
-
-**吞吐口径澄清**：DSpark 下 tok/s = accept/周期，
-高度依赖提示词内容——数数类（高可预测）70.8 tok/s、bench 5 题混合
-32.5~35.1（ALL PASS）、单一散文题 soak ~28（该类内容 accept 仅 ~2.3）。
-机器本身无损：MXFP4 MoE 微基准 234.2µs/层，与历史基线 233.5µs 逐微秒
-持平；GPU 时钟正常；QEMU 虚机（node0、~1.2 核）对 node1 专家核与 MoE
-无可测影响。不同日子的"持续 tok/s"差异主要来自 soak 提示词的 accept
-分布，而非性能回退。
-
-参数说明：
-
-| 参数 | 值 | 说明 |
-|---|---|---|
-| `--speculative-algorithm DSPARK` | 0731 自带 draft（`mtp.0.*`） | 无需 draft path；**不要用 EAGLE**（9.1 节） |
-| `--context-length 131072` | 模型上限 128K | 需 `SGLANG_DSv4_VERIFY_META_OUT_OF_GRAPH=1`（见 9.3；run_dspark.sh 已默认导出）；须是 page_size(256) 倍数 |
-| `--chunked-prefill-size 1024` | prefill 摊销更好（~+8%） | tilelang 索引器下 >100K 重预填充实测安全（grow_probe 125K PASS，DSv4F-Opt.md §5.4）；须配合 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。若改配置后 >100K prefill OOM，回退 512 |
-| `--max-total-tokens 135168` | context + 4096 余量 | KV 池右移：0.60 mem-frac 默认分到 801536 token（单请求永远用不满），右移后省 ~6GB 且**无性能差异**（同机 A/B：43.1 vs 42.5 tok/s，噪声内）；覆盖 context 时同步调大（256 倍数） |
-| `--mem-fraction-static 0.85` | draft 10.6GB + 24 GPU 专家 ~13GB 计入预算 | 实测 36.8GB/48GB；0.60 会因预算校验拒绝启动 |
-| hybrid：28/层 + 1 整层 | 常驻 + partial Marlin（`SGLANG_V4_MARLIN_PARTIAL=1`，`PREFILL_ONLY=0`） | 拆分层 GPU 专家与 CPU 逐层并行；整层（~3.2GB）叠加用真余显存，零通信且 decode 走 Marlin（47.9 tok/s）；显存 42.0GB，再填一层会挤压图捕获。若 Marlin 不可用须回退相位切换模式（`PREFILL_ONLY=1`、24 专家、无整层），否则 decode 掉到 ~25 tok/s（matmul_ogs 小 M 每层 762µs） |
-| `--kt-cpuinfer 48` | 复验 44 vs 48 | bench 32.9/35.1（44 时 32.5/32.8），≥44，噪声内偏正；v2 内核下 24/28/32 线程每 NUMA 持平 |
-| cuda graph | 默认开 | kt-kernel pinned-buffer 修复后正确（DSv4F-Opt.md §1.4）；前 2 步 verify 自动 eager 预热 |
-
-注意事项：
-
-- **venv 是仓库根 `.venv` 且 sglang 为 editable**（指向 third_party/sglang 的
-  `dspark-kt` 分支检出）。运行期间不要切 sglang 分支；改分支=改生产代码。
-- **长 prompt 首 token 延迟是分钟级**：108K 上下文 ÷ 512 分块（131072 配置的
-  chunk）≈ 211 次前向，且专家全在 CPU（实测 4168-token prompt prefill+回答 14.8s）。
-- `--max-running-requests 1` 保持；要并发需同步评估 draft/显存后重测。
+131072 档（1F+28U）历史配置、当时实测与参数表已移至
+`DSv4F-Opt.md` §5.20（部署文档只保留当前稳态；历史进展归 Opt 账本）。
 
 ### 3.2 文档基准配置（备用参考，短上下文 / 双并发）
 
@@ -270,7 +187,7 @@ Step 2（架构环境变量仍按上文 8.9 设置）。该配置未在本机当
 
 | 方式 | 写法 | 说明 |
 |---|---|---|
-| 全局默认开（本服务已启用） | 启动环境变量 `SGLANG_DEFAULT_THINKING=1` | 已写入 `ds4f.service`；输出侧的 `</think>` 切分依赖 dspark-kt 分支对 `serving_chat.py` 的补丁（explicit_thinking 探测模式下输出侧原本忽略该 env） |
+| 全局默认开（本服务已启用） | 启动环境变量 `SGLANG_DEFAULT_THINKING=1` | 已写入 `ds4f.service`；输出侧的 `</think>` 切分依赖本 fork 对 `serving_chat.py` 的补丁（explicit_thinking 探测模式下输出侧原本忽略该 env） |
 | 单请求开启 | 请求体加 `"chat_template_kwargs": {"thinking": true}` | 不设环境变量时的开启方式 |
 | 单请求关闭 | `"chat_template_kwargs": {"thinking": false}` | 覆盖环境变量的全局默认 |
 | 推理强度 | `"reasoning_effort": "low"/"medium"/"high"/"xhigh"/"max"` | 按官方文档映射：low→low（简洁思考前缀），medium/xhigh→high，high→high（默认档），max→max（最大强度前缀）。也可用环境变量 `SGLANG_DSV4_REASONING_EFFORT`（ds4f.service 已设 max；旧名 `SGLANG_REASONING_EFFORT` 仍被接受但已标记废弃） |
@@ -328,19 +245,19 @@ kt chat --host 127.0.0.1 --port 30000 --temperature 0.7 --max-tokens 2048
 ```
 
 吞吐与正确性请以 `tests/bench_dspark.py 30000` 为准（正确性 5/5 PASS、
-DSpark 单请求吞吐参考区间 32–36 tok/s，口径见 3.1）。
+DSpark 单请求吞吐参考区间 32–36 tok/s，口径澄清见 DSv4F-Opt.md §5.20）。
 
 ## 5. 排障记录
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
-| >100K 上下文 prefill OOM（513 页宽 gather 峰值 ~17GB） | indexer torch 回退按全 ctx 派生页宽 gather | `--chunked-prefill-size 512` + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（run_dspark.sh/ds4f.service 已带） |
+| >100K 上下文 prefill OOM（513 页宽 gather 峰值 ~17GB） | indexer torch 回退按全 ctx 派生页宽 gather | 旧方案 chunk 512；现栈 tilelang 索引器（`SGLANG_OPT_USE_TILELANG_INDEXER=1`）+ `expandable_segments` 下 chunk 1024 已实测安全（§5.4；1M 阶梯全档复测，§5.19）。仍 OOM 时回退 512 |
 | 生产 30000 与实验 30001 同时启动 → 反复 OOM 崩溃循环 | 两个实例挤一张 48GB 卡 | 实验前停生产（systemd stop），跑完先停实验（DSv4F-Opt.md 3 的 GPU 独占规则） |
 | 手动 kill 后服务 30s 拉起失败循环 | ExecStart 指向的 venv/路径失效，或 StartLimitBurst(500/天) 耗尽 | `systemctl reset-failed ds4f && systemctl start ds4f`（sudo） |
 | RSS 看起来持续增长 | 紧循环测量含"已 free 未归还"驻留页 | 以 malloc_trim 后读数为准（DSv4F-Opt.md 3.6） |
 | 输出损坏（复读/数学错） | 先跑 `tests/probe_dspark.py`，损坏与 ctx 相关时用 `tests/bisect_ctx.sh` 二分 | 已知两类损坏均已修复（DSv4F-Opt.md §4）；复现即新问题 |
-| 刷屏 `Received output for rid=... but the state was deleted`，且 `#running-req` 不降 | 客户端断连后请求变僵尸继续解码（§5.18 合并引入，详见 DSv4F-Opt.md §1.9） | 已修复（submodule `0960802076`）。修复前清场：`curl -X POST /abort_request -d '{"abort_all": true}'`（连所有在跑请求一起停） |
-| 升级 sglang 后启动报 `sglang-kernel ... less than 0.4.6.post1` | 上游抬高了启动期版本下限，但 PyPI 0.4.6.post1 wheel 是 CUDA 13 构建（`libcudart.so.13`，需 580+ 驱动），本机 550 驱动装不上 | fork 已放宽下限到 0.4.5（dspark-kt `3c4c5c59f`，本地 0.4.5+cu129 构建符号审计无缺口）；要真正上 0.4.6+ 需从 `python/sglang/kernels/aot` 用 CUDA 12 工具链本地构建 |
+| 刷屏 `Received output for rid=... but the state was deleted`，且 `#running-req` 不降 | 客户端断连后请求变僵尸继续解码（§5.18 合并引入，详见 DSv4F-Opt.md §1.9） | 已修复（submodule `70a56a4e0a`，线性化谱系；原 merge 谱系哈希 `0960802076` 见 §5.18 补记）。修复前清场：`curl -X POST /abort_request -d '{"abort_all": true}'`（连所有在跑请求一起停） |
+| 升级 sglang 后启动报 `sglang-kernel ... less than 0.4.6.post1` | 上游抬高了启动期版本下限，但 PyPI 0.4.6.post1 wheel 是 CUDA 13 构建（`libcudart.so.13`，需 580+ 驱动），本机 550 驱动装不上 | fork 已放宽下限到 0.4.5（`1ca9971e6c`，本地 0.4.5+cu129 构建符号审计无缺口）；要真正上 0.4.6+ 需从 `python/sglang/kernels/aot` 用 CUDA 12 工具链本地构建 |
 ## 6. 服务管理（systemd）
 
 工程根目录的 `ds4f.service` 即当前稳态 unit（**DSpark + 3F+27U + 1M ctx +
@@ -382,7 +299,7 @@ nvidia-smi --query-gpu=memory.used --format=csv               # 确认显存归�
 
 ### 7.1 改 sglang（third_party/sglang，纯 Python 包）
 
-`.venv` 里的 sglang 是 **editable 安装**——改 `third_party/sglang` 源码后
+`.venv` 里的 sglang 是 **editable 安装**（`dspark-kt-fix` 分支）——改 `third_party/sglang` 源码后
 **只需重启服务**（见 7.3），无需重装。运行期间不要切 sglang 分支；改分支=改生产代码。
 
 ### 7.2 改 kt-kernel（含 C++/CUDA 编译）
@@ -479,11 +396,12 @@ GPU 参数同样缓存到持久巨页：`third_party/sglang` 新增
 
 ## 9. DSpark / 推测解码（speculative decoding）支持情况
 
-**已支持并在生产启用。** sglang 走 `dspark-kt` 分支（third_party/sglang，
-kt CPU 专家引擎移植；2026-08-25 merge 官方 main `d06762282`（+986 提交），
+**已支持并在生产启用。** sglang 走 `dspark-kt-fix` 分支（third_party/sglang，
+kt CPU 专家引擎移植；2026-08-25 拉齐官方 main `d06762282`（+986 提交），
 带入上游三修复——`4a5d7d3` draft tokens > 4 的静默 KV/compressed-state 损坏、
-`8549cce` c128 ragged prefill 竞态、`154f0ac` DSpark+DP/EP metadata；详见
-DSv4F-Opt.md §5.18），DSpark 投机解码 + cuda graph
+`8549cce` c128 ragged prefill 竞态、`154f0ac` DSpark+DP/EP metadata；
+2026-08-26 历史线性化为 main + 27 个自研 cherry-pick（`dspark-kt-merge`
+留档，详见 DSv4F-Opt.md §5.18 补记），DSpark 投机解码 + cuda graph
 全部打通：**39.6 tok/s**（无投机基线 26.0，+52%；eager 模式 34.3）。
 `--speculative-algorithm DSPARK` 一个参数即可，0731 自带 draft（`mtp.0.*`，
 4705 个权重键；config: block_size=5, markov_rank=256, target_layers=[40,41,42]）。
@@ -502,7 +420,7 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
 - venv：仓库根 `.venv`（torch 2.11.0+cu128；flashinfer 未单独安装，
   flash-ops 由 sgl-kernel 0.4.5+cu129 本地构建提供；sgl-deep-gemm
   cu129 索引；sglang editable 指向
-  third_party/sglang@`dspark-kt`，kt-kernel 以 torch 2.11 头文件重编）。
+  third_party/sglang@`dspark-kt-fix`，kt-kernel 以 torch 2.11 头文件重编）。
 - SM89 适配：sparse 注意力走 Triton 回退、索引器 logits 走 torch 回退、
   topk v1（详见 DSv4F-Opt.md §1）。`paged_mqa_metadata` 的 smem 钳制已被
   上游 2026-08-25 合并带来的批次自适应三 kernel 重写取代（tiny/small
@@ -527,8 +445,10 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
 
 - 正确性/吞吐：`tests/bench_dspark.py`（5 提示词贪心）；快速探针：`tests/probe_dspark.py`
   （数学/翻译/重复词检测，退出码 0=干净）。
-- 长上下文：`tests/grow_probe.py`（单会话逐级加长 20/96/112/120K，含位置 ~10 埋的
-  远程暗号回忆、新数学题、重复度检测；`--stages=` 可自定义）。
+- 长上下文：`tests/ctx_ladder.py`（现行工具：确定性阶梯 + HiCache 快照续测，
+  1M 定档战役与用法见 DSv4F-Opt.md §5.19；`--u` 标注档位、`--stages=` 自定义、
+  日志与逐档结果落 /var/ctx1m）。早期 `tests/grow_probe.py`（单会话逐级加长、
+  暗号回忆/数学/重复度检查）仍可用于快速手测。
 - ctx 阈值二分：`tests/bisect_ctx.sh CTX1 CTX2 ...`（逐 ctx 重启+短探针，判
   CLEAN/CORRUPT；损坏与实际序列长度无关时尤其快）。
 - 实验实例：`run_dspark.sh`（30001 端口，CTXLEN/MAXTOK/MEMFRAC/PREFILL/
