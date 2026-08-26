@@ -343,10 +343,11 @@ DSpark 单请求吞吐参考区间 32–36 tok/s，口径见 3.1）。
 | 升级 sglang 后启动报 `sglang-kernel ... less than 0.4.6.post1` | 上游抬高了启动期版本下限，但 PyPI 0.4.6.post1 wheel 是 CUDA 13 构建（`libcudart.so.13`，需 580+ 驱动），本机 550 驱动装不上 | fork 已放宽下限到 0.4.5（dspark-kt `3c4c5c59f`，本地 0.4.5+cu129 构建符号审计无缺口）；要真正上 0.4.6+ 需从 `python/sglang/kernels/aot` 用 CUDA 12 工具链本地构建 |
 ## 6. 服务管理（systemd）
 
-工程根目录的 `ds4f.service` 即当前稳态 unit（**DSpark + 3F+35U + 512K +
-并发 2 + HiCache 手动快照模式**，2026-08-25 定型，演进过程见
-`DSv4F-Opt.md` §5.10/§5.17；`ds4f-dspark.service` 为早期 DSpark 专用
-unit，仅留档参考）。曾并存过 no-DSpark 与 DSpark 双 unit，现已合一。
+工程根目录的 `ds4f.service` 即当前稳态 unit（**DSpark + 3F+27U + 1M ctx +
+并发 2 + HiCache 手动快照模式**，2026-08-26 定型，演进过程见
+`DSv4F-Opt.md` §5.10/§5.17/§5.19）。曾并存过 no-DSpark 与 DSpark 双
+unit；合一后 DSpark 即默认配置，早期 DSpark 专用 unit
+`ds4f-dspark.service` 已删除（历史参数见 `DSv4F-Opt.md` §5.10）。
 
 均为崩溃自动拉起（30s 延迟；限流 `StartLimitIntervalSec=86400` /
 `StartLimitBurst=500`，即每天最多 500 次重启）。

@@ -143,7 +143,8 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
 
 # 本文件 = 唯一稳态 unit（DSpark + 3F+27U + 1M ctx + HiCache 手动快照模式；
 #   2026-08-25 前曾与 no-DSpark 稳态双 unit 并存（DSv4F-Opt.md §5.10），
-#   已合一，ds4f-dspark.service 留档不部署）。
+#   已合一；早期 DSpark 专用 unit ds4f-dspark.service 已于 2026-08-26
+#   删除——DSpark 已是默认且唯一的稳态配置，历史参数见 §5.10）。
 #   2026-08-25 晚 sglang 已 merge 官方 main d06762282（DSv4F-Opt.md §5.18）；
 #   2026-08-26 hicache 快照恢复截断修复（§5.19，dspark-kt-fix 7f1d2e98）。
 # cuda graph 默认开启（39.6 vs eager 34.3 tok/s）；前 2 步 verify 自动 eager 预热。

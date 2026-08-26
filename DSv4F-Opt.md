@@ -334,7 +334,7 @@ CLEAN）；长 prefill eager 在 12.9.7 下建议上线前补一轮 grow_probe�
 | 文件 | 配置 | prefill | decode | 适用 |
 |---|---|---|---|---|
 | `ds4f.service` | 无 DSpark，3F+40U（2368 专家），memfrac 0.90 | ~540（DSpark 口径实测 540.1，§5.13） | ~28-29 | temp>0 业务行为观察期 |
-| `ds4f-dspark.service`（当前在线） | DSpark + CPU draft，3F+40U（2368 专家），memfrac 0.95 | 540.1 | bench 41.29（贪心） | decode 吞吐 + prefill 兼顾 |
+| `ds4f-dspark.service`（当时在线；文件已于 2026-08-26 删除） | DSpark + CPU draft，3F+40U（2368 专家），memfrac 0.95 | 540.1 | bench 41.29（贪心） | decode 吞吐 + prefill 兼顾 |
 | （备选）同上下调 3F+28U | 长上下文 prefill OOM 时的回退（减 480 专家 ~6GB） | ~525 | 噪声内相同 | 显存余量敏感时 |
 | （历史）5F+28U | 2026-08-23 前稳态；§5.13 证明与 3F+40U 性能无差 | 539.6 | 42.51 | — |
 | （历史）DSpark GPU draft 1F+28U，memfrac 0.87 | 上一版 DSpark 稳态 | 506.9 | 47.9（accept×~1.7） | 极致 decode 步时 |
