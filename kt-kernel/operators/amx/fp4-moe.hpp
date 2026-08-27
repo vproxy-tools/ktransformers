@@ -14,6 +14,8 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include "int8-prefill.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -574,12 +576,23 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   AMX_FP4_MOE_TP() = default;
   AMX_FP4_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0) : Base(config, tp_part_idx_) {}
 
+  // NOTE: this class must stay free of data members — see Int8PrefillSidecar
+  // for why (TP_MOE allocates the BASE class; derived CRTP member access is
+  // out-of-bounds UB).
+  amx::Int8PrefillSidecar& int8_sc() { return amx::Int8PrefillSidecar::get(config_.layer_idx, tp_part_idx); }
+
   void derived_init() {
     auto& quant_config = config_.quant_config;
     if (quant_config.group_size == 0 || quant_config.zero_point) {
       throw std::runtime_error("MXFP4 MoE only supports KGroup FP4");
     }
-    printf("Creating AMX_FP4_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
+    auto& sc = int8_sc();
+    const char* env = getenv("KT_CPU_INT8_PREFILL");
+    sc.enabled = env && env[0] == '1';
+    if (const char* m = getenv("KT_CPU_INT8_MIN_M")) sc.min_m = atoi(m);
+    if (sc.min_m <= 0) sc.min_m = 64;
+    printf("Creating AMX_FP4_MOE_TP %d at numa %d (int8_prefill=%d min_m=%d)\n", tp_part_idx,
+           numa_node_of_cpu(sched_getcpu()), (int)sc.enabled, sc.min_m);
   }
 
   ~AMX_FP4_MOE_TP() = default;
@@ -608,7 +621,11 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
-    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+    auto& sc8 = amx::Int8PrefillSidecar::get(config_.layer_idx, tp_part_idx);
+    if (sc8.enabled && sc8.state.load(std::memory_order_acquire) == 2 && qlen >= sc8.min_m) {
+      amx::int8_mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, ba.get(),
+                               (do_up ? sc8.up : sc8.gate)[expert_idx].get(), bc.get(), ith, nth);
+    } else if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
       amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
     } else {
       amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
@@ -619,13 +636,109 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
 
-    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+    auto& sc8 = amx::Int8PrefillSidecar::get(config_.layer_idx, tp_part_idx);
+    if (sc8.enabled && sc8.state.load(std::memory_order_acquire) == 2 && qlen >= sc8.min_m) {
+      amx::int8_mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx].get(),
+                               sc8.down[expert_idx].get(), down_bc_[expert_idx].get(), ith, nth);
+    } else if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
       amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                           down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     } else {
       amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                           down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     }
+  }
+
+  // --- prefill-only INT8 mirror (KT_CPU_INT8_PREFILL=1) ---------------------
+  bool int8_prefill_ready(int qlen) const {
+    auto& sc = amx::Int8PrefillSidecar::get(config_.layer_idx, tp_part_idx);
+    return sc.enabled && sc.state.load(std::memory_order_acquire) == 2 && qlen >= sc.min_m;
+  }
+
+  // Build INT8 mirrors from the (already resident) MXFP4 BufferB arrays.
+  // Callable on both cold-load and hugepage-REUSED buffers.
+  void build_int8_mirror() {
+    auto& sc = int8_sc();
+    if (!sc.enabled) return;
+#if !defined(__AVX512VNNI__)
+    printf("[int8-prefill] AVX512_VNNI not compiled in; staying on FP4 path\n");
+    sc.enabled = false;
+    return;
+#else
+    int expected = 0;
+    if (!sc.state.compare_exchange_strong(expected, 1)) return;  // built/building
+
+    const int H = config_.hidden_size, I = config_.intermediate_size, E = config_.expert_num;
+    const uint64_t* p2l = (const uint64_t*)config_.physical_to_logical_map;
+    // per-matrix part sizes (gate/up: n=I,k=H; down: n=H,k=I; products equal)
+    const size_t w8_gu = (size_t)(I / 16) * (H / 32) * 512;          // = I*H
+    const size_t wx_gu = (size_t)(I / 16) * (H / 32) * 16 * 4;       // = I*H/8
+    const size_t per_mat_gu = (w8_gu + wx_gu + 63) & ~(size_t)63;
+    const size_t w8_dn = (size_t)(H / 16) * (I / 32) * 512;
+    const size_t wx_dn = (size_t)(H / 16) * (I / 32) * 16 * 4;
+    const size_t per_mat_dn = (w8_dn + wx_dn + 63) & ~(size_t)63;
+    const size_t total = (size_t)E * (2 * per_mat_gu + per_mat_dn);
+
+    // Persistent hugepage arena: one segment per (layer, numa-tp).  NOTE the
+    // arena cursor is sequential — toggling KT_CPU_INT8_PREFILL changes the
+    // [fp4][int8] interleaving and invalidates markers downstream of layer 0,
+    // forcing a one-time full cold reconversion (same as any layout change).
+    hugepage_weights::Segment seg;
+    const std::string key8 = this->hugepage_key() + "_I8V1";
+    if (hugepage_weights::enabled()) {
+      const int numa = this->hp_seg_.ptr != nullptr ? this->hp_seg_.numa : numa_node_of_cpu(sched_getcpu());
+      const std::string fps = "i8v1|" + hugepage_weights::env_or_empty("KT_HP_MODEL_STAMP") + "|" +
+                              hugepage_weights::env_or_empty("KT_HP_BACKEND_TAG") + "|" + key8 + "|" +
+                              std::to_string(per_mat_gu) + "|" + std::to_string(per_mat_dn);
+      seg = hugepage_weights::alloc(numa, key8, total, hugepage_weights::fnv1a64_str(fps), 0);
+    }
+
+    // Wire per-expert buffers: views into the segment when active, heap otherwise.
+    sc.gate.resize(E); sc.up.resize(E); sc.down.resize(E);
+    uint8_t* seg_cur = seg.ptr;
+    char map_expect[48];
+    snprintf(map_expect, sizeof(map_expect), "map=%016llx", (unsigned long long)this->hugepage_map_hash(p2l));
+    const bool reusable = seg.ptr != nullptr && seg.reused && seg.map_line == map_expect;
+
+    auto wire = [&](std::vector<std::unique_ptr<amx::Int8W8Buffer>>& v, int n, int k, size_t per_mat) {
+      for (int e = 0; e < E; e++) {
+        v[e] = std::make_unique<amx::Int8W8Buffer>();
+        if (seg_cur != nullptr) {
+          v[e]->view(n, k, seg_cur, (float*)(seg_cur + ((size_t)(n / 16) * (k / 32) * 512)));
+          seg_cur += per_mat;
+        } else {
+          v[e]->alloc(n, k);
+        }
+      }
+    };
+    wire(sc.gate, I, H, per_mat_gu);
+    wire(sc.up, I, H, per_mat_gu);
+    wire(sc.down, H, I, per_mat_dn);
+
+    if (reusable) {
+      sc.state.store(2, std::memory_order_release);
+      printf("[int8-prefill] layer %d tp %d: INT8 mirror REUSED from persistent hugepages (%.2f GiB)\n",
+             config_.layer_idx, tp_part_idx, (double)total / (1 << 30));
+      return;
+    }
+
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    auto t0 = std::chrono::steady_clock::now();
+    pool->do_work_stealing_job(
+        E, nullptr,
+        [this, &sc](int expert_idx) {
+          sc.gate[expert_idx]->build_from_fp4(*gate_bb_[expert_idx], 0, config_.intermediate_size);
+          sc.up[expert_idx]->build_from_fp4(*up_bb_[expert_idx], 0, config_.intermediate_size);
+          sc.down[expert_idx]->build_from_fp4(*down_bb_[expert_idx], 0, config_.hidden_size);
+        },
+        nullptr);
+    if (seg.ptr != nullptr) hugepage_weights::commit(seg, this->hugepage_map_hash(p2l));
+    sc.state.store(2, std::memory_order_release);
+    double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    printf("[int8-prefill] layer %d tp %d: INT8 mirror built (%d experts, %.1fs, %.2f GiB, %s)\n",
+           config_.layer_idx, tp_part_idx, E, el, (double)total / (1 << 30),
+           seg.ptr != nullptr ? "persistent hugepages" : "heap");
+#endif
   }
 
   void load_weights() {
@@ -639,6 +752,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
       printf("[hugepage_weights] layer %d tp %d: weights reused from persistent hugepages, skip conversion\n",
              config_.layer_idx, tp_part_idx);
       scan_scale_pow2();
+      build_int8_mirror();
       return;
     }
     if (this->hp_active() && config_.gate_proj == nullptr)
@@ -699,6 +813,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
     this->hugepage_commit(physical_to_logical_map);
     scan_scale_pow2();
+    build_int8_mirror();
   }
 
   // Vectorized d (float) → se (int16 exponent addend) for one weight matrix.
@@ -997,6 +1112,7 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       if (all_hp) {
         printf("[hugepage_weights] layer %d: all NUMA weights reused from persistent hugepages\n", config.layer_idx);
         this->weights_loaded = true;
+        pool->dispense_backend()->do_numa_job([this](int i) { static_cast<AMX_FP4_MOE_TP<K>*>(this->tps[i].get())->build_int8_mirror(); });
         return;
       }
     }

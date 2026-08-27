@@ -1598,3 +1598,166 @@ GPU 专家路由构造（SparseMatrix 路径）+ **CUDA graph 捕获安全**双�
   `--init-expert-location *.pt` 基础设施），是比"换层填满"大一个量级的
   下一步。分析：`python3 tests/analyze_dist.py`（tests/test_expert_dist.py
   为单测）。
+
+## 7. 权重精度审计（2026-08-27）：当前稳态部署无权重精度丢失
+
+审计对象 = 当前唯一稳态（ds4f.service：DSpark + 3F+27U + 1M ctx +
+HiCache 手动模式 + draft 专家 CPU 化 + partial Marlin）。**结论：全部
+权重类均以 checkpoint 原生精度按位消费，四条计算路径无一发生再量化，
+不存在权重精度丢失。** 依据如下，复验方法见 7.5。
+
+### 7.1 checkpoint 本身就是原生混合精度（不是 BF16 被压）
+
+0731 checkpoint（156GB / 48 分片）全量 safetensors header 盘点（按 key
+归类，逐张量读 header、不读数据）：
+
+| 权重类别 | 原生格式 | 张量数 | 体量 |
+|---|---|---|---|
+| 路由专家（target，43 层×256） | MXFP4：E2M1（I8 双 nibble 打包）+ E8M0 尺度 | 66,048 | 137.1 GiB |
+| 路由专家（draft/mtp） | 同上，原生 MXFP4 | 4,633 | 9.6 GiB |
+| dense 投影（wq/wkv/wo/shared 等） | FP8 blockwise：E4M3 + ue8m0 尺度（128×128 块） | 365+365 | 5.5 GiB |
+| dense 投影中的小张量 | BF16 | 62 | 0.3 GiB |
+| embed / lm_head / norm / 杂项 | BF16 / F32 / I64 | ~770 | ~2.6 GiB |
+
+与 config.json 互相印证：`expert_dtype: "fp4"`、`quantization_config:
+{fp8, e4m3, ue8m0, block 128×128, dynamic}`、`torch_dtype: bfloat16`。
+**因此 `--kt-method MXFP4` 是"按原生格式加载"，不是在线量化**——这是
+整条结论的地基：模型出厂即 FP4 专家 + FP8 dense + BF16 骨架。
+
+### 7.2 四条计算路径逐条核实（读码，均无损）
+
+**① CPU 常驻专家（kt-kernel + 持久巨页，权重大头）。**
+`kt-kernel/python/utils/loader.py:1185` `MXFP4SafeTensorLoader`：FP4
+nibble 按位拷贝；ue8m0→bf16 是**纯位移**（`_ue8m0_to_bf16`，`(e<<7)
+→int16→view(bf16)`——e8m0 为 8 位指数/0 尾数，恰好映射进 bf16 指数域，
+e∈[1,254] 位级无损）。内核侧 dequant 数学精确（§5.1 fold 路径指数加法，
+max_rel_err 2.7e-4 = bf16 舍入噪声；`scan_scale_pow2` 安全网兜底）。
+巨页缓存有布局指纹校验（§3.5 的 `pfp=9bcd0b02fd234216` 参考值），
+模型/config 变更自动失效。
+
+**② GPU 常驻专家（3 整层 + 27/层，`SGLANG_V4_MARLIN_PARTIAL=1`）。**
+`third_party/sglang/.../v4_marlin_moe.py:182` `prepare_v4_mxfp4_marlin`：
+权重走 `mxfp4_marlin_repack`（jit_kernel/gptq_marlin_repack）是**纯布局
+置换**（uint8→int32 Marlin tile 序，对数值无任何运算）；尺度走
+`_swizzle_e8m0_scales` 的 `SRC_IS_E8M0` 分支 = **位直通 + 置换**（该
+函数里的取整分支只对非字节型尺度源生效，本 checkpoint 尺度均为
+E8M0 字节，不走）。计算为 W4A16：FP4 权重 × BF16 激活、FP32 归约
+（`use_fp32_reduce=True`），激活同样不重量化。
+
+**③ DSpark draft 专家 CPU 化（`SGLANG_KT_DSPARK_CPU_EXPERTS=1`，§5.11）。**
+draft 专家在 checkpoint 里原生就是 MXFP4，`draft_worker_common.py:79`
+路由进与 target 完全相同的 kt_ep CPU 引擎（`wrapper_layer_idx=1000+
+stage`，巨页 marker 与 target 层隔离）；draft 非 expert 权重原生
+FP8/BF16 留 GPU。与 ① 同路径、同无损性质。
+
+**④ dense 投影 FP8（`SGLANG_OPT_FP8_WO_A_GEMM`，environ.py 默认开）。**
+最易误判的一项：它**不做任何在线量化**，反而硬性要求 checkpoint 原生
+提供 FP8 wo_a 权重——加载期发现 `.wo_a.weight` 不是 fp8_e4m3 直接报错
+退出并提示设 0（`models/deepseek_v4.py` load_weights 开头检查）；本
+checkpoint 原生提供（7.1 实测）。开关关掉时代码才会走
+`_dequant_fp8_wo_a_streaming` 把 FP8 上转 BF16。激活侧 per-token-group
+动态量化是 checkpoint 自带 `activation_scheme: "dynamic"` 原生方案，
+属激活精度、非权重精度。lm_head/embedding 原生 BF16 按 BF16 计算
+（`SGLANG_KT_FP8_LMHEAD` 未设，见 7.3）。
+
+### 7.3 已知"会丢精度"的开关确认未启用
+
+ds4f.service 逐一核对：`SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD`（=1 会
+静默丢 rsf=1.5）与 `SGLANG_KT_FP8_LMHEAD`（stash 数据竞争、重建误差
+~20×）均未设置——与 §4 审计结论、DSv4Flash.md 10 的禁用纪律一致。
+
+### 7.4 唯一理论边缘点已实测排除：ue8m0 零/NaN 字节
+
+CPU 路径 ue8m0→bf16 位移转换中，e=0（2⁻¹²⁷，低于 bf16 normal 范围）
+会冲成 +0、e=255（NaN）成 +inf——这是全部路径里唯一的理论损失点
+（GPU 侧 ② 的尺度是位直通，连这个边缘都没有）。抽样首/中/尾 3 个分片
+（00001/00025/00048）共 1,552 个尺度张量、约 403MB 字节：**值域全部
+落在 [115,126]（即 2⁻¹²~2⁻¹），0x00/0xFF 出现 0 次**——边缘情况在
+本 checkpoint 不存在。
+
+> 复验脚注：safetensors header 的 `data_offsets` 是 **[start, end]**，
+> 长度要取 `end-start`。直接拿 `end` 当长度会读进相邻张量数据，得到
+> 伪分布（首次全量扫描即栽在此，读出 273GB 假象后已纠正）。全量扫描
+> 与生产抢 NVMe 较慢，本审计用抽样；如需全量闭环，服务空闲时段跑
+> 同逻辑 48 分片即可。
+
+### 7.5 与"权重精度"无关、但容易被混进来的事项
+
+- **KV cache 为 FP8/DSA 压缩**（~7.7KB/token，§5.8）：架构原生缓存
+  压缩，不是权重损失；
+- tilelang 索引器 / FP8 MQA logits torch 回退 / 稀疏注意力 Triton
+  回退（§1）：SM89 上的**同数学内核替换**，非精度变更，均有
+  probe/bench/ctx_ladder 正确性门槛背书；
+- GPU（Marlin FP32 归约）与 CPU（bf16 累加序）专家舍入路径天然不同：
+  跨路径数值差异，不是权重损失（两边对同一 FP4 权重的 dequant 均精确）。
+
+**复验方法**（改动任何加载/打包代码后建议重跑）：(a) 7.1 的 header
+dtype 盘点（纯读 header，秒级）；(b) 7.4 的尺度字节抽样；(c)
+`tests/hp_weight_check.py` 双遍冷/热（指纹校验，§3.5）；(d)
+`tests/probe_dspark.py` + `bench_dspark.py` 正确性门槛。
+
+## 8. CPU 侧 prefill-only INT8（VNNI）实验实现（2026-08-27）：性能中性，默认关闭
+
+### 8.1 是什么
+
+`kt-kernel` 内的实验性双格式路径（**默认关闭**，生产恒走 MXFP4）：内存中
+同时保留 MXFP4 权重（decode/verify 不变）与一份 **INT8 镜像**（u8 偏置码
+`code=2×e2m1值+128`，VPDPBUSD u8×s8 布局 + 每 16-lane `2^(e-1)` 尺度向量），
+prefill 大批次（`qlen ≥ KT_CPU_INT8_MIN_M`，默认 64）时 GEMM 走 VNNI，
+小批次走原 FP4 内核。权重转换**精确**；唯一数值变化是 prefill 路径激活
+逐 32 组动态 INT8 量化（W4A8），实测层输出 max_rel_err 7.8e-4、
+probe CLEAN / bench 5/5 / 5 类真实问答全对（§7 审计结论对 decode 侧
+逐比特不变）。
+
+- 代码：`kt-kernel/operators/amx/int8-prefill.hpp`（镜像 buffer / 量化
+  staging / VNNI GEMM）+ `fp4-moe.hpp`（dispatch + 三条加载路径挂构建钩子）；
+- 开关：`KT_CPU_INT8_PREFILL=1`（建镜像并启用）、`KT_CPU_INT8_MIN_M`
+  （默认 64）；不设即零行为差异、零内存开销；
+- 巨页：镜像可驻持久巨页（每层每 tp 一个 segment，key `L{...}_I8V1`，
+  冷转换 + REUSED 复用链均已实测；池需求 +138.6 GiB/节点，node0 用至
+  251/300、node1 315/364）。arena 不可用时自动回退堆分配。
+
+### 8.2 性能结论：三级证据，无提升（也无损失）
+
+| 层级 | 条件 | INT8 vs FP4 |
+|---|---|---|
+| 独立微基准（AVX512 流式 GEMM，48 核） | 均匀 m=24、寄存器分块 | **2.25×**（dpbf16 63.8 vs VNNI 122.5 MAC/cyc，指令级 1.92×） |
+| 真实内核层基准（bench_moe_sweep 系，M=1024） | 均匀 / 偏斜路由 / DRAM 背景负载 / int8↔fp4 相位交替 | **中性**（38-46ms 带，±2-4%） |
+| 服务端 100K 上下文冷跑（99023 token，多轮） | 堆镜像 / 巨页镜像 | **中性**（197.9-201.7s vs FP4 197.9-200.7s，±2%） |
+
+结论：指令吞吐的优势在 in-situ 被非 GEMM 相位与负载形态吃平——与
+§5.13（放置扫描）同构：**CPU MoE 工作量/形态的变化不转化为整层/整栈
+墙上时间**。方案保留为实验实现：数值/基建（双巨页格式、秒级复用）
+全部就绪，环境变量即开，但**无性能收益，生产保持关闭**。
+
+### 8.3 方法论教训：一次"−32% 回归"的证伪（缓存污染基线）
+
+排查中曾测得"INT8 使 100K prefill 慢 32%（199-202s vs 150.8s）"并据此
+误判搁置。逐项排除（NUMA=0 miss、内存压力、路由偏斜、DRAM 拐点、相位
+交替、碎片、pinned 拷贝、GPU 时钟、JIT 热身、换回原始 .so 复测）后
+真相：**150.8s 基线被 radix 前缀缓存污染**——此前一版 59K token 的失败
+测试与 99K prompt 前 ~59K token 逐字相同，基线吃了前缀命中；而所有
+~200s 冷跑恰为 §5.19 文档在 100K 档的历史值（496-502 tok/s）。同
+prompt 立即重跑 1.4s 完成实锤机制。两个教训入库：
+
+1. **对照基线必须确认 radix 未命中**：usage 的缓存字段名随 sglang 版本
+   变化，本仓测试脚本若显示 `cached=0` 不可信——同 prompt 重跑秒级完成
+   即为命中（本日 ctx100k 临时脚本已栽过；`tests/ctx_ladder.py` 的
+   usage 解析建议复核）；防污染手段 = prompt 首部加唯一运行标识；
+2. 层级相位插桩（`moe_base.hpp` 的 `FORWARD_TIME_PROFILE`，默认注释）
+   + journald 行级时间戳可以把"MoE 内/MoE 外"切开，是这类排查的
+   快速定界工具（本日实测：MoE 31.6ms/层全程健康，回归在 MoE 之外）。
+
+### 8.4 运维 runbook（如需开启实验）
+
+1. 切换 `KT_CPU_INT8_PREFILL` 会改变巨页 arena 的 cursor 交错
+   （`[fp4]×41` ↔ `[fp4][int8]×41`），**双向都需**先清池再冷转：
+   `sudo rm -rf /var/lib/kt-hugepage-weights /dev/hugepages/kt_weights`，
+   重建 node 子目录并 chown（§8 老坑：目录必须 root 先建），重启后
+   一次性全量冷转（~3min），此后双格式均 REUSED（135s 就绪）；
+2. 开启时 RSS 不变（镜像驻池），巨页池占用 +138.6 GiB/节点（余 ~49 GiB）；
+3. 附带发现（未修）：`moe_base.hpp` 的 `TP_MOE<AMX_MOE_BASE<T,Derived>>`
+   特化实例化 `TP_MOE_Common` 时未传 `Concrete=Derived`，`tps[i]` 实际
+   按基类分配——CRTP 访问派生数据成员为越界 UB。现存各类恰好无数据
+   成员故未爆；本实验用 sidecar 注册表规避。上游修复 = 特化处补传
+   `Derived`，需全后端回归后单独提交。
