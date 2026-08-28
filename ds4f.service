@@ -67,6 +67,14 @@ Environment=SGLANG_KT_DSPARK_CPU_EXPERTS=1
 # node0 251/300、node1 315/364 放得下）。回退开关：置 0 或删除本行
 #（注意：切换后需清巨页池冷转，runbook 见 DSv4F-Opt.md §8.4）。
 Environment=KT_CPU_INT8_PREFILL=1
+# decode 相位减少激活专家（DSv4F-Opt.md §9，2026-08-28 实测定型）：decode/verify
+# 批（<64 token）对 MoE 层 3-20 只激活 top-4 路由专家（0-2 hash 层与 21-42
+# 不变；prefill 全层保持 top-6）。实测 bench_dspark 36.8→40.8 tok/s（+10%），
+# probe CLEAN / qa 19/19 / prefill 47K 829 tok/s 无回归。回退开关：删除本行
+# 并重启。范围/k 可调：SGLANG_KT_DECODE_TOPK_LAYERS / _K（默认 4）；
+# 注意与 SGLANG_KT_DECODE_GPU_CAP_HALF 不要同开（叠加无收益且有边缘题
+# 回归，§9.1-9.3）。
+Environment=SGLANG_KT_DECODE_TOPK_LAYERS=3-20
 # DSpark 上下文上限：batch 内任一请求上下文达到该值后整 batch 退化为普通
 # decode（DSpark >256K 输出不稳定，DSv4F-Opt.md §5.17；0=永不禁用，
 # 默认 262144）。【当前置 0：门控关闭，长上下文也跑 DSpark】

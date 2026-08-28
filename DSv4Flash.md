@@ -88,9 +88,9 @@ kt doctor    # 应全部"正常"，kt-kernel 显示 v0.6.4
 ### 3.1 本机调优配置（DSpark 投机解码 + cuda graph，日常使用）
 
 生产使用 DSpark 投机解码栈（sglang `dspark-kt-fix` 分支，详见第 9 节）。
-**当前稳态（2026-08-26 定型）：3F+27U + 1M 上下文 + 并发 2 + HiCache
-手动快照模式**，与仓库根 `ds4f.service` 完全一致（各 env 的注释、回退
-开关、显存/池测算原始记录都在该文件与 DSv4F-Opt.md §5.14/§5.17）：
+**当前稳态（2026-08-28 更新）：3F+27U + 1M 上下文 + 并发 2 + HiCache
+手动快照模式 + decode top-4@3-20**，与仓库根 `ds4f.service` 完全一致（各 env 的注释、回退
+开关、显存/池测算原始记录都在该文件与 DSv4F-Opt.md §5.14/§5.17/§9）：
 
 ```bash
 cd $KT_ROOT
@@ -122,6 +122,10 @@ export SGLANG_KT_DSPARK_CPU_EXPERTS=1
 # CPU prefill INT8(VNNI) 镜像（分块内核，47K prefill +55%；decode 比特不变；
 # 切换需清巨页池冷转，runbook 见 DSv4F-Opt.md §8.4/§8.5）
 export KT_CPU_INT8_PREFILL=1
+# decode 相位减少激活专家（2026-08-28 定型，DSv4F-Opt.md §9）：decode/verify
+# 批对 MoE 层 3-20 只激活 top-4（0-2/21-42 与 prefill 不变），decode +10%；
+# 实测与回退开关见 §9.4；勿与 SGLANG_KT_DECODE_GPU_CAP_HALF 同开
+export SGLANG_KT_DECODE_TOPK_LAYERS=3-20
 # DSpark 长上下文门控：0=关闭（>256K 已随上游 4a5d7d3 修复验证干净，
 # 见 DSv4F-Opt.md §5.17/§5.18；要保险丝可设 262144）
 export SGLANG_DSPARK_MAX_CTX=0

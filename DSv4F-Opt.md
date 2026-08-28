@@ -2099,3 +2099,9 @@ qa 19/19 的配置也只是"没翻到",不等于零风险。选范围应按速�
 (3-20)+ 业务质量观察定,而非试图用小范围换安全。
 
 生产维持全 6(不开实验参数)。
+
+**生产启用(2026-08-28 23:31)**:ds4f.service 加
+`SGLANG_KT_DECODE_TOPK_LAYERS=3-20`(注释含回退与禁组合说明),
+DSv4Flash.md §3.1 同步。重启后验证:启动日志 `[decode-topk] enabled
+... 18 layers`、巨页 REUSED、probe CLEAN、qa 19/19、bench 40.53 tok/s
+(与实验批次一致)。
