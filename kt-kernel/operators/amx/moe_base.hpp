@@ -451,6 +451,7 @@ class AMX_MOE_BASE {
             __m512 x0 = _mm512_setzero_ps();
             __m512 x1 = _mm512_setzero_ps();
             for (int j = 0; j < k; j++) {
+              if (expert_ids[i * k + j] < 0) continue;  // slot owned by the GPU side
               if (config_.should_skip_expert(expert_ids[i * k + j])) {
                 continue;
               }
@@ -656,6 +657,7 @@ class AMX_MOE_BASE {
       __m512 x0 = _mm512_setzero_ps();
       __m512 x1 = _mm512_setzero_ps();
       for (int j = 0; j < k; j++) {
+        if (expert_ids[j] < 0) continue;  // slot owned by the GPU side
         if (config_.should_skip_expert(expert_ids[j])) {
           continue;
         }

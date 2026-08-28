@@ -232,6 +232,7 @@ class AVX2_MOE_BASE {
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < qlen; i++) {
       for (int j = 0; j < k; j++) {
+        if (expert_ids[i * k + j] < 0) continue;  // slot owned by the GPU side
         if (config_.should_skip_expert(expert_ids[i * k + j])) {
           continue;
         }
@@ -306,6 +307,7 @@ class AVX2_MOE_BASE {
     // Copy input to per-expert buffers
     direct_or_pool(qlen, [&](int i) {
       for (int j = 0; j < k; j++) {
+        if (expert_ids[i * k + j] < 0) continue;  // slot owned by the GPU side
         if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
         memcpy(m_local_input_ptr_[expert_ids[i * k + j]] + m_local_pos_[i][j] * config_.hidden_size,
                (ggml_bf16_t*)input + i * config_.hidden_size, sizeof(ggml_bf16_t) * config_.hidden_size);
@@ -372,6 +374,7 @@ class AVX2_MOE_BASE {
             __m256 x0 = _mm256_setzero_ps();
             __m256 x1 = _mm256_setzero_ps();
             for (int j = 0; j < k; j++) {
+              if (expert_ids[i * k + j] < 0) continue;  // slot owned by the GPU side
               if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
               __m256 weight = _mm256_set1_ps(weights[i * k + j]);
               __m256 d0, d1;
@@ -396,6 +399,7 @@ class AVX2_MOE_BASE {
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < k; i++) {
+      if (expert_ids[i] < 0) continue;  // slot owned by the GPU side
       if (config_.should_skip_expert(expert_ids[i])) continue;
       m_expert_id_map_[activated_expert] = expert_ids[i];
       m_local_pos_[0][i] = 0;
@@ -515,6 +519,7 @@ class AVX2_MOE_BASE {
       __m256 x0 = _mm256_setzero_ps();
       __m256 x1 = _mm256_setzero_ps();
       for (int j = 0; j < k; j++) {
+        if (expert_ids[j] < 0) continue;  // slot owned by the GPU side
         if (config_.should_skip_expert(expert_ids[j])) continue;
         __m256 weight = _mm256_set1_ps(weights[j]);
         __m256 d0, d1;
