@@ -24,6 +24,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <vector>
 
 #include "la/amx_buffers.hpp"  // BufferBInt4KGroupImpl
@@ -106,6 +107,7 @@ struct Int8W8Buffer {
 // ----------------------------------------------------------------------------
 struct Int8PrefillSidecar {
   std::vector<std::unique_ptr<Int8W8Buffer>> gate, up, down;
+  std::vector<std::unique_ptr<struct Int8ActBuf>> actbuf;  // per-expert shared quantized activations
   std::atomic<int> state{0};  // 0=none, 1=building, 2=built
   bool enabled = false;
   int min_m = 64;
@@ -124,27 +126,38 @@ struct Int8PrefillSidecar {
 };
 
 // ----------------------------------------------------------------------------
-// Per-thread staging: quantize permuted bf16 rows -> s8 codes + fp32 group
-// scales + int32 group sums (zero-point correction needs 128*sumA).
+// Per-expert SHARED quantized activations: s8 codes + fp32 group scales +
+// int32 group sums (zero-point correction needs 128*sumA).  Filled by a
+// dedicated quant pre-pass job (row-split across threads) ahead of the GEMM
+// job — replacing the original per-thread staging, where every one of the
+// nth GEMM threads redundantly quantized all m rows (and gate/up quantized
+// the same input twice).  gate/up and down REUSE the same slot; the job
+// boundary between phases provides the isolation.
 // ----------------------------------------------------------------------------
-struct Int8ActStaging {
-  std::vector<int8_t> codes;   // [row][k]   (permuted position order)
-  std::vector<float> scale;    // [row][k/32]
-  std::vector<int32_t> suma;   // [row][k/32]
-  int rows = 0, k = 0;
+struct Int8ActBuf {
+  std::vector<int8_t> codes;   // [row][stride]  (permuted position order)
+  std::vector<float> scale;    // [row][stride/32]
+  std::vector<int32_t> suma;   // [row][stride/32]
+  int cap_rows = 0, stride = 0;  // capacity (row stride)
+  int m = 0, k = 0;              // active shape for the current phase
+  std::mutex mu;
 
-  void ensure(int m, int k_) {
-    if (m > rows || k_ != k) {
-      rows = std::max(m, rows); k = k_;
-      codes.resize((size_t)rows * k);
-      scale.resize((size_t)rows * (k / 32));
-      suma.resize((size_t)rows * (k / 32));
+  void ensure(int m_, int k_) {
+    std::lock_guard<std::mutex> lk(mu);  // growth reallocates; first callers race
+    m = m_; k = k_;
+    if (m > cap_rows || k > stride) {
+      cap_rows = std::max(m, cap_rows);
+      stride = std::max(k, stride);
+      codes.resize((size_t)cap_rows * stride);
+      scale.resize((size_t)cap_rows * (stride / 32));
+      suma.resize((size_t)cap_rows * (stride / 32));
     }
   }
 
   // Quantize one row (permuted positions; group = 32 consecutive positions).
   inline void quant_row(const ggml_bf16_t* src, int row) {
     const int kgs = k / 32;
+    const int skgs = stride / 32;  // scale/suma row stride tracks capacity, not active k
     for (int g = 0; g < kgs; g++) {
       __m512 f0, f1;
       avx512_32xbf16_to_32xfp32((__m512i*)(src + (size_t)g * 32), &f0, &f1);
@@ -152,25 +165,40 @@ struct Int8ActStaging {
       float amax = _mm512_reduce_max_ps(_mm512_max_ps(af0, af1));
       if (amax < 1e-12f) amax = 1e-12f;
       const float s = amax / 127.0f;
-      scale[(size_t)row * kgs + g] = s;
+      scale[(size_t)row * skgs + g] = s;
       const __m512 inv = _mm512_set1_ps(1.0f / s);
       __m512i q0 = _mm512_cvtps_epi32(_mm512_mul_ps(f0, inv));
       __m512i q1 = _mm512_cvtps_epi32(_mm512_mul_ps(f1, inv));
       q0 = _mm512_min_epi32(_mm512_max_epi32(q0, _mm512_set1_epi32(-127)), _mm512_set1_epi32(127));
       q1 = _mm512_min_epi32(_mm512_max_epi32(q1, _mm512_set1_epi32(-127)), _mm512_set1_epi32(127));
       const __m256i packed = _mm256_set_m128i(_mm512_cvtepi32_epi8(q1), _mm512_cvtepi32_epi8(q0));
-      _mm256_storeu_si256((__m256i*)(codes.data() + (size_t)row * k + (size_t)g * 32), packed);  // vector heap ptr: 16B-aligned only
-      suma[(size_t)row * kgs + g] = _mm512_reduce_add_epi32(q0) + _mm512_reduce_add_epi32(q1);
+      _mm256_storeu_si256((__m256i*)(codes.data() + (size_t)row * stride + (size_t)g * 32), packed);
+      suma[(size_t)row * skgs + g] = _mm512_reduce_add_epi32(q0) + _mm512_reduce_add_epi32(q1);
     }
+  }
+
+  // Row range [ith/nth) of a parallel pre-pass; row_ptr(r) returns the
+  // permuted bf16 source row.
+  template <typename RowFn>
+  void quant_rows(RowFn&& row_ptr, int ith, int nth) {
+    const int r0 = (int)((long long)m * ith / nth);
+    const int r1 = (int)((long long)m * (ith + 1) / nth);
+    for (int r = r0; r < r1; r++) quant_row(row_ptr(r), r);
   }
 };
 
 // ----------------------------------------------------------------------------
-// GEMM: [m x k] bf16 activations x [n x k] INT8 mirror -> [m x n] fp32.
-// ith/nth split over 16-lane n-tiles.  m rows staged per thread.
+// GEMM: pre-quantized [m x k] s8 activations x [n x k] INT8 mirror -> [m x n]
+// fp32.  ith/nth split over 16-lane n-tiles.
+//
+// Register-blocked over ROWS tokens (weight-stationary inner loop): each
+// 512B weight group load feeds ROWS independent VPDPBUSD chains, which both
+// hides the dpbusd latency and cuts L2 weight re-reads by ROWSx — the naive
+// row-at-a-time variant was L2-bandwidth/latency bound and measured no faster
+// than the FP4 kernel despite VNNI's 2x instruction-level advantage.
 // ----------------------------------------------------------------------------
-template <typename KA, typename KC>
-void int8_mat_mul_kgroup(int m, int n, int k, BufferABF16Impl<KA>* ba, Int8W8Buffer* wb,
+template <typename KC>
+void int8_mat_mul_kgroup(int m, int n, int k, const Int8ActBuf* act, Int8W8Buffer* wb,
                          BufferCReduceImpl<KC>* bc, int ith, int nth) {
   const int tiles = wb->tiles, kgs = wb->kgs;
   int t_per = (tiles + nth - 1) / nth;
@@ -178,32 +206,57 @@ void int8_mat_mul_kgroup(int m, int n, int k, BufferABF16Impl<KA>* ba, Int8W8Buf
   const int t_end = std::min(t_start + t_per, tiles);
   if (t_start >= t_end) return;
 
-  static thread_local Int8ActStaging stage;
-  stage.ensure(m, k);
-  for (int r = 0; r < m; r++)
-    stage.quant_row((const ggml_bf16_t*)ba->get_submat(m, k, r, 0), r);
-
-  for (int r = 0; r < m; r++) {
-    const int8_t* arow = stage.codes.data() + (size_t)r * k;
-    const float* ascale = stage.scale.data() + (size_t)r * kgs;
-    const int32_t* asum = stage.suma.data() + (size_t)r * kgs;
+  const int stride = act->stride, skgs = act->stride / 32;
+  constexpr int MB = 8;
+  // ROWS is instantiated 1..MB — same reasoning as the FP4 fold kernel: a
+  // runtime row bound keeps the token loop rolled and loses the blocking win.
+  auto tile_rows = [&](auto rows_ct, int m_pos) {
+    constexpr int ROWS = decltype(rows_ct)::value;
+    const int8_t* arow[ROWS];
+    const float* asc[ROWS];
+    const int32_t* asum[ROWS];
+    for (int r = 0; r < ROWS; r++) {
+      arow[r] = act->codes.data() + (size_t)(m_pos + r) * stride;
+      asc[r] = act->scale.data() + (size_t)(m_pos + r) * skgs;
+      asum[r] = act->suma.data() + (size_t)(m_pos + r) * skgs;
+    }
     for (int t = t_start; t < t_end; t++) {
       const uint8_t* wbase = wb->w8 + (size_t)t * kgs * 512;
       const float* wexp = wb->wexp + (size_t)t * kgs * 16;
-      __m512 accf = _mm512_setzero_ps();
+      __m512 accf[ROWS];
+      for (int r = 0; r < ROWS; r++) accf[r] = _mm512_setzero_ps();
       for (int g = 0; g < kgs; g++) {
-        __m512i acc = _mm512_setzero_si512();
-        const int8_t* ag = arow + (size_t)g * 32;
+        __m512i acci[ROWS];
+        for (int r = 0; r < ROWS; r++) acci[r] = _mm512_setzero_si512();
+        const uint8_t* wg = wbase + (size_t)g * 512;
         for (int i = 0; i < 8; i++) {
-          __m512i w = _mm512_load_si512((const __m512i*)(wbase + (size_t)g * 512 + i * 64));
-          __m512i a = _mm512_set1_epi32(*(const int*)(ag + i * 4));
-          acc = _mm512_dpbusd_epi32(acc, w, a);
+          __m512i w = _mm512_load_si512((const __m512i*)(wg + i * 64));
+#pragma GCC unroll 8
+          for (int r = 0; r < ROWS; r++)
+            acci[r] =
+                _mm512_dpbusd_epi32(acci[r], w, _mm512_set1_epi32(*(const int*)(arow[r] + (size_t)g * 32 + i * 4)));
         }
-        __m512 f = _mm512_cvtepi32_ps(_mm512_sub_epi32(acc, _mm512_set1_epi32(128 * asum[g])));
-        accf = _mm512_fmadd_ps(f, _mm512_mul_ps(_mm512_load_ps(wexp + (size_t)g * 16),
-                                                _mm512_set1_ps(ascale[g])), accf);
+        const __m512 wex = _mm512_load_ps(wexp + (size_t)g * 16);
+#pragma GCC unroll 8
+        for (int r = 0; r < ROWS; r++) {
+          __m512 f = _mm512_cvtepi32_ps(_mm512_sub_epi32(acci[r], _mm512_set1_epi32(128 * asum[r][g])));
+          accf[r] = _mm512_fmadd_ps(f, _mm512_mul_ps(wex, _mm512_set1_ps(asc[r][g])), accf[r]);
+        }
       }
-      _mm512_storeu_ps(bc->get_submat(m, n, r, t * 16), accf);
+      for (int r = 0; r < ROWS; r++)
+        _mm512_storeu_ps(bc->get_submat(m, n, m_pos + r, t * 16), accf[r]);
+    }
+  };
+  for (int m_pos = 0; m_pos < m; m_pos += MB) {
+    switch (std::min(MB, m - m_pos)) {
+      case 8: tile_rows(std::integral_constant<int, 8>{}, m_pos); break;
+      case 7: tile_rows(std::integral_constant<int, 7>{}, m_pos); break;
+      case 6: tile_rows(std::integral_constant<int, 6>{}, m_pos); break;
+      case 5: tile_rows(std::integral_constant<int, 5>{}, m_pos); break;
+      case 4: tile_rows(std::integral_constant<int, 4>{}, m_pos); break;
+      case 3: tile_rows(std::integral_constant<int, 3>{}, m_pos); break;
+      case 2: tile_rows(std::integral_constant<int, 2>{}, m_pos); break;
+      default: tile_rows(std::integral_constant<int, 1>{}, m_pos); break;
     }
   }
 }

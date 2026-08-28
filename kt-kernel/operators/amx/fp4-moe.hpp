@@ -623,7 +623,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
     auto& sc8 = amx::Int8PrefillSidecar::get(config_.layer_idx, tp_part_idx);
     if (sc8.enabled && sc8.state.load(std::memory_order_acquire) == 2 && qlen >= sc8.min_m) {
-      amx::int8_mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, ba.get(),
+      amx::int8_mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, sc8.actbuf[expert_idx].get(),
                                (do_up ? sc8.up : sc8.gate)[expert_idx].get(), bc.get(), ith, nth);
     } else if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
       amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
@@ -638,7 +638,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
     auto& sc8 = amx::Int8PrefillSidecar::get(config_.layer_idx, tp_part_idx);
     if (sc8.enabled && sc8.state.load(std::memory_order_acquire) == 2 && qlen >= sc8.min_m) {
-      amx::int8_mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, down_ba_[expert_idx].get(),
+      amx::int8_mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, sc8.actbuf[expert_idx].get(),
                                sc8.down[expert_idx].get(), down_bc_[expert_idx].get(), ith, nth);
     } else if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
       amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
@@ -653,6 +653,33 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   bool int8_prefill_ready(int qlen) const {
     auto& sc = amx::Int8PrefillSidecar::get(config_.layer_idx, tp_part_idx);
     return sc.enabled && sc.state.load(std::memory_order_acquire) == 2 && qlen >= sc.min_m;
+  }
+
+  // Quant pre-pass hooks (driven by forward_prefill's dedicated jobs): fill the
+  // per-expert shared Int8ActBuf with a row range.  gate/up share one buffer
+  // (same input); down reuses it after the gate_up job boundary.
+  void do_int8_quant_gate_up(int expert_idx, int ith, int nth) {
+    auto& sc = amx::Int8PrefillSidecar::get(config_.layer_idx, tp_part_idx);
+    const int m = m_local_num_[expert_idx];
+    auto* buf = sc.actbuf[expert_idx].get();
+    buf->ensure(m, config_.hidden_size);
+    buf->quant_rows(
+        [&](int r) {
+          return (const ggml_bf16_t*)gate_up_ba_[expert_idx]->get_submat(m, config_.hidden_size, r, 0);
+        },
+        ith, nth);
+  }
+
+  void do_int8_quant_down(int expert_idx, int ith, int nth) {
+    auto& sc = amx::Int8PrefillSidecar::get(config_.layer_idx, tp_part_idx);
+    const int m = m_local_num_[expert_idx];
+    auto* buf = sc.actbuf[expert_idx].get();
+    buf->ensure(m, config_.intermediate_size);
+    buf->quant_rows(
+        [&](int r) {
+          return (const ggml_bf16_t*)down_ba_[expert_idx]->get_submat(m, config_.intermediate_size, r, 0);
+        },
+        ith, nth);
   }
 
   // Build INT8 mirrors from the (already resident) MXFP4 BufferB arrays.
@@ -695,6 +722,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
     // Wire per-expert buffers: views into the segment when active, heap otherwise.
     sc.gate.resize(E); sc.up.resize(E); sc.down.resize(E);
+    sc.actbuf.resize(E);
+    for (int e = 0; e < E; e++) sc.actbuf[e] = std::make_unique<amx::Int8ActBuf>();
     uint8_t* seg_cur = seg.ptr;
     char map_expect[48];
     snprintf(map_expect, sizeof(map_expect), "map=%016llx", (unsigned long long)this->hugepage_map_hash(p2l));

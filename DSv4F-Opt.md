@@ -1348,6 +1348,21 @@ ds4f`，或 kill 主进程靠 systemd 30s 后拉起、注意 StartLimitBurst 预
 - **通过分界**：M=1 落在历史 ±5% 内 = 机器/内核健康；显著偏高先查负载再查回归
   （对照 jsonl 里最近记录的 commit 定位改动）。
 
+### 3.9 `tests/qa_battery.py` —— 答题正确性电池（数学/逻辑/常识）
+
+- **功能**：19 题硬校验（数学×6 / 逻辑×5 / 常识×7 / 长 prompt 阅读理解×2），
+  贪心解码、逐题核对期望答案子串（含同义答案放宽）。最后两题 prompt ~200
+  token，专门跨过 INT8 prefill 的 `qlen>=64` 触发线，校验 INT8 路径对
+  prompt 内容的保真（答案为文中嵌入的数字）。
+- **前提**：目标端口有活的 sglang 实例（生产或实验均可）。
+- **执行**：`python3 tests/qa_battery.py [port]`（默认 30000）。~2-4 分钟
+  （两题走 thinking=true，略慢）。
+- **清理**：无需。
+- **解读**：逐题 `[cat] PASS/FAIL => 答案前缀` + 末行 `ALL 19 PASS`。
+  **注意判读**：个别题（两步算术、三人说谎）在 thinking=off 下模型本身
+  会答错（已把这两题固定为 thinking=true）；其余失败才需当回归查。
+- **通过分界**：**退出码 0=全对，1=有错**，可接 CI/脚本。
+
 ## 4. 已修复问题档案（均已修复并验证，折叠备查）
 
 <details>
@@ -1564,6 +1579,7 @@ GPU 专家路由构造（SparseMatrix 路径）+ **CUDA graph 捕获安全**双�
 | `bench_moe_sweep.py` | CPU MoE 微基准 + 数值校验 | `.venv`（kt_kernel+torch） |
 | `kern_test.cpp` | 单核内核试验台（tile/预取扫描） | g++ -O3 -march=native |
 | `probe_dspark.py` | 快速损坏探针（退出码判断） | 系统 python3 |
+| `qa_battery.py` | 19 题数学/逻辑/常识硬校验电池（含 INT8 触发线以上长 prompt 题） | 系统 python3 |
 | `bench_dspark.py` | 5 题硬校验 + decode 吞吐 | 系统 python3 |
 | `grow_probe.py` | 长上下文分级探针（到 125K） | 系统 python3 |
 | `analyze_trace.py` | profiler trace 聚合分析 | 系统 python3 |
@@ -1696,7 +1712,7 @@ dtype 盘点（纯读 header，秒级）；(b) 7.4 的尺度字节抽样；(c)
 `tests/hp_weight_check.py` 双遍冷/热（指纹校验，§3.5）；(d)
 `tests/probe_dspark.py` + `bench_dspark.py` 正确性门槛。
 
-## 8. CPU 侧 prefill-only INT8（VNNI）实验实现（2026-08-27）：性能中性，默认关闭
+## 8. CPU 侧 prefill-only INT8（VNNI）（2026-08-27 初版中性 → 2026-08-28 分块内核 + 共享量化，生产 47K 831 tok/s 破 800）
 
 ### 8.1 是什么
 
@@ -1761,3 +1777,109 @@ prompt 立即重跑 1.4s 完成实锤机制。两个教训入库：
    按基类分配——CRTP 访问派生数据成员为越界 UB。现存各类恰好无数据
    成员故未爆；本实验用 sidecar 注册表规避。上游修复 = 特化处补传
    `Derived`，需全后端回归后单独提交。
+4. （2026-08-28 补）清池后**两个目录都要 root 重建并 chown**：
+   `/dev/hugepages/kt_weights`（数据）**和** `/var/lib/kt-hugepage-weights`
+   （标记）。只建前者会出现日志刷 `cannot create .../nodeN: Permission
+   denied` 并整体静默回落堆分配（fp4+int8 全部走堆，功能正常但重启
+   不再秒级复用）。
+
+### 8.5 分块内核重写（2026-08-28）：中性翻转为 +55% prefill，生产开启
+
+**代码级归因（review 初版实现）**：§8.2 的"指令吞吐优势被非 GEMM 相位
+吃平"结论不准确——level-2 真实内核层基准本身就是中性的，损失发生在
+内核内部，与外部相位无关。初版 `int8_mat_mul_kgroup` 的三个缺陷：
+
+1. **无 m 分块**：逐行处理（row-at-a-time），每 (row,tile,group) 是一条
+   8 指令的 VPDPBUSD 串行依赖链，权重流量无任何行间摊销；而 §8.2 跑出
+   2.25× 的独立微基准恰恰带寄存器分块——微基准与集成内核结构不一致，
+   是"微基准赢、服务端平"落差的直接原因。
+2. **量化 staging 逐线程冗余**：gate/up 的 nth=8、down 的 nth=16
+   （`N_BLOCK=256`），每个线程把全部 m 行重复量化一遍（gate 与 up 输入
+   相同还各量一次）。
+3. INT8 每线程权重切片 2× 于 FP4（~1MB），正好骑在 L2 容量线上，
+   逐行重读进一步放大 L2/L3 压力。
+
+**修法**（`int8-prefill.hpp`，仅 GEMM 一处重写）：MB=8 行 × 1 个 16-lane
+tile 的寄存器分块（weight-stationary 内层，8 条独立 dpbusd 链隐藏延迟、
+权重 L2 重读 ÷8），ROWS 1..8 编译期实例化处理尾部（与 §5.1 fold 内核同
+法）。MB=12 实测变差（16.3/28.4ms vs 14.3/21.4ms，accf+acci 共 24 个
+zmm 溢出寄存器堆），维持 MB=8。量化 staging 保持逐线程（估计残余开销
+~5%，共享化需在 work-stealing 任务间加屏障，有死锁风险，不值得）。
+
+**实测（bench_moe_sweep，tpn=24×2，E8M0 合成权重）**：
+
+| M | FP4 fold | INT8 初版 | INT8 分块 | 分块 vs FP4 |
+|---|---|---|---|---|
+| 64 | 7.84ms | — | 6.48ms | **+21%** |
+| 128 | 14.29 | — | 8.72 | **+64%** |
+| 256 | 11.85 | — | 10.53 | **+13%** |
+| 341 | 14.63 | — | 12.00 | **+22%** |
+| 512 | 20.46 | 22.48 | 14.26 | **+44%** |
+| 1024 | 38.16 | 38.59 | 21.34 | **+79%** |
+
+数值 `--check` max_rel_err=7.83e-4（与初版逐位一致的分块无关量化误差，
+PASS）。小 M 全胜 ⇒ `KT_CPU_INT8_MIN_M=64` 默认值保持不变即可（64 以下
+是 decode/verify 区间，本就不切）。
+
+**服务端 A/B**（30001 实验实例，0 GPU 专家 + DSpark，47.3K prompt，
+`--disable-radix-cache` 无缓存污染）：
+
+| 配置 | prefill 47K | decode（bench_dspark） |
+|---|---|---|
+| INT8 off | 458.0 tok/s（3 次 457.5-458.3） | 41.69 tok/s ALL PASS |
+| INT8 on | **709.3 tok/s**（3 次 708.7-709.8） | 41.42 tok/s ALL PASS，probe CLEAN |
+
+prefill **+54.9%**；decode 逐比特路径不变（吞吐差在 accept 噪声带内）。
+MoE 占 prefill ~73%（§5.8 口径），内核 1.78× × MoE 占比 ≈ 预期 +44~57%，
+与实测吻合。生产 ds4f.service 已加 `KT_CPU_INT8_PREFILL=1`。
+
+**生产配置（3F+27U + 1M ctx，30000）实测**：47K 冷 prefill（每轮
+/flush_cache 防 radix 命中；命中轮 0.55s 已丢弃）**782.1 / 784.3 tok/s**
+——对照同档历史 ~522（§5.19 阶梯 20K 档）约 **+50%**，GPU 专家稀释
+（27/256 驻留 + 3 整层）后的生产口径收益与预期一致。部署当天
+probe CLEAN、bench_dspark 36.99 ALL PASS（decode 不变）、grow_probe
+8K/96K 验证长上下文 INT8 prefill 输出。**100K 冷 prefill（生产、
+flush 后两轮冷跑一致）：101,165 token / 138.0-138.3s = 731.6/733.0
+tok/s**，对照 §8.2 时代 99K/197.9-201.7s（~496-502 tok/s）约 **+46%**。
+
+**正确性专项（2026-08-28，生产 INT8 开启状态）**：
+`tests/qa_battery.py`（新增，19 题硬校验：数学×6 / 逻辑×5 / 常识×7 /
+INT8 触发线以上长 prompt 阅读理解×2）**19/19 ALL PASS**——其中两步算术
+(17+25)×13−48 与三人说谎题在 thinking=off 下会错（546/丙），开思考后
+正确（498/乙），属 no-thinking 能力问题而非 INT8 损坏（且短 prompt
+qlen<64 根本不进 INT8 路径）；grow_probe 阶梯 **8K/96K/200K/400K 全 PASS**
+（暗号 XK-42Q7 长程回忆 + 逐级新数学题 + 重复度 dup≤1）。
+
+### 8.6 共享量化（2026-08-28 第二轮）：47K prefill 829-831 tok/s，突破 800
+
+消除 §8.5 遗留的量化 staging 冗余（gate/up 的 nth=8、down 的 nth=16 个
+GEMM 线程各自把全部 m 行重复量化，gate 与 up 同输入还各量一次）：
+
+- **结构**：每专家一块共享 `Int8ActBuf`（codes/scale/suma，capacity
+  stride 与 active k 分离，gate/up 与 down 跨 job 边界复用同一槽位）；
+  量化**搭车**既有的两个 `from_mat` job（gate_up / down，一任务一专家），
+  零新增 job 派发。moe_base 侧为 CRTP 默认空钩子（`int8_prefill_ready` /
+  `do_int8_quant_{gate_up,down}`），其它后端零开销。
+- **两轮失败迭代（留档）**：(a) 细粒度行切分 pre-pass job（每专家 16
+  任务）→ 任务派发开销主导，17.8/24.9ms 全面倒退；(b) 独立"一专家一
+  任务" pre-pass job ×2 → job 屏障吃掉节省，M=512 持平、M=1024 仅 -1.6%。
+  教训：**省重复劳动必须顺路，不能为它单独设卡**。
+- **顺带修 bug**：初版 scale/suma 行索引用 active k/32 作行宽、codes 用
+  capacity stride，down（k=2048 < stride=4096）布局错位 → 数值全崩
+  （max_rel_err 1.7e+03）；统一为 stride/32 后恢复 7.83e-04。
+
+实测（bench_moe_sweep）：M=1024 21.34→**20.4-20.7ms（-4%）**，M=512
+14.26→14.34-14.41（持平）；FP4 路径 38.2→38.5（噪声内，钩子零影响）；
+数值 `--check` 7.83e-04 PASS。服务端（生产 3F+27U，flush 后冷跑）：
+**47K 828.8/831.3 tok/s（较 §8.5 的 782-784 再 +5.9%，突破 800）**；
+**100K 771.7 tok/s（较 731.6-733.0 再 +5.3%）**；decode 36.72 ALL PASS
+不变；probe CLEAN。巨页布局未变（actbuf 驻堆），重启全程 REUSED。
+
+**decode 侧顺带实验（负面结果）**：`--speculative-dspark-block-size 7`
+（gamma 5→7，verify 窗 6→8）实测 32.67 tok/s vs 41.69（**-22%**）——
+超出 draft 训练分布，尾部位置接受率塌（accept len 2.45→~2.0，accept
+rate 0.22→0.13-0.19），加宽的 verify 全是浪费。gamma=5 维持。
+（背景：DSPARK 的 num_draft_tokens 被 `speculative_hook.py` 硬校验绑定为
+gamma+1，只能经 `--speculative-dspark-block-size` 调；draft 是单次并行
+前向 + host 侧 Markov 逐步采样，gamma 调大的代价是 draft 前向宽度、
+Markov 步数、verify 宽度三处线性增长。）

@@ -119,6 +119,9 @@ export SGLANG_V4_MARLIN_PARTIAL=1
 export SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0
 # DSpark draft 专家挪 CPU（见 §5.11，省 ~9.5GB 显存）
 export SGLANG_KT_DSPARK_CPU_EXPERTS=1
+# CPU prefill INT8(VNNI) 镜像（分块内核，47K prefill +55%；decode 比特不变；
+# 切换需清巨页池冷转，runbook 见 DSv4F-Opt.md §8.4/§8.5）
+export KT_CPU_INT8_PREFILL=1
 # DSpark 长上下文门控：0=关闭（>256K 已随上游 4a5d7d3 修复验证干净，
 # 见 DSv4F-Opt.md §5.17/§5.18；要保险丝可设 262144）
 export SGLANG_DSPARK_MAX_CTX=0
@@ -444,7 +447,8 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
 ### 9.4 验证与工具
 
 - 正确性/吞吐：`tests/bench_dspark.py`（5 提示词贪心）；快速探针：`tests/probe_dspark.py`
-  （数学/翻译/重复词检测，退出码 0=干净）。
+  （数学/翻译/重复词检测，退出码 0=干净）；答题电池：`tests/qa_battery.py`
+  （19 题数学/逻辑/常识硬校验，退出码 0=全对）。
 - 长上下文：`tests/ctx_ladder.py`（现行工具：确定性阶梯 + HiCache 快照续测，
   1M 定档战役与用法见 DSv4F-Opt.md §5.19；`--u` 标注档位、`--stages=` 自定义、
   日志与逐档结果落 /var/ctx1m）。早期 `tests/grow_probe.py`（单会话逐级加长、

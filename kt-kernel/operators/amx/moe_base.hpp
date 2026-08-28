@@ -350,9 +350,13 @@ class AMX_MOE_BASE {
     }
 #endif
 
-    direct_or_pool(activated_expert, [this](int task_id) {
+    const bool i8_quant = derived()->int8_prefill_ready(qlen);
+    direct_or_pool(activated_expert, [this, i8_quant](int task_id) {
       int expert_idx = m_expert_id_map_[task_id];
       gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
+      // INT8 prefill: shared activation quant rides inside this existing job
+      // (one task per expert, no extra job boundary); gate/up share one copy.
+      if (i8_quant) derived()->do_int8_quant_gate_up(expert_idx, 0, 1);
     });
 
 #ifdef FORWARD_TIME_PROFILE
@@ -401,9 +405,12 @@ class AMX_MOE_BASE {
 
     pool->do_work_stealing_job(
         activated_expert, nullptr,
-        [this](int task_id) {
+        [this, i8_quant](int task_id) {
           int expert_idx = m_expert_id_map_[task_id];
           down_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], 0, 1);
+          // INT8 prefill: down-GEMM input quant (shared buffer reused across
+          // the gate_up/down job boundary).
+          if (i8_quant) derived()->do_int8_quant_down(expert_idx, 0, 1);
         },
         nullptr);
 
@@ -741,6 +748,14 @@ class AMX_MOE_BASE {
   void derived_init() {
     // Default implementation does nothing - derived classes can override
   }
+
+  // ============================================================================
+  // INT8-prefill hooks (only AMX_FP4_MOE_TP overrides; see int8-prefill.hpp).
+  // Defaults keep every other backend on its original path with zero overhead.
+  // ============================================================================
+  bool int8_prefill_ready(int qlen) const { return false; }
+  void do_int8_quant_gate_up(int expert_idx, int ith, int nth) {}
+  void do_int8_quant_down(int expert_idx, int ith, int nth) {}
 
   // ============================================================================
   // Virtual points for buffer creation and size calculation

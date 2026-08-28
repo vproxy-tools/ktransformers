@@ -59,6 +59,14 @@ Environment=SGLANG_KT_GPU_EXPERTS_PREFILL_ONLY=0
 # DSpark draft（mtp.0/1/2）专家全挪 CPU（DSv4F-Opt.md §5.11）：draft GPU 占用
 # 10.37→~0.9GB，省 ~9.5GB 喂给整层；decode 步时 +1~3ms。回退开关：置 0
 Environment=SGLANG_KT_DSPARK_CPU_EXPERTS=1
+# CPU prefill INT8(VNNI) 镜像路径（2026-08-28 分块内核重写后转为生产开启，
+# DSv4F-Opt.md §8.5）：prefill qlen≥64 的 CPU 专家 GEMM 走 VNNI，47K 实测
+# 458→709 tok/s（+55%，0 GPU 专家实验实例）；decode/verify 保持 MXFP4 比特
+# 不变。权重转换精确，唯一数值变化是 prefill 激活逐 32 组动态 INT8 量化
+#（max_rel_err 7.8e-4）。内存：镜像 +138.6GiB/节点 驻持久巨页（池实测
+# node0 251/300、node1 315/364 放得下）。回退开关：置 0 或删除本行
+#（注意：切换后需清巨页池冷转，runbook 见 DSv4F-Opt.md §8.4）。
+Environment=KT_CPU_INT8_PREFILL=1
 # DSpark 上下文上限：batch 内任一请求上下文达到该值后整 batch 退化为普通
 # decode（DSpark >256K 输出不稳定，DSv4F-Opt.md §5.17；0=永不禁用，
 # 默认 262144）。【当前置 0：门控关闭，长上下文也跑 DSpark】
