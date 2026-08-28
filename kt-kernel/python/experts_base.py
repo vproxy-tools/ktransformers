@@ -80,8 +80,13 @@ class KExpertsCPUBuffer:
     """
 
     capture_bs: List = list()
+    # Keyed by (batch_size, num_experts_per_tok): the decode-phase reduced
+    # top-k experiment runs one layer with two different widths (full-k
+    # prefill vs reduced-k decode). A batch-size-only key would hand the
+    # decode-width copy_ a full-width pinned buffer (shape mismatch) or let
+    # a prefill tail evict the buffer a captured decode graph baked in.
     capture_buffers: Dict = dict()
-    temp_bs: int = 0
+    temp_key: Optional[tuple] = None
     temp_buffer: tuple = tuple()
     buffer_depth: int = 2
 
@@ -92,15 +97,16 @@ class KExpertsCPUBuffer:
 
         pin_memory = True
 
-        if batch_size in cls.capture_buffers:
-            return cls.capture_buffers[batch_size]
-        if batch_size == cls.temp_bs:
+        key = (batch_size, int(num_experts_per_tok))
+        if key in cls.capture_buffers:
+            return cls.capture_buffers[key]
+        if key == cls.temp_key:
             # The warmup (eager) run usually allocates this size already; the
             # capture run then hits this early return with the SAME instance,
             # so it must be promoted here too or the graph still bakes
             # pointers into a freeable buffer (see comment below).
             if torch.cuda.is_current_stream_capturing():
-                cls.capture_buffers[batch_size] = cls.temp_buffer
+                cls.capture_buffers[key] = cls.temp_buffer
             return cls.temp_buffer
 
         input_tensor_cpu = [
@@ -154,8 +160,8 @@ class KExpertsCPUBuffer:
         # keep it alive forever. Prefill-sized (never captured) buffers
         # still go through the one-slot temp cache.
         if batch_size in cls.capture_bs or torch.cuda.is_current_stream_capturing():
-            cls.capture_buffers[batch_size] = cur_buffer
-        cls.temp_bs = batch_size
+            cls.capture_buffers[key] = cur_buffer
+        cls.temp_key = key
         cls.temp_buffer = cur_buffer
         return cur_buffer
 
@@ -295,6 +301,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
         self.layer_idx = layer_idx
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
+        # Width of the most recent submit_forward; sync_forward re-derives the
+        # pinned buffer from it (see submit_forward).
+        self._last_submit_k = num_experts_per_tok
         self.hidden_size = hidden_size
         self.moe_intermediate_size = moe_intermediate_size
 
@@ -416,6 +425,14 @@ class BaseMoEWrapper(_MoEBase, ABC):
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         batch_size = flat_hidden_states.shape[0]
 
+        # Width comes from the live tensor, not the wrapper's configured
+        # num_experts_per_tok: the decode-phase reduced top-k experiment
+        # submits [batch, k_reduced] tensors on decode batches while prefill
+        # keeps the configured width. Remember it for sync_forward, which has
+        # no topk tensor to read.
+        k = int(topk_ids.shape[-1])
+        self._last_submit_k = k
+
         (
             input_tensor_cpu,
             immediate_experts_ids_cpu,
@@ -424,7 +441,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
             output_cpu,
             bsz_tensor_cpu,
             _output_gpu,
-        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, k)
 
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
         next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
@@ -435,7 +452,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         immediate_ids: torch.Tensor
         deferred_ids: Optional[torch.Tensor]
         if self.max_deferred_experts_per_token > 0:
-            protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
+            protected_k = min(self.num_experts_per_tok, k) - self.max_deferred_experts_per_token
 
             immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
         else:
@@ -497,7 +514,10 @@ class BaseMoEWrapper(_MoEBase, ABC):
             output_cpu,
             _bsz_tensor_cpu,
             output_gpu,
-        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+        ) = KExpertsCPUBuffer.get_buffer(
+            flat_hidden_states,
+            getattr(self, "_last_submit_k", self.num_experts_per_tok),
+        )
 
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
@@ -562,6 +582,6 @@ class BaseMoEWrapper(_MoEBase, ABC):
         to reset the buffer state or free memory.
         """
         KExpertsCPUBuffer.capture_buffers.clear()
-        KExpertsCPUBuffer.temp_bs = 0
+        KExpertsCPUBuffer.temp_key = None
         KExpertsCPUBuffer.temp_buffer = tuple()
 
