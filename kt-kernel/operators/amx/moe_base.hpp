@@ -233,6 +233,9 @@ class AMX_MOE_BASE {
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < qlen; i++) {
       for (int j = 0; j < k; j++) {
+        // Negative ids mark slots whose computation another device owns
+        // (decode-phase GPU-cap split: kept slots go to the GPU MoE).
+        if (expert_ids[i * k + j] < 0) continue;
         if (config_.should_skip_expert(expert_ids[i * k + j])) {
           continue;
         }
@@ -495,6 +498,7 @@ class AMX_MOE_BASE {
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < k; i++) {
+      if (expert_ids[i] < 0) continue;  // slot owned by the GPU side (see forward_prefill)
       if (config_.should_skip_expert(expert_ids[i])) {
         continue;
       }

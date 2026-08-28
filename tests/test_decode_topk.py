@@ -158,5 +158,75 @@ class KExpertsCPUBufferKeyTests(unittest.TestCase):
         self.assertIsNone(self.buf_cls.temp_key)
 
 
+class GpuCapHalfLogicTests(unittest.TestCase):
+    """Pure-tensor check of the SGLANG_KT_DECODE_GPU_CAP_HALF slot split:
+    keep = resident & (cumcount(resident) <= N//2); CPU ids blank kept slots
+    with -1, GPU ids blank everything else."""
+
+    def setUp(self):
+        import torch
+
+        self.torch = torch
+        torch.manual_seed(0)
+
+    def _split(self, ids, resident_mask, cap_on):
+        torch = self.torch
+        if cap_on:
+            cap = ids.shape[-1] // 2
+            rank = torch.cumsum(resident_mask.to(torch.int32), dim=1)
+            keep = resident_mask & (rank <= cap)
+        else:
+            keep = resident_mask
+        cpu_ids = torch.where(keep, torch.full_like(ids, -1), ids)
+        return keep, cpu_ids
+
+    def test_full_resident_layer_3F(self):
+        # 3F layer decode: every slot resident, N=6 -> GPU keeps 3, CPU gets 3.
+        ids = self.torch.arange(24).reshape(4, 6) % 256
+        resident = self.torch.ones_like(ids, dtype=self.torch.bool)
+        keep, cpu_ids = self._split(ids, resident, cap_on=True)
+        self.assertEqual(int(keep.sum(dim=1).min()), 3)
+        self.assertEqual(int(keep.sum(dim=1).max()), 3)
+        self.assertEqual(
+            int((cpu_ids == -1).sum(dim=1).min()), 3
+        )  # CPU computes exactly the other 3
+        # positional order: first 3 slots kept, last 3 handed back
+        self.assertTrue(bool(keep[:, :3].all()))
+        self.assertTrue(bool(~keep[:, 3:].any()))
+
+    def test_sparse_resident_layer(self):
+        # 27U layer decode, N=4, occasional resident hits: cap=2 almost never
+        # binds; handed-back count = max(resident_hits - 2, 0).
+        ids = self.torch.tensor(
+            [[5, 7, 200, 9], [5, 7, 8, 9], [300, 301, 302, 303], [1, 2, 3, 4]]
+        )
+        resident_ids = {5, 7, 300}
+        resident = self.torch.zeros_like(ids, dtype=self.torch.bool)
+        for t in range(ids.shape[0]):
+            for j in range(ids.shape[1]):
+                resident[t, j] = ids[t, j].item() in resident_ids
+        keep, cpu_ids = self._split(ids, resident, cap_on=True)
+        # row0: 2 resident hits, both kept; row1: 2 hits capped to 2 (fine);
+        # row2: 1 hit kept; row3: 0 hits
+        self.assertEqual(int(keep[0].sum()), 2)
+        self.assertEqual(int(keep[1].sum()), 2)
+        self.assertEqual(int(keep[2].sum()), 1)
+        self.assertEqual(int(keep[3].sum()), 0)
+        # row with 3 hits would bind: add one
+        ids2 = self.torch.tensor([[5, 7, 300, 9]])
+        res2 = self.torch.tensor([[True, True, True, False]])
+        keep2, cpu2 = self._split(ids2, res2, cap_on=True)
+        self.assertEqual(int(keep2.sum()), 2)  # capped at N//2 = 2
+        self.assertEqual(int((cpu2 == -1).sum()), 2)
+        self.assertEqual(int(cpu2[0, 2]), 300)  # 3rd hit handed to CPU
+
+    def test_prefill_keeps_all_resident(self):
+        ids = self.torch.arange(12).reshape(2, 6) % 256
+        resident = self.torch.ones_like(ids, dtype=self.torch.bool)
+        keep, cpu_ids = self._split(ids, resident, cap_on=False)
+        self.assertTrue(bool(keep.all()))
+        self.assertTrue(bool((cpu_ids == -1).all()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

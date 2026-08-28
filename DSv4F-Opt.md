@@ -1957,3 +1957,53 @@ FP4 with KGroup Scale`(C++ fp4-moe.hpp:1150,`gate_projs` 为空)。触发
 hybrid 3F+27U 冷转后用 0 GPU 专家 uniform 起实例)。生产 hybrid 配置
 指纹匹配走 REUSED 不受影响;临时绕法 = 用生产同款放置参数,或按 §8.4
 清池后用目标配置冷转一次。
+
+### 9.1 decode 相位 per-token GPU 承接上限(N/2)(2026-08-28,SGLANG_KT_DECODE_GPU_CAP_HALF)
+
+**功能**:decode 批次(含 verify,<`SGLANG_KT_DECODE_GPU_CAP_MIN_M`=64 token)
+每 token 的路由专家中,GPU 侧最多承接 **N//2** 个常驻命中(按 topk 位置序
+取前 N/2 个命中),其余命中(即使权重常驻 GPU)交回 CPU 侧计算——CPU 权重
+带宽与 GPU 算力各承担一半并行。prefill 批保持"命中即算"(现状)。N 取该层
+当次激活数(与 §9 decode-topk 联动:top-6 层 cap=3、top-4 层 cap=2)。
+3F 整层(层 0-2 全 256 常驻)是主要触发面(必然 6→3);27U 分裂层偶发
+(命中 ≥2/≥3 时分别被 cap 到 2/3)。
+
+**实现**(sglang `kt_ep_wrapper.py` + kt-kernel `moe_base.hpp`):
+
+- 承接所有权全部编码进 ids:GPU 侧 `mask_and_remap` 后把非 keep 位置置
+  -1(Marlin 已兼容);CPU 侧 keep 位置置 -1(C++ 两个跳过循环加负 id
+  防御,`moe_base.hpp` forward_prefill/forward_decode)。keep = 常驻命中
+  ∩ (cumsum(常驻) ≤ N//2),纯 tensor 算子,cuda graph 捕获安全。
+- **kt wrapper 的 pinned 层 mask 恒置零**(C++ 不再按层 mask 跳过,完全
+  由 -1 控制)——避免 §5.3 相位翻转的清零/恢复竞态;sglang 侧
+  `self.gpu_experts_mask` 保持真值供 remap/diag。与
+  `--kt-max-deferred-experts-per-token` 互斥(启动报错,deferred 的
+  topk 切分不识别 -1)。
+- 机制验证:单测(`tests/test_decode_topk.py` GpuCapHalfLogicTests:
+  3F 层 keep 恒 3、27U 偶发裁剪、prefill 全 keep)+ 行为证据(cap 开启
+  后场景 A decode +2.6%,即 3F 层 GPU 计算减半的体现;若 CPU 未承接
+  被踢专家,3F 层丢一半贡献会导致大面积输出损坏,实测 probe CLEAN)。
+
+**实测**(生产配置 3F+27U + DSpark + 1M ctx,30001,对照同日):
+
+| 场景 | bench_dspark(×3 稳态) | probe | qa_battery | accept |
+|---|---|---|---|---|
+| B0 基线(6 expert) | 36.76 | CLEAN | 19/19 | 2.99 |
+| C0 = 6 expert + cap | **37.75/37.69(+2.6%)** | CLEAN | **19/19** | 3.02 |
+| B1d = 4 expert(3-20) | 40.44/40.56/40.67 | CLEAN | 19/19 | 3.05 |
+| C1 = 4 expert + cap | 40.45/40.55(持平) | CLEAN | **18/19** | 3.03 |
+
+- **C0(6 expert + cap)是净收益**:+2.6% decode,全部正确性门槛通过。
+- **C1(4 expert + cap)不建议**:速度与 B1d 持平(top-4 后 27U 层命中更
+  少、cap 触发面缩小,3F 层 GPU 时间已非瓶颈),且 qa 出现 1 例稳定
+  数学回归——999×999 在 thinking=off 下答 999001(基线/A/B1d 单独均对,
+  只有两因素叠加才翻;thinking=on 可答对 998001)。定位:非计算损坏
+  (probe CLEAN、无复读/乱码、贪心稳定),是 top-4 容量削减 + cap 改变
+  3F 层数值路径(Marlin FP32 归约 ↔ CPU bf16 累加,§7.5 跨路径差异)
+  两个扰动叠加把 no-thinking 边缘数学题推过界。**(17+25)×13−48 的
+  thinking-off 必错是既有已知(§3.9),非本次引入。**
+
+**结论**:cap 单独使用(6 expert)可用且 +2.6%;与 decode-topk 叠加无
+速度收益且有边缘质量回归,不推荐组合。生产未启用;启用加
+`SGLANG_KT_DECODE_GPU_CAP_HALF=1`(与 KT_CPU_INT8_PREFILL/decode-topk
+均兼容)。
