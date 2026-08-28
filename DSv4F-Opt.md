@@ -2007,3 +2007,28 @@ hybrid 3F+27U 冷转后用 0 GPU 专家 uniform 起实例)。生产 hybrid 配�
 速度收益且有边缘质量回归,不推荐组合。生产未启用;启用加
 `SGLANG_KT_DECODE_GPU_CAP_HALF=1`(与 KT_CPU_INT8_PREFILL/decode-topk
 均兼容)。
+
+### 9.2 无 DSpark 场景对照(2026-08-28 补测)
+
+去掉 `--speculative-algorithm DSPARK`(其余生产参数不变,30001),四组
+对照(每组 bench ×3 稳态 + probe + qa_battery):
+
+| 场景 | decode tok/s | probe | qa | 备注 |
+|---|---|---|---|---|
+| N0 基线(6 expert) | 24.48/24.52 | CLEAN | 19/19 | 无投机逐 token(M=1) |
+| N1 = 6 expert + cap | 24.58/24.58 | CLEAN | 19/19 | 持平(+0.4%,噪声内) |
+| N2 = 4 expert(3-20) | 25.22/25.25 | CLEAN | 19/19 | **+3.0%** |
+| N3 = 4 expert + cap | 25.21/25.29 | CLEAN | **18/19** | 持平;999×999 off 稳定错 999001,on 对 |
+
+结论与 DSpark 场景(§9.1)一致且互补:
+
+- **cap 的收益依赖投机**:DSpark verify 窗(M=6-12)GPU Marlin 时间占
+  每步比重较大,cap 到 N/2 带来 +2.6%;无投机 M=1 时 GPU 时间可忽略,
+  cap 持平(N1)。
+- **top-4 的收益也依赖投机**:无投机 +3.0%(vs DSpark +10.3%)——
+  verify 窗 CPU MoE 时间份额大,减专家的杠杆被放大;M=1 逐步 decode
+  中 CPU MoE 份额较小。
+- **叠加回归与 DSpark 无关**:N3 与 C1(§9.1)同签名(999×999
+  thinking=off 稳定 999001、on 恢复 998001),排除投机栈交互 bug,
+  坐实"top-4 容量削减 + cap 数值路径(Marlin FP32 ↔ CPU bf16)两扰动
+  叠加把 no-thinking 边缘数学题推过界"的解释。
