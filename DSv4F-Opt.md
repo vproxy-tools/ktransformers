@@ -1883,3 +1883,77 @@ rate 0.22→0.13-0.19），加宽的 verify 全是浪费。gamma=5 维持。
 gamma+1，只能经 `--speculative-dspark-block-size` 调；draft 是单次并行
 前向 + host 侧 Markov 逐步采样，gamma 调大的代价是 draft 前向宽度、
 Markov 步数、verify 宽度三处线性增长。）
+
+## 9. decode 相位减少激活专家(top-6→top-4,可配层范围)(2026-08-28)
+
+**功能**:decode 批次(含 DSpark verify)对一段连续 MoE 层只激活每 token
+前 4 个路由专家(原来是 6);0-2 层(hash-MoE)与 21-42 层不变;prefill
+所有层走完整 top-6。默认关闭,不指定参数 = 逐比特原行为。
+
+**参数**(启动参数优先,环境变量兜底;层号 0 起、闭区间、单层 "5" 亦可):
+
+```
+--kt-decode-topk-layers "3-20"     # 或 env SGLANG_KT_DECODE_TOPK_LAYERS=3-20
+--kt-decode-topk-k 4               # 或 env SGLANG_KT_DECODE_TOPK_K(默认 4)
+# 相位阈值:batch token 数 < SGLANG_KT_DECODE_TOPK_MIN_M(默认 64,
+# 与 SGLANG_KT_GPU_EXPERTS_PREFILL_MIN 同语义)算 decode 批
+```
+
+范围含 hash 层(0-2)启动即报错(hash 路由是 token-id 查表,不能换 k);
+范围/数值格式非法同样启动即报错。DSpark draft 层(is_nextn)恒不受影响。
+生效时启动日志打一条 `[decode-topk] enabled: ...`。调试开关
+`SGLANG_KT_DECODE_TOPK_DEBUG=1` 会在 layer 3/21 打捕获期相位选择诊断。
+
+**实现**(sglang `deepseek_v2.py` + `server_args.py`;kt-kernel
+`experts_base.py`):
+
+- sglang:命中层在构造时额外建一个 k=4 的 `TopK`(继承 renormalize/
+  scoring/correction_bias,**top-4 权重按幸存专家重新归一化**,输出尺度
+  保持);`forward_normal`/`forward_normal_dual_stream` 按 batch 大小选
+  TopK 对象。cuda graph 捕获(verify 图 bs=1/2 → 6/12 token)天然落在
+  decode 相位,图内录的就是 k=4 的 moe_fused_gate,回放一致。
+- kt-kernel:`KExpertsCPUBuffer` 缓存 key 从 batch 改为 **(batch, k)**
+  ——否则同 batch 的 prefill(k=6)与 decode(k=4)共用一个 pinned 槽,
+  copy_ 形状不匹配、或捕获图烤进错误宽度;`submit_forward` 按张量实际
+  宽度取 buffer、`sync_forward` 用 last-k(memory 无 topk 张量可读)。
+  C++ `forward(qlen, k, ...)` 本就按运行时 k 寻址,零改动;GPU 常驻专家
+  的 Marlin 路径动态读 `topk_ids.shape[1]`,天然兼容。
+- 单测 `tests/test_decode_topk.py`(11 例:spec 解析/env 优先级/非法
+  输入/复合 key 缓存隔离)。
+
+**坑(nn.Module 类属性遮蔽,首版栽过)**:TopK 是 `BaseFusedOp` =
+nn.Module;`self._decode_topk = TopK(...)` 注册进 `self._modules` 而
+非实例 `__dict__`。若类上定义 `_decode_topk = None` 类属性,普通类属性
+在 `__getattribute__` 阶段命中,**先于** `nn.Module.__getattr__` 查
+`_modules` → 永远读到 None,功能静默失效(启动日志照样打 enabled、零
+报错)。修法:类属性删除,`__init__` 里 `self._decode_topk = None`
+实例占位(None 走 object.__dict__,后续赋 Module 时 nn.Module.__setattr__
+的 remove_from 会清掉占位)。**暴露手段**:KT_EXPERT_DIST_TRACK=1 +
+SIGUSR2 dump,纯 decode 流量(短题面+长生成)的 DELTA 矩阵按层求和——
+首版层间比值 1.0001(应为 4/6),修复后 0.6673。
+
+**实测**(30001 实验实例,生产同款配置 3F+27U + DSpark + 1M ctx +
+INT8 prefill,同日 A/B,贪心):
+
+| 指标 | 基线(top-6) | decode top-4 @3-20 |
+|---|---|---|
+| bench_dspark(×3) | 36.76 tok/s ALL PASS | **40.44/40.56/40.67(+10.3%)ALL PASS** |
+| probe / qa_battery | CLEAN / 19/19 | CLEAN / 19/19 |
+| accept len(同口径) | 2.99 | 3.05 |
+| decode 路由对数比(层3-20 ÷ 其它) | 1.000 | **0.6673(= 4/6,机制级)** |
+| prefill 47K 冷跑 | 828.8-831.3(§8.6 历史) | 829.4(无回归) |
+
+解读:decode/verify 的 CPU 专家带宽需求 -1/3 直接转化为步时收益
+(与 §5.12/§5.13 "放置不影响 decode" 不同——那是挪专家,这是真减算量);
+accept 不降(target/draft 独立,verify 用 top-4 target 分布判接受,
+贪心下自洽);bench completion 482→655 token 是贪心轨迹改变(生成更长),
+硬校验全过。**生产 ds4f.service 未启用**(加一行
+`SGLANG_KT_DECODE_TOPK_LAYERS=3-20` 即可启用;长期观察输出质量后再定)。
+
+**顺带发现(既有问题,未修,与本次改动无关)**:巨页指纹不匹配时的
+冷加载路径在当前 kt-kernel 构建下崩——`MXFP4 MoE only supports Packed
+FP4 with KGroup Scale`(C++ fp4-moe.hpp:1150,`gate_projs` 为空)。触发
+条件:实验配置的 physical→logical 映射与池内 marker 不一致(如池按
+hybrid 3F+27U 冷转后用 0 GPU 专家 uniform 起实例)。生产 hybrid 配置
+指纹匹配走 REUSED 不受影响;临时绕法 = 用生产同款放置参数,或按 §8.4
+清池后用目标配置冷转一次。
