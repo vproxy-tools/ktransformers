@@ -68,30 +68,57 @@ class DecodeTopkCfgTests(unittest.TestCase):
         self.assertIsNone(cfg)
 
     def test_range_parse(self):
-        layers, k = self._cfg(layers="3-20")
-        self.assertEqual(layers, frozenset(range(3, 21)))
-        self.assertEqual(k, 4)
+        cfg = self._cfg(layers="3-20")
+        self.assertEqual(cfg, {L: 4 for L in range(3, 21)})
 
     def test_single_layer_parse(self):
-        layers, k = self._cfg(layers="7")
-        self.assertEqual(layers, frozenset({7}))
-        self.assertEqual(k, 4)
+        cfg = self._cfg(layers="7")
+        self.assertEqual(cfg, {7: 4})
+
+    def test_range_with_k(self):
+        cfg = self._cfg(layers="3-20=3")
+        self.assertEqual(cfg, {L: 3 for L in range(3, 21)})
+
+    def test_per_layer_map(self):
+        cfg = self._cfg(layers="0=6,3-20=4,21=6,42=6")
+        self.assertEqual(cfg[0], 6)
+        self.assertEqual(cfg[3], 4)
+        self.assertEqual(cfg[20], 4)
+        self.assertEqual(cfg[21], 6)
+        self.assertEqual(cfg[42], 6)
+        self.assertNotIn(1, cfg)  # layer 1 unspecified -> native behavior
+
+    def test_later_item_wins_on_overlap(self):
+        cfg = self._cfg(layers="3-10=4,7=3")
+        self.assertEqual(cfg[7], 3)
+        self.assertEqual(cfg[6], 4)
+
+    def test_overlap_later_item_wins(self):
+        cfg = self._cfg(layers="3-10=4,7=3")
+        self.assertEqual(cfg[7], 3)
+        self.assertEqual(cfg[6], 4)
+        self.assertEqual(cfg[8], 4)
+
+    def test_summary_compression(self):
+        cfg = self._cfg(layers="3-20=4,25=3")
+        self.assertEqual(
+            self.dsv2.DeepseekV2MoE._decode_topk_cfg_summary(cfg), "3-20=4,25=3"
+        )
 
     def test_env_fallback(self):
-        layers, k = self._cfg(layers=None, env_layers="5-9", env_k="2")
-        self.assertEqual(layers, frozenset(range(5, 10)))
-        self.assertEqual(k, 2)
+        cfg = self._cfg(layers=None, env_layers="5-9=2")
+        self.assertEqual(cfg, {L: 2 for L in range(5, 10)})
 
     def test_arg_overrides_env(self):
-        layers, k = self._cfg(layers="3-4", env_layers="10-12")
-        self.assertEqual(layers, frozenset({3, 4}))
+        cfg = self._cfg(layers="3-4=5", env_layers="10-12=6")
+        self.assertEqual(cfg, {3: 5, 4: 5})
 
     def test_default_k(self):
-        _, k = self._cfg(layers="3-4", env_k=None)
-        self.assertEqual(k, 4)
+        cfg = self._cfg(layers="3-4", env_k=None)
+        self.assertEqual(cfg, {3: 4, 4: 4})
 
     def test_rejects_garbage(self):
-        for bad in ["3-20-7", "a-b", "20-3", "-3", "3..20"]:
+        for bad in ["3-20-7", "a-b", "20-3", "-3", "3..20", "3=0", "3=x", "3-20=4,5=x"]:
             with self.assertRaises(ValueError, msg=bad):
                 self._cfg(layers=bad)
         with self.assertRaises(ValueError):
