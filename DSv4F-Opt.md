@@ -2291,3 +2291,35 @@ U 改变哪些专家在 CPU/GPU 算 → §9.3 数值非等价 → 贪心轨迹�
 
 复现:`/tmp/run_u.sh <U>`(生产 ExecStart 镜像 + 端口 30001 +
 DECODE_TOPK_LAYERS=3-20,dist-track 关);日志 /tmp/u{0,10,20,27}*.log。
+
+### 9.8 DSpark draft 放 GPU vs 放 CPU(2026-08-30,维持 CPU)
+
+draft 专家放置开关:`SGLANG_KT_DSPARK_CPU_EXPERTS`(默认 0 = draft
+纯 GPU,代价 ~8.7-9.5GB VRAM;=1 = draft 各阶段走 KT CPU wrapper,
+权重 mtp.{stage} 进 hugepage 池 marker L1000+)。生产历来 =1。
+
+**实验**:A = U=10 + draft GPU(run_u.sh 去掉该 env;37.6GB 基础
++8.7GB = 47.4GB,U=10 恰好装下,无需再降 U);B = U=27 + draft CPU
+(= 生产,同日 §9.7 数据);对照 U=10 + draft CPU(§9.7)。
+放置验证:VRAM +8.7GB、REUSED 207(少 2-3 = mtp 阶段不进 CPU)、
+log 零 mtp 加载记录。
+
+| 配置 | DSpark tok/s | comp | accept(n) | 步时粗算 | prefill 47K | VRAM |
+|---|---|---|---|---|---|---|
+| U=27+draftCPU(生产) | **40.70** | 655 | 2.88(5) | **70.8ms** | **833.9** | 46.6GB |
+| U=10+draftCPU(§9.7) | 39.79 | 563 | 2.92(4) | 73.4ms | 800.1 | 37.6GB |
+| U=10+draftGPU(A) | 37.15 | 585 | 2.75(5) | 74.0ms | 801.1 | 47.4GB |
+
+**结论**:
+
+1. **draft 放 GPU 换不来解码收益**:同 U=10 下 GPU vs CPU draft
+   步时 74.0 vs 73.4ms——差异落在 accept 噪声(±1-2ms)内。CPU
+   draft 的"每步 CPU 专家延迟"实际被掩盖(单层 draft MoE 相对
+   40 层 target 步是零头/可重叠)。
+2. GPU draft 的 8.7GB 若用在 target 上值 ~16 个专家(U+16),
+   是严格更优的交换。生产 U=27+draftCPU 在 decode、prefill、
+   吞吐全部领先;A 档 tok/s 还叠加了 accept 内容效应(draft 数值
+   路径变了 → 草稿不同,accept 2.75 偏低)。
+3. 正确性:A 档 999×999 ✓、bench 5/5 PASS。
+4. **生产维持 U=27 + SGLANG_KT_DSPARK_CPU_EXPERTS=1**,该 env 的
+   ~9.5GB 注释得到实测印证(8.7GB 实测)。
