@@ -117,8 +117,22 @@ class DecodeTopkCfgTests(unittest.TestCase):
         cfg = self._cfg(layers="3-4", env_k=None)
         self.assertEqual(cfg, {3: 4, 4: 4})
 
+    def test_skip_parse(self):
+        # k=0 = skip the layer's whole MoE in decode; must be explicit.
+        cfg = self._cfg(layers="3-18=4,19-22=0")
+        self.assertEqual(cfg[3], 4)
+        self.assertEqual(cfg[18], 4)
+        self.assertEqual({L: cfg[L] for L in range(19, 23)}, {L: 0 for L in range(19, 23)})
+        self.assertNotIn(23, cfg)  # layer 23 unspecified -> native behavior
+
+    def test_skip_mixed_summary(self):
+        cfg = self._cfg(layers="3-18=4,19-22=0")
+        self.assertEqual(
+            self.dsv2.DeepseekV2MoE._decode_topk_cfg_summary(cfg), "3-18=4,19-22=0"
+        )
+
     def test_rejects_garbage(self):
-        for bad in ["3-20-7", "a-b", "20-3", "-3", "3..20", "3=0", "3=x", "3-20=4,5=x"]:
+        for bad in ["3-20-7", "a-b", "20-3", "-3", "3..20", "3=x", "3-20=4,5=x"]:
             with self.assertRaises(ValueError, msg=bad):
                 self._cfg(layers=bad)
         with self.assertRaises(ValueError):
