@@ -2180,3 +2180,42 @@ phase)`(verify 12 tok 与 decode 6 tok 均命中),prefill 106 tok 时
 - 结论:**整层跳过不可用于生产**。k=0 机制保留在代码库(默认关),
   与 §9.1 cap 一样作为边界记录:decode 相位的收益天花板约 +12%,
   代价是能力级损伤。生产维持 3-20=4。
+
+**实验过程记录**(2026-08-29 20:00-20:16,复现备查):
+
+1. **实现+单测**:deepseek_v2.py(spec 解析 k>=0、`_decode_skip` 实例
+   槽、forward 顶部短路、enabled 日志移出 TopK 构建分支使 skip-only
+   配置也能打印)、server_args.py 帮助文本、单测 19→21 例
+   (`3=0` 从 garbage 列表移入合法 skip 解析;默认 k=0 仍拒绝)。
+   `tests/test_decode_topk.py` 21/21 OK。
+2. **切实验位**:`sudo systemctl stop ds4f`(GPU 46.6GB→1MB,生产/
+   实验互斥);从 `/tmp/run_prod30001.sh` 派生 `/tmp/run_prod30001_skip.sh`
+   (端口 30001,唯一差异:`SGLANG_KT_DECODE_TOPK_LAYERS="3-18=4,19-22=0"`
+   + `SGLANG_KT_DECODE_TOPK_DEBUG=1`,其余与生产 ExecStart 完全一致)。
+3. **启动确认**:模型构建期打出 `enabled: ... top-k 3-18=4,19-22=0
+   (20 layers total, first hit layer 3; k=0 layers skip ...)`;
+   READY 后 smoke(斐波那契一句话解释,thinking 默认开)推理文本
+   连贯——4 层跳过后模型仍可对话。
+4. **机制验证**(probe 层 {3,21}):`layer 3 num_tokens=12 -> reduced
+   k`(DSpark verify)、`layer 3 num_tokens=6 -> reduced k`(decode)、
+   `layer 21 -> skip MoE (decode phase)`(图捕获期即命中);
+   prefill `num_tokens=106` 时 layer 3/21 均 `full k`——decode/verify
+   跳过、prefill 全量,相位语义正确。
+5. **bench**(`tests/bench_dspark.py 30001`):5/5 PASS,1355 tok /
+   29.6s = **45.79 tok/s**(逐题 45.43/25.10/44.96/42.02/48.76);
+   服务器 Decode batch 行 accept len 14 段(含 smoke 窗口)均值
+   ≈3.15,与对照 3.09 持平;步时粗算 3.15/45.79≈68.8ms。注意
+   accept 窗口混入 smoke、且为区间快照均值,68.8ms 是粗估。
+6. **qa**(`tests/qa_battery.py 30001`):**16/19**,fail 全部在 math
+   直答:357×89→31793(对 31773)、2^20→2097152(=2^21)、999×999
+   →999999;logic/common/int8rc 全对——损伤集中在精确算术。
+7. **thinking 复核**(chat_template_kwargs thinking=true,贪心):
+   999×999→998001 ✓、2^20→1048576 ✓;357×89 在 1200/3000/8000
+   token 三档预算下均无 content(finish=length),8000 档 reasoning
+   尾部为 "32130-300=318?30?" 无限重复——自我校验也无法收敛,
+   判定为能力级损伤而非可恢复的边界扰动。
+8. **恢复**:kill 实验进程(GPU→1MB)→ `sudo systemctl start ds4f`
+   → enabled 日志确认 `3-20=4`(新日志格式同时证明新代码已上线且
+   生产无 skip 层)→ `tests/probe_dspark.py 30000` = **CLEAN**。
+9. **提交**:sglang(dspark-kt-fix)`e89bd3318b`;主仓(optimize-latest)
+   `6a04d39`(本节 + 单测 + submodule bump)。
