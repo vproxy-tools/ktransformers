@@ -2219,3 +2219,75 @@ phase)`(verify 12 tok 与 decode 6 tok 均命中),prefill 106 tok 时
    生产无 skip 层)→ `tests/probe_dspark.py 30000` = **CLEAN**。
 9. **提交**:sglang(dspark-kt-fix)`e89bd3318b`;主仓(optimize-latest)
    `6a04d39`(本节 + 单测 + submodule bump)。
+
+### 9.7 GPU 部分专家数 U 扫描(hybrid 3F + U∈{0,10,20,27})(2026-08-30)
+
+**运维发现(先于数据)**:hugepage 池 marker 是 `L*_-E256`(每层存
+**全部 256 专家**,2 NUMA 节点各一份),`physical_to_logical_map`
+与 U 无关——U 只是 GPU 侧驻留 mask(Marlin 持有权 + CPU skip mask)。
+因此**换 U 不触发池重写**:四个配置全部走 REUSED 快启动(~135s/
+次),零池扰动;§9.6 之前记录的"换配置冷加载崩溃"由此解释——
+uniform **策略**(非 U 值)才改 map → 指纹失配 → staging 路径
+gate_projs 为空 → MXFP4 throw。hybrid 下任意 U 安全。
+
+**方法**:端口 30001,生产镜像栈(decode-topk 3-20=4、DSpark、
+INT8 prefill、HiCache manual,KT_EXPERT_DIST_TRACK 关闭),唯一
+变量 `--kt-num-gpu-experts`。prefill = `bench_prefill.py --tokens
+8192 --iters 1`(47,303 tok 标准口径,取未缓存首请求;同 prompt
+iter≥1 命中 radix 缓存不可用——`--tokens 47104` 会膨胀成 277K
+实际 token,勿用);decode 两口径:`bench_dspark.py`(生产口径,
+含 accept 内容效应)与 `bench_decode.py 512 3`(无 DSpark 单流
+稳态 ITL,贪心确定性使每配置单次即可,3 run 内散布 ±0.06)。
+每配置抽查 999×999(全对 998001)。
+
+**prefill(47K 口径)**:
+
+| U | tok/s | vs U=27 | VRAM |
+|---|---|---|---|
+| 27(生产) | **833.9** | — | 46.6GB |
+| 20 | 820.6 | −1.6% | 42.8GB |
+| 10 | 800.1 | −4.1% | 37.6GB |
+| 0 | 786.8 | −5.7% | 32.4GB |
+
+prefill 随 U 单调:47K prompt 命中所有专家,GPU 侧专家份额直接
+转化为吞吐(U/256 ≈ 专家对比例)。
+
+**decode(DSpark bench,生产口径)**:
+
+| U | tok/s | completion | accept(n) | 步时粗算 |
+|---|---|---|---|---|
+| 27 | 40.70 | 655 | 2.88(5) | 70.8ms |
+| 20 | 39.44 | 613 | 2.85(5) | 72.2ms |
+| 10 | 39.79 | 563 | 2.92(4) | 73.4ms |
+| 0 | 40.82 | 622 | 3.12(5) | 76.5ms |
+
+U 改变哪些专家在 CPU/GPU 算 → §9.3 数值非等价 → 贪心轨迹漂移
+(completion 563-655 不齐),tok/s 含 accept 内容效应;步时
+(accept÷tok/s)部分校正,但 accept 区间样本仅 4-5 个,±1-2ms。
+
+**decode(无 DSpark 纯步时,排除 accept 干扰)**:
+
+| U | tok/s | ms/step |
+|---|---|---|
+| 27 | **15.10** | **66.2** |
+| 20 | 14.83 | 67.4 |
+| 10 | 14.76 | 67.8 |
+| 0 | 14.78 | 67.7 |
+
+**结论**:
+
+1. **U=27 双轴最优,prefill 833.9/decode 66.2ms 都是第一**——生产
+   选择得到数据背书。
+2. decode 收益只在 U=27 档出现(纯步时快 1.2-1.5ms/step,~5σ);
+   **U∈{0,10,20} 互相不可区分**(±0.1 tok/s 内)——每档差 ~8 专家对/
+   步,低于步时噪声地板,与 §9.5"~10 专家对/步不转化步时"一致。
+   27 档的跃迁推测与 hybrid 按 hotness 选 GPU 专家有关:第 21-27
+   热门专家承接的对数占比不成比例(待 dist-track 数据可验证)。
+3. **U 是现成的 VRAM 旋钮**:若未来需要腾显存(更长 ctx/更大
+   batch),U=20 代价最小(−1.6% prefill、−0.2ms/step、省 3.8GB);
+   U=0 省 14.2GB 但 prefill −5.7%。U 换挡全程 REUSED,回切生产
+   无冷加载代价(实测恢复即 REUSED)。
+4. 四配置正确性抽查全过;DSpark bench 各 5/5 PASS。
+
+复现:`/tmp/run_u.sh <U>`(生产 ExecStart 镜像 + 端口 30001 +
+DECODE_TOPK_LAYERS=3-20,dist-track 关);日志 /tmp/u{0,10,20,27}*.log。
