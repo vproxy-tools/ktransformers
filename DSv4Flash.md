@@ -1,7 +1,8 @@
 # DeepSeek-V4-Flash 构建与启动实录（RTX 4090D / ktransformers optimize-latest 分支）
 
 本文记录从源码构建 ktransformers（sglang `dspark-kt-fix` fork + kt-kernel）并启动
-DeepSeek-V4-Flash-0731 推理服务的完整步骤。
+DeepSeek-V4-Flash-0731 推理服务的完整步骤。第 11 节为 vision-exp 多模态部署（当前
+`ds4f.service` 所服务的模型）。
 
 ## 1. 环境信息
 
@@ -487,3 +488,66 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
 | `SGLANG_KT_FP8_LMHEAD=1` | 读取点在 `logits_processor.py:756`（head.weight BF16 129280×4096 满足条件） | **禁用**：见下 |
 
 审计与实测依据见 `DSv4F-Opt.md` §4；ds4f.service 注释中已标注禁止引入。
+
+## 11. vision-exp 多模态部署（2026-09-01，当前 ds4f.service）
+
+**模型**：`/var/deepseek-v4-flash/vision-exp`（0731 + 32 层 ViT 塔与 aligner + 图像
+特殊嵌入 + gate.bias_vl）。`config.json` 的 architectures 已改为
+`DeepseekV4VisionForCausalLM`（备份 `config.json.bak-pre-vision`）；LLM 主干 0-42 层
+与 0731 完全一致，视觉塔挂在 `self.vision` 下、绝不进 `model.layers`。
+
+### 11.1 代码改动（sglang submodule `3b9e8ed316` 起）
+
+| 位置 | 内容 |
+|---|---|
+| `models/deepseek_v4_vision.py` | 视觉模型：ViT+aligner（按 checkpoint 自带 inference/vision.py 逐算子移植）；`SGLANG_DSV4_VISION_MODE=hybrid`（默认，attn GPU bf16 / FFN CPU INT8）/`gpu`（全 GPU）；权重流式分流加载 |
+| `multimodal/processors/deepseek_v4_vision.py` | mm processor：safe_resize/patch 化/N-layout 哨兵展开/pad_value（radix 前缀缓存友好） |
+| `layers/moe/vl_routing.py` + topk/hash_topk/MoEGate | gate.bias_vl：image span 内 token 用 bias_vl 选专家（hash 层走 (scores+bias_vl).topk），mask 为 thread-local + 长度防御（DSpark 复用 ForwardBatch 对象会残留旧 mask） |
+| `deepseek_v4_backend._extend_swa_windows_for_images` | image span 内 token 的滑窗扩展为整图双向可见（参考 get_window_topk_idxs_visible，索引集离线逐点校验一致） |
+| `encoding_dsv4` + `serving_chat` | dsv4 编码保留 image 块（process_image_messages），请求直传 tokenized ids + 图片记录 |
+| 架构注册 | model_config/server_args/overrides/speculative_hook 等 9 处按架构名键控的列表补 `DeepseekV4VisionForCausalLM`（backend 强制 dsv4、draft 架构替换、hybrid-swa 等） |
+| 分块 prefill | 本架构自动禁用（图片 span 必须单 chunk prefill，与参考实现约束一致）；KTConfig/staging/MHC-prewarm 对 chunked_prefill_size≤0 归一到 max_prefill_tokens |
+
+### 11.2 CPU 侧视觉 FFN 的 INT8 方案（参考 kt-kernel int8-prefill.hpp）
+
+权重加载时一次性反量化为 INT8：K 二分组、每 (out, K/2) 静态 fp32 尺度；每步对激活
+按 (token, K/2) 动态量化；GEMM 走 `torch._int_mm`（oneDNN VNNI）。选 K/2 粒度是实测
+结果：全 K 单尺度 11.4 TFLOPS 但精度差，16×64 窄分片触发 oneDNN 病态路径（~0.06
+TFLOPS），K/2 在 6.8–13.6 TFLOPS 且塔输出 cos≈0.9976（gpu 模式与参考实现逐位一致，
+cos=1.0）。EPYC 9275F 上 2223-ViT-token 图：塔时延 GPU 235ms / hybrid 427ms（离线）。
+
+### 11.3 使用与实测（hybrid 默认；2026-09-01）
+
+```bash
+# 图片请求：image_url 支持本机路径 / data:base64 / http(s) URL
+curl -s -X POST http://127.0.0.1:30000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "/var/deepseek-v4-flash/vision-exp",
+  "messages": [{"role":"user","content":[
+    {"type":"image_url","image_url":{"url":"/home/wkgcass/vision-sample.png"}},
+    {"type":"text","text":"表格里 Terminal Bench 一行三个模型的分数分别是多少？"}]}],
+  "temperature": 0, "max_tokens": 100,
+  "chat_template_kwargs": {"thinking": false}}'
+```
+
+- 正确性：vision-sample.png（benchmark 表）读数全部与图内真值一致（83.9/82.7/85.0、
+  Cybergym 75.3、ZeroBench 仅两列等）；多图交错、纯色小图、缓存命中（同图换问题）
+  均正确。文本侧 probe_dspark CLEAN、bench_dspark 5/5、qa_battery 18/19（唯一"FAIL"
+  为脑筋急转弯答"一样重"，语义正确）。
+- 性能（DSpark+3F+27U+256K ctx）：文本 38.15 tok/s（0731 参考区间内）；新图请求
+  gpu 模式 1.10s / hybrid 2.20s（含视觉塔+prefill+少量解码），同图缓存命中 ~1.1s。
+- 数值校验：`tests/vision_tower_check.py`（gpu 模式逐位一致、窗口索引集一致、
+  hybrid INT8 噪声 cos>0.995）。
+- 切换视觉模式：改 `SGLANG_DSV4_VISION_MODE`（ds4f.service）后 `daemon-reload +
+  restart`；gpu 模式视觉塔占 ~0.95GB 显存，hybrid ~0.4GB。
+
+### 11.4 与 0731 配置的差异 / 已知限制
+
+- ctx 1048576→262144、max-total-tokens 1052672→266240（给视觉权重与图片 prefill
+  瞬态留显存；启动后 avail ~9.5GB）。
+- 分块 prefill 禁用 → `--max-prefill-tokens 4096` 为单批 prefill 上限：带图请求
+  （≤~3.5K token）没问题；**超长纯文本 prompt（>4K）会被拒**。长上下文阶梯测试请
+  切回 0731（git 历史里的旧 ds4f.service）。
+- 换模型后首次启动需冷转巨页（CPU 专家 ~100s + INT8 镜像，随后 REUSED 秒级）；
+  若 `/dev/hugepages/kt_weights` 属主不对按第 8 节修复。
+- vision-exp 的 mm 请求 usage 里 prompt_tokens 计的是展开前的文本长度（sglang mm
+  计数口径），实际序列含 ~283 token/图 的 span（日志 `[dsv4-vision] expanded`）。
