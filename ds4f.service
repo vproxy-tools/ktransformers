@@ -124,14 +124,13 @@ Environment=PATH=/home/wkgcass/ktransformers/.venv/bin:/usr/local/bin:/usr/bin:/
 #     image span 内 token 的滑窗扩展为"整图双向可见"
 #     （deepseek_v4_backend._extend_swa_windows_for_images，与参考
 #     get_window_topk_idxs_visible 索引集逐点一致）；
-#   * mm chunked prefill 对本架构禁用（model_config 不支持列表）：图片 span
-#     必须单 chunk prefill（与参考实现约束一致）→ 全局无分块 prefill，
-#     超长纯文本 prompt（>16K token）会被拒/一次性 prefill 有 OOM 风险——
-#     视觉测试阶段可接受，长文本阶梯测试请切回 0731 模型。
-# ctx 从 1M 收到 256K：给视觉塔权重（hybrid ~0.4GB / gpu ~0.95GB）+
-#   图片 prefill 瞬态留显存余量（1M+27U 原 avail 仅 ~2.85GB 顶格）。
-#   要恢复长上下文：调大 --context-length/--max-total-tokens 并按
-#   DSv4Flash.md §8 清巨页池后重启。
+#   * 分块 prefill 已恢复（chunk 1024，与 0731 稳态一致）：调度器对图片
+#     span 做边界保护（PrefillAdder._mm_extend_chunk_to_spans——分界点落在
+#     span 内时把本 chunk 延到 span 结束），保证 span 内双向注意力契约；
+#     带图长 prompt（如 700K）按 1024-token 分多批 prefill。
+# ctx 恢复 1M（1048576/1052672，与 0731 稳态一致）。视觉塔额外占用
+#   hybrid ~0.4GB / gpu ~0.95GB；若长上下文 prefill OOM，优先降
+#   --kt-num-gpu-experts 27→26（每 U ≈ 0.5GB）。
 
 ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
@@ -144,11 +143,12 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --kt-cpuinfer 48 \
   --kt-threadpool-count 2 \
   --tensor-parallel-size 1 \
-  --context-length 262144 \
-  --max-prefill-tokens 4096 \
+  --context-length 1048576 \
+  --chunked-prefill-size 1024 \
+  --max-prefill-tokens 1024 \
   --attention-backend flashinfer \
   --mem-fraction-static 0.96 \
-  --max-total-tokens 266240 \
+  --max-total-tokens 1052672 \
   --max-running-requests 2 \
   --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \
@@ -169,9 +169,8 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
 
 # 其余稳态注释（DSpark/专家放置/HiCache/MEMFRAC）同 0731 配置，详见
 #   git 历史（ds4f.service @ d993589）与 DSv4Flash.md；此处仅列差异：
-#   - chunked-prefill-size 移除（本架构自动禁用分块 prefill），
-#     --max-prefill-tokens 4096 = 无分块时的单批 prefill 预算（图片请求
-#     ≤~3.5K token；同时决定 KT CPU 激活暂存尺寸 ~4× 旧 1024 基线）；
+#   - 与 0731 稳态完全一致（chunked 1024 / max-prefill 1024 / 1M ctx /
+#     27U），仅多 SGLANG_DSV4_VISION_MODE 与视觉模型路径；
 #   - ctx 1048576→262144、max-total-tokens 1052672→266240（视觉显存预算）。
 
 # 崩溃后至少等 30s 再拉起（配合上面的 StartLimit 限流）

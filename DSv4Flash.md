@@ -506,7 +506,7 @@ draft 期望 MTP 适配层挂在 `model.e_proj/...` 顶层命名，而本 checkp
 | `deepseek_v4_backend._extend_swa_windows_for_images` | image span 内 token 的滑窗扩展为整图双向可见（参考 get_window_topk_idxs_visible，索引集离线逐点校验一致） |
 | `encoding_dsv4` + `serving_chat` | dsv4 编码保留 image 块（process_image_messages），请求直传 tokenized ids + 图片记录 |
 | 架构注册 | model_config/server_args/overrides/speculative_hook 等 9 处按架构名键控的列表补 `DeepseekV4VisionForCausalLM`（backend 强制 dsv4、draft 架构替换、hybrid-swa 等） |
-| 分块 prefill | 本架构自动禁用（图片 span 必须单 chunk prefill，与参考实现约束一致）；KTConfig/staging/MHC-prewarm 对 chunked_prefill_size≤0 归一到 max_prefill_tokens |
+| 分块 prefill | 恢复启用（chunk 1024，与 0731 稳态一致）：调度器 PrefillAdder._mm_extend_chunk_to_spans 在分界点落入图片 span 时把本 chunk 延到 span 结束（span ≤388 token，越界有界），保住 span 内双向注意力契约；带图长 prompt 正常分多批 prefill |
 
 ### 11.2 CPU 侧视觉 FFN 的 INT8 方案（参考 kt-kernel int8-prefill.hpp）
 
@@ -533,7 +533,7 @@ curl -s -X POST http://127.0.0.1:30000/v1/chat/completions -H "Content-Type: app
   Cybergym 75.3、ZeroBench 仅两列等）；多图交错、纯色小图、缓存命中（同图换问题）
   均正确。文本侧 probe_dspark CLEAN、bench_dspark 5/5、qa_battery 18/19（唯一"FAIL"
   为脑筋急转弯答"一样重"，语义正确）。
-- 性能（DSpark+3F+27U+256K ctx）：文本 38.15 tok/s（0731 参考区间内）；新图请求
+- 性能（DSpark+3F+27U，1M ctx 已恢复）：文本 38.1 tok/s（0731 参考区间内）；新图请求
   gpu 模式 1.10s / hybrid 2.20s（含视觉塔+prefill+少量解码），同图缓存命中 ~1.1s。
 - 数值校验：`tests/vision_tower_check.py`（gpu 模式逐位一致、窗口索引集一致、
   hybrid INT8 噪声 cos>0.995）。
@@ -542,11 +542,15 @@ curl -s -X POST http://127.0.0.1:30000/v1/chat/completions -H "Content-Type: app
 
 ### 11.4 与 0731 配置的差异 / 已知限制
 
-- ctx 1048576→262144、max-total-tokens 1052672→266240（给视觉权重与图片 prefill
-  瞬态留显存；启动后 avail ~9.5GB）。
-- 分块 prefill 禁用 → `--max-prefill-tokens 4096` 为单批 prefill 上限：带图请求
-  （≤~3.5K token）没问题；**超长纯文本 prompt（>4K）会被拒**。长上下文阶梯测试请
-  切回 0731（git 历史里的旧 ds4f.service）。
+- 配置与 0731 稳态完全一致（1M ctx / 1052672 池 / chunk 1024 / 27U），仅多
+  `SGLANG_DSV4_VISION_MODE` 与视觉模型路径；启动 avail ~2.49GB（0731 ~2.85GB，
+  差值=视觉塔权重）。若长上下文 prefill OOM，优先降 27U→26U（每 U ≈0.5GB）。
+- **带图长上下文实测（2026-09-01，27U 未降档）**：`tests/vision_long_ctx_test.py`
+  —— 图片+暗号开头+填充文本的 ~397K（全冷）与 ~699K（~400K 前缀命中 + ~303K 新增）
+  两个档位均 PASS：暗号与表格数值双对、每批恒 1024 token、无 OOM；~397K 全冷
+  prefill 约 10.5 分钟（~630 tok/s 均值）。注意：禁用分块 prefill 的旧方案里
+  `max_prefill_tokens` 并不切批也不封单请求上限（调度器一把梭整个序列，长 prompt
+  必 OOM）——这是恢复分块 + span 边界保护的原因。
 - 换模型后首次启动需冷转巨页（CPU 专家 ~100s + INT8 镜像，随后 REUSED 秒级）；
   若 `/dev/hugepages/kt_weights` 属主不对按第 8 节修复。
 - vision-exp 的 mm 请求 usage 里 prompt_tokens 计的是展开前的文本长度（sglang mm
