@@ -551,6 +551,20 @@ curl -s -X POST http://127.0.0.1:30000/v1/chat/completions -H "Content-Type: app
   prefill 约 10.5 分钟（~630 tok/s 均值）。注意：禁用分块 prefill 的旧方案里
   `max_prefill_tokens` 并不切批也不封单请求上限（调度器一把梭整个序列，长 prompt
   必 OOM）——这是恢复分块 + span 边界保护的原因。
+- **文/图/文交叉实测（2026-09-01）**：`tests/vision_interleave_test.py` ——
+  [文字+暗号1][图1=benchmark表][文字+暗号2][图2=生成的代码图][文字][四问]，
+  ~72.7K 与 ~98.9K 两档全 PASS（双暗号 + 表格 82.7 + 图2 代码 OMEGA-881 全对，
+  每批 ≤1024）。两个坑及修复：① span 长度依赖占位符位置（compress_pad=
+  3-start%4，同图 283~286 变长）而 mm embedding 缓存/pad_value 只按图片内容
+  哈希——已把 span 长度混入 item hash；② 最初的"分界落 span 内则延展本批"会把
+  批撑过 KT staging 上限（1129>1024 断言）——改为**收缩优先**（截到 span 起点前，
+  批恒 ≤预算；仅 span 恰在批首时延展，≤388）。
+- **prefill 性能对比（同机同配置，flush 后全冷单发）**：纯文本 72K=787.7 tok/s，
+  交叉 72.7K（2 图）=787 tok/s，交叉 98.9K（2 图）≈785 tok/s，纯文本 430K=532.7
+  tok/s——**交叉与纯文本同长度几乎零差异**（视觉塔 ~0.4s/图 占 <1%）；与 0731
+  文档口径（47K 829、阶梯 522→186）处于同一区间，文本 prefill 路径无回归
+  （bench_prefill.py 的 --tokens 按词估算，实际 token 数 ~5.9×，读输出以
+  prompt= 为准）。
 - 换模型后首次启动需冷转巨页（CPU 专家 ~100s + INT8 镜像，随后 REUSED 秒级）；
   若 `/dev/hugepages/kt_weights` 属主不对按第 8 节修复。
 - vision-exp 的 mm 请求 usage 里 prompt_tokens 计的是展开前的文本长度（sglang mm
