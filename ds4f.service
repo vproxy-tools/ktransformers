@@ -1,5 +1,5 @@
 [Unit]
-Description=DeepSeek-V4-Flash-Vision-Exp SGLang server (ktransformers dspark-kt-fix, RTX 4090D, hybrid 3F+27U + DSpark + 256K ctx + CPU侧视觉推理)
+Description=DeepSeek-V4-Flash-Vision-Exp SGLang server (ktransformers dspark-kt-fix, RTX 4090D, hybrid 3F+27U + DSpark + 1M ctx + CPU侧视觉推理)
 Documentation=file:///home/wkgcass/ktransformers/DSv4Flash.md
 After=network.target
 # 若机器启用了 nvidia-persistenced，取消下面两行注释可避免冷启动时驱动未就绪
@@ -170,8 +170,8 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
 # 其余稳态注释（DSpark/专家放置/HiCache/MEMFRAC）同 0731 配置，详见
 #   git 历史（ds4f.service @ d993589）与 DSv4Flash.md；此处仅列差异：
 #   - 与 0731 稳态完全一致（chunked 1024 / max-prefill 1024 / 1M ctx /
-#     27U），仅多 SGLANG_DSV4_VISION_MODE 与视觉模型路径；
-#   - ctx 1048576→262144、max-total-tokens 1052672→266240（视觉显存预算）。
+#     27U / max-total-tokens 1052672），仅多 SGLANG_DSV4_VISION_MODE 与
+#     视觉模型路径（hybrid 视觉塔额外占 ~0.4GB 显存，1M 阶梯已复测通过）。
 
 # 崩溃后至少等 30s 再拉起（配合上面的 StartLimit 限流）
 Restart=on-failure

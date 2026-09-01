@@ -581,3 +581,59 @@ curl -s -X POST http://127.0.0.1:30000/v1/chat/completions -H "Content-Type: app
   若 `/dev/hugepages/kt_weights` 属主不对按第 8 节修复。
 - vision-exp 的 mm 请求 usage 里 prompt_tokens 计的是展开前的文本长度（sglang mm
   计数口径），实际序列含 ~283 token/图 的 span（日志 `[dsv4-vision] expanded`）。
+
+### 11.5 适配后审查与修复（2026-09-01 下午）
+
+对 `me/dspark-kt-fix..HEAD` 三个 vision 提交做了全量静态审查 + 无污染 A/B 实测
+（重启全新进程、未服务图片、intra-op=1），结论与修复：
+
+**性能回退定论：非实现问题，是权重差异。** ① 纯净进程复测：47K 冷 prefill
+815.8/821.4/822.5（vs 污染进程 820.6、0731 基线 828.8/831.3），bench_dspark
+38.16（vs 污染 38.3）——`set_num_threads` 污染与否无可分辨影响；② decode
+步时 72.9-75.9ms 与 0731 的 ~73ms 一致，bench tok/s 差额全部来自 accept len
+2.93 vs 3.05；③ 直接比对 checkpoint 张量证实 **vision-exp 的 LM 主干权重与
+0731 位级不同**（`layers.10.attn.wq_a.weight`、`layers.0.ffn.gate.weight`、
+`shared_experts.w1` 等全部不等；vision-exp = 0731 + 新增视觉张量）——主干重新
+训过导致路由/draft 分布不同，~1.2% prefill 差与 accept 差均为权重特性。
+
+**修复的正确性问题**（均附触发用例，`tests/vision_encoding_unit_test.py`，
+33 项检查全 PASS，且用 `git show HEAD:` 加载修复前模块证实旧版确实触发 bug）：
+
+1. **tool_result 重排图文静默错配**（encoding_dsv4.py，最严重）：原流水线先
+   `process_image_messages` 收集图片、后 `sort_tool_results_by_call_order` 重排
+   tool_result 块 → 占位符换位而图片记录不变。修复：**先 merge+sort 后抽取图片**
+   （`merge_tool_messages` 改为保留 parts-list 原始块）；为保渲染逐字节一致，
+   新增 24 项新旧 prompt 逐字节 parity 检查（chat/thinking × 6 类输入全同）。
+   附带补齐 tool_result 字符串内容的占位符注入校验（流水线重排后的校验对等）。
+2. **`pad_input_ids` fallback 必崩**（deepseek_v4_vision.py）：把单个
+   `MultimodalInputs` 当 list 迭代 → TypeError；改为直接迭代 `mm_items`
+   （对齐 deepseek_vl2 契约；scheduler.py:2650/2970 传单对象）。
+3. **context 图片被丢弃**：`processed_context, _ = ...` 丢弃记录 → 占位符在
+   prompt 前缀而记录缺失。修复：context 图片保留且排在本轮图片之前。
+4. **stale vl_mask 等长穿透**（deepseek_v4_vision.py forward）：DSpark
+   verify/draft 复用 prefill 的 ForwardBatch 时，旧防护仅长度不等检查，等长时
+   文本 token 会被按图像 token 路由（bias_vl+SWA 扩展）。修复：forward 的
+   finally 里显式清掉 `mm_token_mask/mm_span_left/mm_span_right`，长度检查
+   降为纵深防御；并更正了"embed_mm_inputs 会清 mm_inputs"的错误注释。
+5. **SWA 图窗扩展未复用 `req_pool_indices_repeated`**（deepseek_v4_backend.py）：
+   自建 `repeat_interleave(extend_lens)` 不含 cuda-graph padding/CP 重排。修复：
+   复用 `expand_prefill_casually` 的现成结果；`cp_v2_active` 时显式 assert
+   拒绝（重排会错位 mask）；padding 尾部补 False/0。
+6. **`@dataclass` 误删**（forward_batch_info.py `DSV4OutCacheLoc`，NPU 路径
+   实例化必崩）：已恢复装饰器。
+7. **`set_num_threads(32)` 进程级泄漏**：原实现首次服务图片后永久抬高 scheduler
+   进程的 torch intra-op 线程数（1→32）。修复：改为 `_cpu_gemm_threads_scope()`
+   仅在 vision INT8 MLP forward 期间临时生效、结束即恢复（CPU GEMM 是同步的）。
+   实测验证：同进程先服务 2 张图再测 47K 冷 prefill = 820.1 tok/s，与从未服务
+   图片的纯净进程一致。
+8. `ds4f.service` 注释矛盾（Description/底部注释写 256K，ExecStart 实际 1M）：
+   已更正为 1M 稳态口径。
+
+**复测（修复后生产实例）**：probe_dspark CLEAN；bench_dspark ALL PASS
+（38.62 tok/s，权重特性区间内）；qa_battery 19/19（"一磅羽毛"题答案
+"Neither—they both weigh exactly one pound"语义正确，checker 放宽收
+`neither`——该 FAIL 在修复前的 §11.3 已记录为 18/19 已知项，与本次修复无关）；
+vision_interleave 100K PASS（双暗号+表格+代码图全对，90 批全 ≤1024，hybrid
+路径跑在新 threads scope 上）；47K 冷 prefill 820.1（无回归）。
+注：`tests/vision_tower_check.py`（离线逐位对照）需停服务跑（GPU 仅剩 ~1GB），
+本次未重跑——其数值路径未被改动，hybrid 数值已由服务端文/图交叉用例覆盖。

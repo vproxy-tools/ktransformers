@@ -91,7 +91,7 @@ for cat, q, expects, mt, th in CASES:
     # 同义答案放宽
     if not ok and "星期五" in expects and ("星期五" in text or "周五" in text or "Friday" in text):
         ok = True
-    if not ok and "same" in expects and ("same" in text or "equal" in text):
+    if not ok and "same" in expects and ("same" in text or "equal" in text or "neither" in text.lower()):
         ok = True
     print(f"[{cat:6s}] {'PASS' if ok else 'FAIL'}  {q[:24]}... => {text.strip()[:60]!r}")
     if not ok:
