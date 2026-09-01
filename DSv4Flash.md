@@ -648,3 +648,22 @@ verify/decode/draft 的 token 流本来就没有图像 span。复现用例
 `tests/vision_concurrent_verify_test.py`（长解码文本请求 × 带图 9K prefill
 并发）：未修复进程必崩（同款 zip ValueError，12:04 复现确认），修复后 PASS
 且 probe/bench_dspark/vision_interleave 100K 全绿。
+
+**追加修复 2（2026-09-01 午后，真实会话 OOM 热修）**：多轮长上下文会话
+（~162K，前缀全命中）尾声发了一张接近上限的图（span 367，ViT 42x74=3108
+patch）→ 视觉塔 SDPA OOM（要 590MiB，当时全卡仅剩 545MiB）拖垮服务。根因：
+本 torch 构建（2.11.0+cu128, sm89）**不含任何 flash/cudnn/mem-efficient SDPA
+内核**（连续 bf16 理想输入也报 "No available kernel"），视觉注意力只能走 math
+路径，其实例化 [heads,n,n] 注意力矩阵 + fp32 softmax 缓冲（3.4K patch ≈0.6GiB）；
+而会话中 free VRAM 会从启动时的 ~2.49GiB 衰减（长上下文 decode 工作区驻留 +
+triton 懒加载等，13:25 时仅 0.47GiB）。修复 `_vision_sdpa`：先试完整 math SDPA
+（与参考逐位一致的快路径），OOM 则 empty_cache 后按 query 分块重试（每块内
+对全量 K/V 做 per-row softmax，数学语义相同，瞬时占用降到 ~0.1GiB@512；
+CPU fp32 下分块与整体逐位一致）。旋钮：`SGLANG_DSV4_VISION_SDPA_QCHUNK`
+（默认 512）；测试钩子 `SGLANG_DSV4_VISION_SDPA_FORCE_CHUNK=1` 强制走分块
+（服务端文/图交叉用例在该钩子下 PASS）。注意：懒加载警告
+"Triton kernel device-loaded after serving started" 提示 free mem 已低——
+大图请求前若日志出现该提示，视为 OOM 前兆信号（回退路径已兜底，不会再崩）。
+另外 13:26 启动日志里大量 libtorchcodec/FFmpeg/libavutil 报错为每次启动都有
+的良性噪音（mimo 音频 processor 探测，与本栈无关），tokenizer backend 提示
+同理，均可忽略。
