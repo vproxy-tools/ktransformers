@@ -568,6 +568,15 @@ curl -s -X POST http://127.0.0.1:30000/v1/chat/completions -H "Content-Type: app
   注意 bench_prefill.py 的 --tokens 按词估算、实际 token ~5.9×，读数以输出
   prompt= 为准；flush 后需等几秒再发（异步清树，抢跑会全量命中缓存得到
   荒谬的 9 万 tok/s）。
+- **decode 性能（2026-09-01）**：标准口径 bench_dspark ×5 轮 38.13-38.47
+  （均值 38.3，±0.5%）vs 0731 同配置 40.44-40.67（-6%）。步时核算：76.5ms/步
+  vs 0731 75.2ms（+1.7%，噪声内）——**decode 基础设施无回归**，差额全部来自
+  accept 长度 2.93 vs 3.05（vision-exp 权重自身的 draft 特性；DSpark tok/s
+  内容敏感带 ±10%，见 DSv4F-Opt.md §5.20/§9.6 口径警告）。长上下文 99K 纯
+  decode：文本 512 tok/8.1s = 63 tok/s（99,072 前缀命中）；带图（2 个 span
+  驻 KV）347 tok/6.0s ≈ 58 tok/s——图 span 对 decode 无拖累（decode 窗口把
+  其按普通 token 处理）。注：decode 日志的 gen throughput 单点采样波动大
+  （29-50 tok/s），以 e2e×token 计数为准。
 - 换模型后首次启动需冷转巨页（CPU 专家 ~100s + INT8 镜像，随后 REUSED 秒级）；
   若 `/dev/hugepages/kt_weights` 属主不对按第 8 节修复。
 - vision-exp 的 mm 请求 usage 里 prompt_tokens 计的是展开前的文本长度（sglang mm
