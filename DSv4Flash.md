@@ -559,12 +559,15 @@ curl -s -X POST http://127.0.0.1:30000/v1/chat/completions -H "Content-Type: app
   哈希——已把 span 长度混入 item hash；② 最初的"分界落 span 内则延展本批"会把
   批撑过 KT staging 上限（1129>1024 断言）——改为**收缩优先**（截到 span 起点前，
   批恒 ≤预算；仅 span 恰在批首时延展，≤388）。
-- **prefill 性能对比（同机同配置，flush 后全冷单发）**：纯文本 72K=787.7 tok/s，
-  交叉 72.7K（2 图）=787 tok/s，交叉 98.9K（2 图）≈785 tok/s，纯文本 430K=532.7
-  tok/s——**交叉与纯文本同长度几乎零差异**（视觉塔 ~0.4s/图 占 <1%）；与 0731
-  文档口径（47K 829、阶梯 522→186）处于同一区间，文本 prefill 路径无回归
-  （bench_prefill.py 的 --tokens 按词估算，实际 token 数 ~5.9×，读输出以
-  prompt= 为准）。
+- **prefill 性能对比（同机同配置，flush 后全冷单发）**：
+  **同口径复测（bench_prefill.py --tokens 8192，47,303 token）：820.6 tok/s vs
+  0731 文档 828.8/831.3（-1.1%，噪声内）；100K 档 99,245 token：762.8 vs 文档
+  771.7（-1.2%）——文本 prefill 路径无回归**。其余档位（均落衰减曲线上）：
+  纯文本 72K=787.7、交叉 72.7K（2 图）=787、交叉 98.9K（2 图）≈785、纯文本
+  430K=532.7 tok/s——交叉与纯文本同长度几乎零差异（视觉塔 ~0.4s/图 占 <1%）。
+  注意 bench_prefill.py 的 --tokens 按词估算、实际 token ~5.9×，读数以输出
+  prompt= 为准；flush 后需等几秒再发（异步清树，抢跑会全量命中缓存得到
+  荒谬的 9 万 tok/s）。
 - 换模型后首次启动需冷转巨页（CPU 专家 ~100s + INT8 镜像，随后 REUSED 秒级）；
   若 `/dev/hugepages/kt_weights` 属主不对按第 8 节修复。
 - vision-exp 的 mm 请求 usage 里 prompt_tokens 计的是展开前的文本长度（sglang mm
