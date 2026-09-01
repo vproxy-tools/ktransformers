@@ -637,3 +637,14 @@ vision_interleave 100K PASS（双暗号+表格+代码图全对，90 批全 ≤10
 路径跑在新 threads scope 上）；47K 冷 prefill 820.1（无回归）。
 注：`tests/vision_tower_check.py`（离线逐位对照）需停服务跑（GPU 仅剩 ~1GB），
 本次未重跑——其数值路径未被改动，hybrid 数值已由服务端文/图交叉用例覆盖。
+
+**追加修复（2026-09-01 中午，真实请求打挂服务后的热修）**：并发场景——文本请求
+在 DSpark verify 解码，另一带图请求仍在分块 prefill——`ForwardBatch.init_new`
+对 TARGET_VERIFY 批也跑 `compute_mm_token_mask`，此时 schedule batch 的
+`multimodal_inputs`（含未在 verify 批里的 prefill 请求）与 extend 长度表不对齐，
+`zip(strict=True)` 直接 ValueError 拖垮整个服务。修复：mask 只对 extend 模式
+（EXTEND/MIXED/SPLIT_PREFILL）计算（`is_extend_or_draft_extend_or_mixed()`）——
+verify/decode/draft 的 token 流本来就没有图像 span。复现用例
+`tests/vision_concurrent_verify_test.py`（长解码文本请求 × 带图 9K prefill
+并发）：未修复进程必崩（同款 zip ValueError，12:04 复现确认），修复后 PASS
+且 probe/bench_dspark/vision_interleave 100K 全绿。
