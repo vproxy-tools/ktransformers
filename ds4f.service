@@ -35,6 +35,14 @@ Environment=TORCH_CUDA_ARCH_LIST=8.9+PTX
 # gpu：视觉塔全放 GPU bf16（~0.95GB 显存，~0.24s/图，与参考实现逐位一致）。
 # 切换后 systemctl restart ds4f 生效。
 Environment=SGLANG_DSV4_VISION_MODE=hybrid
+# URL 图片磁盘缓存（2026-09-02，DSv4Flash.md §11.6）：http(s) 图片字节按
+#   sha256(url) 平铺缓存到本目录，跨重启保留；仅在进程启动时检查——总大小
+#   超过阈值则按 mtime 从旧到新裁剪到达标。阈值：--dsv4-image-cache-max-mb
+#   > SGLANG_DSV4_IMAGE_CACHE_MAX_MB > 默认 1024MiB（0=禁用缓存）。
+#   单文件上限 SGLANG_DSV4_IMAGE_MAX_BYTES（默认 64MiB）、超时
+#   SGLANG_DSV4_IMAGE_FETCH_TIMEOUT（默认 30s）。
+#   前缀匹配本就基于 patch 字节 hash（pad_value），与 URL 无关，无需配置。
+Environment=SGLANG_DSV4_IMAGE_CACHE_DIR=/var/hicache/dsv4-image-cache
 
 # --- 思考模式默认开启（输出侧切分由本 fork 的 serving_chat 补丁保证）---
 # 单请求可用 chat_template_kwargs {"thinking": false} 覆盖关闭

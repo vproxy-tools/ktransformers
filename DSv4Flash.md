@@ -667,3 +667,54 @@ CPU fp32 下分块与整体逐位一致）。旋钮：`SGLANG_DSV4_VISION_SDPA_Q
 另外 13:26 启动日志里大量 libtorchcodec/FFmpeg/libavutil 报错为每次启动都有
 的良性噪音（mimo 音频 processor 探测，与本栈无关），tokenizer backend 提示
 同理，均可忽略。
+
+### 11.6 URL 图片磁盘缓存（2026-09-02）
+
+**背景核查结论**（代码级，sglang 子模块）：
+
+- **URL 取图原本已支持**：`deepseek_v4_vision.py` 的 `load_image_bytes` 对
+  http(s) 走 `urlopen(timeout=30)`；本地路径/base64 data URI 各自独立分支。
+  但**每次请求都重新下载**——无字节级缓存。
+- **前缀匹配不需要改**：radix/HiCache 的 key 是 padded token ids，图片 span
+  被替换为 `pad_value = 1_000_000 + hash % 2^30`，hash 来自 **patch 字节
+  SHA-256 前 8 字节 ⊕ span_len**（`mm_utils.hash_feature` → fork 的
+  `set_hash((hash<<3)^span_len)`）。同一张图无论来自 URL/base64/本地路径，
+  patch 字节相同 → pad_value 相同 → 跨请求前缀命中。URL 不参与匹配也不
+  需要参与（URL 只是取字节的一种途径；不同 URL 同内容照样命中）。理论
+  风险：pad_value 仅 30 bit，存在 2^-30 碰撞概率（不同图误判同 KV）。
+- embedding 级缓存已有：`MultiModalStaticCache`（scheduler 进程内存 LRU，
+  `SGLANG_VLM_CACHE_SIZE_MB` 默认 100MB），重复图跳过 ViT 前向，但仍要
+  重新下载字节——磁盘缓存补的正是这一环。
+
+**实现**（`deepseek_v4_vision.py`，仅改 http(s) 分支）：
+
+- 下载字节按 **sha256(url)** 平铺缓存到 `<base>/sha256(url)`，
+  原子写入（tmp + os.replace），**跨重启保留**。
+- base 目录解析顺序：`SGLANG_DSV4_IMAGE_CACHE_DIR` →
+  `<SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR>/dsv4-image-cache` →
+  `<tempdir>/dsv4-image-cache`；生产 unit 显式设为
+  `/var/hicache/dsv4-image-cache`（NVMe，避开根分区）。
+- **清理时机：仅在进程启动时**（`Dsv4VisionProcessor.__init__` →
+  `_enforce_cache_size_limit`）——目录总大小超过阈值才按 mtime 从旧到新
+  裁剪到达标；旧版 per-pid 布局的 `pid-*` 目录在启动检查时直接移除。
+  阈值解析顺序：`--dsv4-image-cache-max-mb`（server_args 启动参数）>
+  `SGLANG_DSV4_IMAGE_CACHE_MAX_MB` > 默认 **1024 MiB**；0 = 完全禁用缓存
+  （每次都下载、不落盘）。
+- 防护旋钮：`SGLANG_DSV4_IMAGE_MAX_BYTES`（默认 64MiB，分块读超限即拒，
+  不留半成品 tmp 文件）、`SGLANG_DSV4_IMAGE_FETCH_TIMEOUT`（默认 30s）。
+- 注意：缓存以 URL 为 key，**不校验源站内容是否变化**，文件一直保留到
+  超阈值被裁剪（不再随进程退出清理）。裸 urlopen 无域名白名单/SSRF 防护，
+  服务监听 0.0.0.0 时不要暴露到不可信网络。
+
+**测试**：`tests/vision_image_cache_test.py`（离线，11 项全 PASS：下载落盘、
+缓存命中不再联网、超限拒绝、tmp 残留清理、超阈值 oldest-first 裁剪、
+旧版 pid-* 目录移除、欠阈值不动、max_mb=0 禁用缓存）。上线需重启服务生效。
+
+**真实环境复测**（2026-09-02，重启后生产实例，`tests/vision_url_cache_live_test.py`，
+10/10 PASS）：本地 `python3 -m http.server` 挂图走 http URL 请求——
+模型正确读出图中红色/蓝色矩形、绿色椭圆与数字 12345/67890；同 URL 第二次
+请求无 "cached ... bytes" 日志（磁盘命中，未再联网）；同图换问题前缀命中
+（scheduler 日志 `#cached-token: 256`）。阈值裁剪改为启动时执行后再次复测：
+重启后缓存文件保留、同 URL 请求零网络 fetch（跨重启命中）。已知
+cosmetic 问题：OpenAI usage 的 `prompt_tokens_details.cached_tokens` 对图片
+span 恒报 0（scheduler 的 `#cached-token` 才是真实命中口径）。
