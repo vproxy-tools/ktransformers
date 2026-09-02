@@ -651,17 +651,25 @@ verify/decode/draft 的 token 流本来就没有图像 span。复现用例
 
 **追加修复 2（2026-09-01 午后，真实会话 OOM 热修）**：多轮长上下文会话
 （~162K，前缀全命中）尾声发了一张接近上限的图（span 367，ViT 42x74=3108
-patch）→ 视觉塔 SDPA OOM（要 590MiB，当时全卡仅剩 545MiB）拖垮服务。根因：
-本 torch 构建（2.11.0+cu128, sm89）**不含任何 flash/cudnn/mem-efficient SDPA
-内核**（连续 bf16 理想输入也报 "No available kernel"），视觉注意力只能走 math
-路径，其实例化 [heads,n,n] 注意力矩阵 + fp32 softmax 缓冲（3.4K patch ≈0.6GiB）；
-而会话中 free VRAM 会从启动时的 ~2.49GiB 衰减（长上下文 decode 工作区驻留 +
-triton 懒加载等，13:25 时仅 0.47GiB）。修复 `_vision_sdpa`：先试完整 math SDPA
-（与参考逐位一致的快路径），OOM 则 empty_cache 后按 query 分块重试（每块内
-对全量 K/V 做 per-row softmax，数学语义相同，瞬时占用降到 ~0.1GiB@512；
-CPU fp32 下分块与整体逐位一致）。旋钮：`SGLANG_DSV4_VISION_SDPA_QCHUNK`
-（默认 512）；测试钩子 `SGLANG_DSV4_VISION_SDPA_FORCE_CHUNK=1` 强制走分块
-（服务端文/图交叉用例在该钩子下 PASS）。注意：懒加载警告
+patch）→ 视觉塔 SDPA OOM（要 590MiB，当时全卡仅剩 545MiB）拖垮服务。当时
+误判为"本 torch 构建不含任何 flash/cudnn/mem-efficient SDPA 内核"——**该结论
+有误，2026-09-02 复查推翻**：内核都在（sm89 上 flash/cudnn/mem_eff/math 四种
+后端全部可用，数值与 math 参考一致），真正原因是视觉塔以 3-D `[heads,n,d]`
+调用 SDPA，而 fused 内核一律要求 4-D `[batch,heads,n,d]`（"All fused kernels
+requires query, key and value to be 4 dimensional"），dispatcher 静默回退 math，
+math 路径实例化 [heads,n,n] 注意力矩阵 + fp32 softmax 缓冲（3.4K patch
+≈0.6GiB）；而会话中 free VRAM 会从启动时的 ~2.49GiB 衰减（长上下文 decode
+工作区驻留 + triton 懒加载等，13:25 时仅 0.47GiB）。**真正修复（2026-09-02）**：
+`_vision_sdpa` 补一个单例 batch 维，flash 内核直接接管（显存 O(n²)→O(n)，
+且明显更快）；OOM 分块回退保留作兜底（每块内对全量 K/V 做 per-row softmax，
+数学语义相同）。注意 checkpoint 自带的参考实现 `inference/vision.py` 同样以
+3-D 调用、同样静默走 math——gpu 模式与参考的"逐位一致"自此变为 bf16 内核
+舍入级差异（塔级 cos 实测 >0.9999，远大于 hybrid INT8 噪声下限 0.995），
+`tests/vision_tower_check.py` 的 gpu 断言已相应放宽。离线单测
+`tests/vision_sdpa_test.py`（flash 强制派发成功 = 4-D 修复回归守卫、
+对 fp32 CPU 参考的数值一致性、FORCE_CHUNK 分块回退一致性，5/5 PASS）。
+旋钮：`SGLANG_DSV4_VISION_SDPA_QCHUNK`（默认 512，仅回退路径用）；
+测试钩子 `SGLANG_DSV4_VISION_SDPA_FORCE_CHUNK=1` 强制走分块。注意：懒加载警告
 "Triton kernel device-loaded after serving started" 提示 free mem 已低——
 大图请求前若日志出现该提示，视为 OOM 前兆信号（回退路径已兜底，不会再崩）。
 另外 13:26 启动日志里大量 libtorchcodec/FFmpeg/libavutil 报错为每次启动都有

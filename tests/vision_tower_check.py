@@ -194,8 +194,12 @@ def main():
             f"rel={rel.item():.4%} cos={cos:.6f}"
         )
         if mode == "gpu":
-            # Bit-exact port of the reference tower.
-            assert cos == 1.0, f"gpu mode must match the reference (cos={cos})"
+            # Near-exact port of the reference tower. Not bit-exact: our
+            # _vision_sdpa adds a batch dim so the flash kernel engages,
+            # while the reference's 3-D SDPA call silently falls back to
+            # the math path — bf16 kernel-rounding drift only. Must stay
+            # far above the hybrid INT8 floor below.
+            assert cos > 0.9999, f"gpu mode drifted from the reference (cos={cos})"
         else:
             # INT8 (2-way K-split) noise floor: same trade the MoE INT8
             # prefill makes; validated end-to-end by the benchmark-table QA.
