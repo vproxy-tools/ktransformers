@@ -81,6 +81,7 @@ def journal(since):
 
 
 def main():
+    global IMG_URL
     t_start = time.strftime("%Y-%m-%d %H:%M:%S")
     pre_existing = len(cache_files()) > 0
     q1 = "What shapes and colors do you see? List every number visible in the image. Answer briefly."
@@ -119,6 +120,24 @@ def main():
     print(f"  [req3 answer] {text3[:200]}")
     check("req3 answers two rectangles",
           "two" in (text3 + reasoning3).lower() or "2" in text3)
+
+    # presigned-style URLs: query string is excluded from the cache key, so
+    # re-signed variants of the SAME object share req1's cache entry — no
+    # new file, no new fetch. (python -m http.server strips the query, so
+    # both variants serve the same bytes.)
+    orig_url = IMG_URL
+    try:
+        for sig in ("fake1&X-Amz-Expires=3600", "fake2&X-Amz-Expires=60"):
+            IMG_URL = orig_url + "?X-Amz-Signature=" + sig
+            r5 = chat(q2)
+            text5 = (r5["choices"][0]["message"]["content"] or "")
+            check(f"presigned variant ({sig[:5]}) answers correctly",
+                  "two" in text5.lower() or "2" in text5)
+    finally:
+        IMG_URL = orig_url
+    files5 = cache_files()
+    check("presigned variants share one cache file",
+          len(files5) == 1, repr(files5))
 
     # journal ground truth: at most one network fetch (0 if the cache file
     # survived from an earlier run in the same process), prefix hits after

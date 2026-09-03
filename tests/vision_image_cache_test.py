@@ -2,8 +2,10 @@
 """Offline unit tests for the dsv4-vision URL image disk cache.
 
 Covers sglang/srt/multimodal/processors/deepseek_v4_vision.py:
-  1. http(s) download is cached on disk keyed by sha256(url) — second fetch
-     of the same URL is served from disk without touching the network.
+  1. http(s) download is cached on disk keyed by sha256(url-sans-query) —
+     second fetch of the same URL is served from disk without touching the
+     network; presigned URLs differing only in the query share one entry
+     (the download itself still uses the full URL).
   2. _IMAGE_MAX_BYTES cap aborts oversized downloads (no partial tmp left).
   3. Startup size trim: over-cap cache drops oldest files first; legacy
      pid-* dirs are removed outright.
@@ -83,6 +85,33 @@ def main():
         check("second fetch served from cache",
               second == payload and calls["n"] == 1,
               f"urlopen calls={calls['n']}")
+
+        # 1b. query string excluded from the cache key (S3 presigned URLs
+        #     re-sign per request; same object must hit the same entry)
+        s3_base = "https://s3.example.com/bucket/pic.png"
+        signed1 = s3_base + "?X-Amz-Signature=aaa&X-Amz-Expires=3600"
+        signed2 = s3_base + "?X-Amz-Signature=bbb&X-Amz-Expires=7200"
+        q_calls = []
+
+        def signed_urlopen(u, timeout=None):
+            q_calls.append(u)
+            return FakeResponse(b"S3:" + u.encode())
+
+        proc.urlopen = signed_urlopen
+        r1 = proc.load_image_bytes({"url": signed1})
+        check("presigned: download uses the FULL url (query kept)",
+              q_calls == [signed1] and r1 == b"S3:" + signed1.encode(),
+              repr(q_calls))
+        r2 = proc.load_image_bytes({"url": signed2})
+        check("presigned: re-signed query hits the same cache entry",
+              r2 == r1 and len(q_calls) == 1, f"calls={q_calls}")
+        check("presigned: bare url hits too",
+              proc.load_image_bytes({"url": s3_base}) == r1
+              and len(q_calls) == 1)
+        proc.urlopen = fake_urlopen
+        # keep later steps' file-count assertions intact
+        os.remove(os.path.join(proc._IMAGE_CACHE_BASE,
+                               proc._cache_key(s3_base)))
 
         # 2. size cap
         def big_urlopen(u, timeout=None):

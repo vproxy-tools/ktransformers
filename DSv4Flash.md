@@ -696,8 +696,12 @@ math 路径实例化 [heads,n,n] 注意力矩阵 + fp32 softmax 缓冲（3.4K pa
 
 **实现**（`deepseek_v4_vision.py`，仅改 http(s) 分支）：
 
-- 下载字节按 **sha256(url)** 平铺缓存到 `<base>/sha256(url)`，
-  原子写入（tmp + os.replace），**跨重启保留**。
+- 下载字节按 **sha256(去掉 query 的 url)** 平铺缓存到 `<base>/<hash>`，
+  原子写入（tmp + os.replace），**跨重启保留**。query 不参与键（2026-09-03
+  起）：S3 presigned URL 的签名在 query 里、每次签发都不同，带 query 做键
+  会导致同一对象每次都缓存 miss；下载本身仍用完整 URL（签名照带）。
+  已知取舍：仅靠 query 区分内容的 URL（如 `?file=a` vs `?file=b`）会共享
+  一个缓存项，先取者胜。
 - base 目录解析顺序：`SGLANG_DSV4_IMAGE_CACHE_DIR` →
   `<SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR>/dsv4-image-cache` →
   `<tempdir>/dsv4-image-cache`；生产 unit 显式设为
@@ -714,8 +718,9 @@ math 路径实例化 [heads,n,n] 注意力矩阵 + fp32 softmax 缓冲（3.4K pa
   超阈值被裁剪（不再随进程退出清理）。裸 urlopen 无域名白名单/SSRF 防护，
   服务监听 0.0.0.0 时不要暴露到不可信网络。
 
-**测试**：`tests/vision_image_cache_test.py`（离线，11 项全 PASS：下载落盘、
-缓存命中不再联网、超限拒绝、tmp 残留清理、超阈值 oldest-first 裁剪、
+**测试**：`tests/vision_image_cache_test.py`（离线，14 项全 PASS：下载落盘、
+缓存命中不再联网、presigned URL 重签名共享缓存项且下载仍带完整 query、
+超限拒绝、tmp 残留清理、超阈值 oldest-first 裁剪、
 旧版 pid-* 目录移除、欠阈值不动、max_mb=0 禁用缓存）。上线需重启服务生效。
 
 **真实环境复测**（2026-09-02，重启后生产实例，`tests/vision_url_cache_live_test.py`，
