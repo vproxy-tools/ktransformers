@@ -140,6 +140,8 @@ Environment=PATH=/home/wkgcass/ktransformers/.venv/bin:/usr/local/bin:/usr/bin:/
 #   hybrid ~0.4GB / gpu ~0.95GB；若长上下文 prefill OOM，优先降
 #   --kt-num-gpu-experts 27→26（每 U ≈ 0.5GB）。
 
+# --sleep-on-idle：无负载时 scheduler 在 zmq poller 上挂起（来请求立即唤醒，
+#   不加延迟），消除空转 100%+ CPU；有负载时不睡。
 ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --host 0.0.0.0 --port 30000 \
   --model /var/deepseek-v4-flash/vision-exp \
@@ -171,6 +173,7 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --hicache-manual-mode \
   --enable-metrics \
   --skip-server-warmup \
+  --sleep-on-idle \
   --speculative-algorithm DSPARK \
   --reasoning-parser deepseek-v4 \
   --tool-call-parser deepseekv4
