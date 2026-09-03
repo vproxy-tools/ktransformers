@@ -47,10 +47,10 @@ Environment=SGLANG_DSV4_IMAGE_CACHE_DIR=/var/hicache/dsv4-image-cache
 # --- 思考模式默认开启（输出侧切分由本 fork 的 serving_chat 补丁保证）---
 # 单请求可用 chat_template_kwargs {"thinking": false} 覆盖关闭
 Environment=SGLANG_DEFAULT_THINKING=1
-# 思考等级默认拉满：请求不传 reasoning_effort 时按 "max" 编码
+# 思考等级默认 high：请求不传 reasoning_effort 时按 "high" 编码
 # （official profile：low/high/max；checkpoint 自带默认是 low。
-#  单请求可用请求体 reasoning_effort: "low"/"high" 覆盖降级）
-Environment=SGLANG_DSV4_REASONING_EFFORT=max
+#  单请求可用请求体 reasoning_effort: "low"/"max" 覆盖）
+Environment=SGLANG_DSV4_REASONING_EFFORT=high
 
 # --- DSpark + SM89 回退栈必需 ---
 Environment=SGLANG_RAGGED_VERIFY_MODE=static

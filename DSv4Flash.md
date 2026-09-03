@@ -100,9 +100,9 @@ cd $KT_ROOT
 export FLASHINFER_CUDA_ARCH_LIST=8.9
 export TORCH_CUDA_ARCH_LIST="8.9+PTX"
 
-# 思考模式默认开启 + 等级拉满（单请求可用请求体 reasoning_effort 覆盖）
+# 思考模式默认开启 + 默认等级 high（单请求可用请求体 reasoning_effort 覆盖）
 export SGLANG_DEFAULT_THINKING=1
-export SGLANG_DSV4_REASONING_EFFORT=max
+export SGLANG_DSV4_REASONING_EFFORT=high
 
 # DSpark + SM89 回退栈必需（缺一不可，见 DSv4F-Opt.md §1）
 export SGLANG_RAGGED_VERIFY_MODE=static
@@ -198,7 +198,7 @@ Step 2（架构环境变量仍按上文 8.9 设置）。该配置未在本机当
 | 全局默认开（本服务已启用） | 启动环境变量 `SGLANG_DEFAULT_THINKING=1` | 已写入 `ds4f.service`；输出侧的 `</think>` 切分依赖本 fork 对 `serving_chat.py` 的补丁（explicit_thinking 探测模式下输出侧原本忽略该 env） |
 | 单请求开启 | 请求体加 `"chat_template_kwargs": {"thinking": true}` | 不设环境变量时的开启方式 |
 | 单请求关闭 | `"chat_template_kwargs": {"thinking": false}` | 覆盖环境变量的全局默认 |
-| 推理强度 | `"reasoning_effort": "low"/"medium"/"high"/"xhigh"/"max"` | 按官方文档映射：low→low（简洁思考前缀），medium/xhigh→high，high→high（默认档），max→max（最大强度前缀）。也可用环境变量 `SGLANG_DSV4_REASONING_EFFORT`（ds4f.service 已设 max；旧名 `SGLANG_REASONING_EFFORT` 仍被接受但已标记废弃） |
+| 推理强度 | `"reasoning_effort": "low"/"medium"/"high"/"xhigh"/"max"` | 按官方文档映射：low→low（简洁思考前缀），medium/xhigh→high，high→high，max→max（最大强度前缀）。也可用环境变量 `SGLANG_DSV4_REASONING_EFFORT`（ds4f.service 默认档现为 high；旧名 `SGLANG_REASONING_EFFORT` 仍被接受但已标记废弃） |
 | 官方开关写法 | `"thinking": {"type": "enabled"}` 或 `{"type": "disabled"}` | 与 `chat_template_kwargs.thinking` 等效，对齐 api-docs.deepseek.com |
 | Anthropic 风格 | `"reasoning": {"effort": "none"}` / `{"effort": "max"}` | effort=none 关思考；也接受 `"enabled": true/false` |
 

@@ -658,15 +658,16 @@ swa/c4/c128/state 侧池，比只算 KV 的 5.7KB 大）。长上下文 prefill 
 - 注意：回放后树结构是"每路径一个合并大节点"（再次 save 时 nodes=2），
   前缀匹配语义等价；快照目录 `/var/hicache-snap1`（2.4GB）留作样本。
 
-### 5.16 思考等级默认拉满 + 默认 temperature 回 1.0（2026-08-25）
+### 5.16 思考等级默认值（曾拉满，现为 high）+ 默认 temperature 回 1.0（2026-08-25）
 
 - **思考等级**：DSv4 编码器（`encoding_dsv4.py`）本就有 `reasoning_effort`
   概念——请求体可传 `reasoning_effort`（本模型 checkpoint 检测为
   official profile：**low / high / max** 三档，靠 system prompt 注入不同
   努力程度指令实现）；请求不传时读 env `SGLANG_DSV4_REASONING_EFFORT`
   兜底（serving_chat.py:1225-1237）。checkpoint 自带默认是 **low**。
-  现稳态在 ds4f-dspark.service 设 `SGLANG_DSV4_REASONING_EFFORT=max`，
-  即默认最高档；单请求可用 `reasoning_effort: "low"/"high"` 降级。
+  稳态曾在 ds4f-dspark.service 设 `SGLANG_DSV4_REASONING_EFFORT=max`
+  （默认最高档），2026-09-03 起默认档调整为 **high**；单请求可用
+  `reasoning_effort: "low"/"max"` 覆盖。
 - **默认 temperature 回到 0**：bench 复现期曾把模型目录
   `generation_config.json` 改成 `temperature: 0.0, do_sample: false`，
   2026-08-25 白天短暂恢复过 1.0（`.bak` 原值），同日按用户决定**改回
