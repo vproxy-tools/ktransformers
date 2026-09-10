@@ -2352,6 +2352,16 @@ prefill。**DSpark 共存（2026-09-09 起，§10.12；初版全降级见 §10.1
   起生产回退关闭**——生产服务定位为不开 latent 的稳态，latent 只在实验实例
   `run_dspark.sh SOFT=1`（30001）使用；单请求可用
   `chat_template_kwargs {"thinking": false}` 走纯普通解码）。
+- **恢复与生成分离（2026-09-10，sglang 后续提交）**：`<|latent|>` 块的解析/恢复
+  （serving_chat 抽取、prefill soft embedding 重建、内容派生缓存键）**不随
+  `SGLANG_SOFT_THINKING` 开关**——开关只管"生成新 latent 块"。在未开 latent 的
+  服务上回传含 latent 块的历史（09-08~09-10 生产窗口或实验实例保存的会话）：
+  正常解析恢复、前缀缓存照常按内容键命中，恢复后请求以普通离散解码续跑。
+  实测（生产 30000，latent 关 + overlap 开 + DSpark，
+  tests/test_soft_latent_restore_off.py 5/5）：500 块合成历史 restored 500、
+  同对话重放缓存命中 512 tok 穿过 latent 段、篡改单权重即断在首个 latent 页。
+  TP>1 时 embedding 表分片，恢复注册跳过并告警（此时回传 latent 历史显式报错，
+  生成本就要求 TP=1）。
 - `SGLANG_SOFT_LATENT_TOPK_CAP`（候选数封顶，默认 4——2026-09-09 起由 256
   收紧；实际分布大概率只有 3-4 个有效候选，无 top-k/top-p 过滤的请求
   每位置候选即 top-4 归一化分布，soft embedding 质量无损（尾部单概率
