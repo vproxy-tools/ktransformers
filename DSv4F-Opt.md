@@ -1876,6 +1876,13 @@ GEMM 线程各自把全部 m 行重复量化，gate 与 up 同输入还各量一
 **100K 771.7 tok/s（较 731.6-733.0 再 +5.3%）**；decode 36.72 ALL PASS
 不变；probe CLEAN。巨页布局未变（actbuf 驻堆），重启全程 REUSED。
 
+**2026-09-10 复测（生产 30000，vision-exp checkpoint，soft thinking 已
+回退关闭、overlap 恢复开启）**：47K（实测 46.5K）冷跑 **821.1/825.8
+tok/s**——较本节数字低 ~1%（噪声级；checkpoint 已由 0731 换 vision-exp）。
+附带 276K 冷跑 **622.9/624.3 tok/s**（当前栈首个 276K 数据点，长上下文
+衰减符合预期，对照 100K=771.7）。flush 后同 prompt 立即重跑偶发命中
+（0.76-1.3s 轮），按 §8.5 口径丢弃。
+
 **decode 侧顺带实验（负面结果）**：`--speculative-dspark-block-size 7`
 （gamma 5→7，verify 窗 6→8）实测 32.67 tok/s vs 41.69（**-22%**）——
 超出 draft 训练分布，尾部位置接受率塌（accept len 2.45→~2.0，accept
@@ -2324,6 +2331,16 @@ log 零 mtp 加载记录。
 3. 正确性:A 档 999×999 ✓、bench 5/5 PASS。
 4. **生产维持 U=27 + SGLANG_KT_DSPARK_CPU_EXPERTS=1**,该 env 的
    ~9.5GB 注释得到实测印证(8.7GB 实测)。
+
+**2026-09-10 复测（生产 30000，vision-exp checkpoint，soft thinking
+关闭，DSpark+INT8+top-4 同款配置）**：bench_dspark 三轮 **36.44/36.27/
+36.20 tok/s，5/5 ALL PASS**——较本节 40.44-40.67 低 ~10%，但拆解后差异
+全部来自 accept len（journald 实测 2.65-2.70 vs 本节 3.05）：checkpoint
+0731→vision-exp 权重不同（草稿一致性漂移，同 §5.11 A 档 accept 2.75 偏低
+的同类现象）、思考默认等级其后由 max 调为 high（§9 头部口径警告即此）。
+隐含步时 36.3÷2.67≈**73.5ms** vs 本节 40.5÷3.05≈75.3ms——**单步速度持平
+略优，配置/kernel 无回退**；36.2-36.4 亦在历史多日散布带内（§8.6 曾记
+36.72）。prefill 侧同日复测见 §8.6 补记（持平）。
 
 ## 10. Soft Token Latent Reasoning 实验（2026-09-07，功能落地，默认关闭）
 
