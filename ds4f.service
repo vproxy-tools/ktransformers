@@ -1,5 +1,5 @@
 [Unit]
-Description=DeepSeek-V4-Flash-Vision-Exp SGLang server (ktransformers dspark-kt-fix, RTX 4090D, hybrid 3F+27U + DSpark + 1M ctx + CPU侧视觉推理)
+Description=DeepSeek-V4-Flash-Vision-Exp SGLang server (ktransformers dspark-kt-fix, RTX 4090D, hybrid 3F+27U + DSpark + Soft Token Latent Reasoning + 1M ctx + CPU侧视觉推理)
 Documentation=file:///home/wkgcass/ktransformers/DSv4Flash.md
 After=network.target
 # 若机器启用了 nvidia-persistenced，取消下面两行注释可避免冷启动时驱动未就绪
@@ -17,11 +17,28 @@ User=wkgcass
 Group=wkgcass
 WorkingDirectory=/home/wkgcass/ktransformers
 
-# --- DSpark 投机解码栈（DSv4Flash.md 第 3.1/9 节）---
+# --- 生产栈（2026-09-08 起含 Soft Token Latent Reasoning，DSv4F-Opt.md §10）---
 # venv: 仓库根 .venv（torch 2.11+cu128；sglang 为
 # editable 安装，指向 third_party/sglang 的 dspark-kt-fix 分支
 # （官方 main d06762282 + 自研补丁线性化谱系，见 DSv4F-Opt.md §5.18
 # 补记）——不要切分支！）
+#
+# 与 2026-09-08 之前的生产配置的差异（其余完全一致）：
+#   1. 打开 SGLANG_SOFT_THINKING=1（见下）。DSpark 保留开启：单候选 latent 步
+#      与 think-end 步与普通贪心完全等价，直接走 DSpark verify（2026-09-09 起，
+#      DSv4F-Opt.md §10.12）；只有多候选 latent 步（verify clamp 或 plain 拦截
+#      器存下 pending soft embedding）才把下一步降级为普通 target decode
+#      （dspark_worker_v2._forward_decode 顶部按 _soft_pending_count 门控），
+#      消费完自动恢复投机；
+#   2. radix/HiCache 均保持开启：latent 位置在缓存键序列中使用内容派生的
+#      合成 int64 id（候选 token 字符串 + float32 权重位级的 blake2b，见
+#      layers/soft_latent.py latent_cache_key），相同思维链前缀可命中；
+#      HiCache 页哈希对宽 id 走 escape 编码（hash_binding.cpp，向后兼容
+#      历史 u32 布局，已有 L3 内容不失效）。L3 prefetch 路径同样按
+#      内容 key 哈希；
+#   3. 显式加 --disable-overlap-schedule（SGLANG_SOFT_THINKING 下
+#      server_args 本来就会强制，显式写出避免告警；latent 步的下一输入
+#      在采样后才算出，overlap 流水线无法提前跑）。
 
 # --- 架构变量（SM_89）---
 Environment=FLASHINFER_CUDA_ARCH_LIST=8.9
@@ -51,6 +68,24 @@ Environment=SGLANG_DEFAULT_THINKING=1
 # （official profile：low/high/max；checkpoint 自带默认是 low。
 #  单请求可用请求体 reasoning_effort: "low"/"max" 覆盖）
 Environment=SGLANG_DSV4_REASONING_EFFORT=high
+
+# --- Soft Token Latent Reasoning 开关（DSv4F-Opt.md §10，2026-09-07 落地）---
+# 思维链（<think>…</think>）内部不采样离散 token，而是把现有 logits 管线
+# 产出的候选分布按概率加权 input embedding 作为下一位置输入；每个 latent
+# 位置以 <|latent|>base64(protobuf)<|/latent|> 下发，客户端回传可在
+# prefill 重建 soft embedding。部署约束：TP=1 + 非 overlap 调度
+#（server_args._handle_soft_latent_thinking 校验/强制）。
+Environment=SGLANG_SOFT_THINKING=1
+# 单请求连续 latent 步数上限，超出强制发 </think> 回到普通解码
+# （0=不限。实测 temp=0.8 难题有 2000 步不收尾的样本——这是方法特性：
+# 思维链内 argmax=EOS 会被当作普通候选吞掉，不会自行终止，故生产
+# 必须设兜底；2000 latent 步 ≈ 2000 个额外 decode 步，代价可控）。
+Environment=SGLANG_SOFT_LATENT_MAX_STEPS=2000
+# 每 latent 位置保留的候选数上限（top_k/top_p/min_p 过滤后再截断），
+# 默认 4（2026-09-09 起，原 256）；另有 SGLANG_SOFT_LATENT_MIN_PROB
+# 候选概率绝对下限（默认 0.05，某位置全部低于下限则回退保留 top-cap
+# 个）。改 cap/下限会改变 latent 缓存键，旧 L3 中对应条目自然失效；
+# 调试可另设 SGLANG_SOFT_LATENT_DEBUG=1。
 
 # --- DSpark + SM89 回退栈必需 ---
 Environment=SGLANG_RAGGED_VERIFY_MODE=static
@@ -163,6 +198,7 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \
   --trust-remote-code \
+  --disable-overlap-schedule \
   --enable-hierarchical-cache \
   --hicache-ratio 2 \
   --hicache-write-policy write_through \
@@ -179,10 +215,9 @@ ExecStart=/home/wkgcass/ktransformers/.venv/bin/python -m sglang.launch_server \
   --tool-call-parser deepseekv4
 
 # 其余稳态注释（DSpark/专家放置/HiCache/MEMFRAC）同 0731 配置，详见
-#   git 历史（ds4f.service @ d993589）与 DSv4Flash.md；此处仅列差异：
-#   - 与 0731 稳态完全一致（chunked 1024 / max-prefill 1024 / 1M ctx /
-#     27U / max-total-tokens 1052672），仅多 SGLANG_DSV4_VISION_MODE 与
-#     视觉模型路径（hybrid 视觉塔额外占 ~0.4GB 显存，1M 阶梯已复测通过）。
+#   git 历史（ds4f.service @ d993589）与 DSv4Flash.md；与旧生产配置的差异
+#   见文件头部清单（SGLANG_SOFT_THINKING=1 + disable-overlap-schedule，
+#   其余全同）。
 
 # 崩溃后至少等 30s 再拉起（配合上面的 StartLimit 限流）
 Restart=on-failure

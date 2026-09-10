@@ -4,6 +4,9 @@
 # 用法:
 #   ./run_dspark.sh              # kt MXFP4 混合推理（无投机，基线）
 #   DSPARK=1 ./run_dspark.sh     # + --speculative-algorithm DSPARK（0731 自带 draft head）
+#   SOFT=1 ./run_dspark.sh       # Soft Token Latent Reasoning（与 DSPARK 互斥；
+#                                #   radix cache 保持开启：latent 位置用内容派生
+#                                #   的合成 key，见 DSv4F-Opt.md §10）
 # 环境变量: EXTRA_ARGS / MEMFRAC / KT_CPUINFER / KT_TP_COUNT
 set -e
 cd /home/wkgcass/ktransformers
@@ -29,6 +32,37 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 export KT_CPUINFER="${KT_CPUINFER:-48}"
 export KT_TP_COUNT="${KT_TP_COUNT:-2}"
+
+# 实验实例与生产的持久巨页 arena 物理隔离（2026-09-08 根因确认，
+# DSv4F-Opt.md §10.8）：本实例不开 KT_CPU_INT8_PREFILL，fp4-only 的 cursor
+# 交错 ([fp4]×41) 与生产 ([fp4][int8]×41) 不同——共享默认 arena 时本实例的
+# fp4 写入会覆写生产的 I8V1 INT8 镜像段（9-07/09-08 两次生产乱码事故）。
+# 巨页池装不下两套 arena（664G 池 vs 生产 502G + 实验 ~194G），独立目录
+# 试过会半建崩溃；故默认直接关持久 arena 走堆分配（功能正常，每次重启
+# 全量转换 ~3min）。要持久化可显式 KT_HUGEPAGE_WEIGHTS=1 + 独立目录。
+export KT_HUGEPAGE_WEIGHTS="${KT_HUGEPAGE_WEIGHTS:-0}"
+
+# Soft Token Latent Reasoning 模式（可与 DSPARK 组合：THINKING 态的请求会把
+# 整个 decode 批降级为普通 target decode（dspark_worker_v2._forward_decode
+# 顶部 soft 门控，与 DSPARK_MAX_CTX 门控同机制）；回到 NORMAL 态
+# （</think> 之后）自动恢复投机。见 DSv4F-Opt.md §10.10）
+SOFT="${SOFT:-0}"
+RADIX_ARGS="--disable-radix-cache"
+if [ "$SOFT" = "1" ]; then
+    export SGLANG_SOFT_THINKING=1
+    # 连续 latent 步数兜底（思维链内 argmax=EOS 会被吞，可能不收尾）
+    export SGLANG_SOFT_LATENT_MAX_STEPS="${SOFT_MAX_STEPS:-2000}"
+    # radix cache 保持开启（latent 位置用内容派生 key）；overlap 调度
+    # server_args 会强制关闭，这里显式写出避免告警
+    RADIX_ARGS="--disable-overlap-schedule --enable-cache-report"
+    # HiCache（L2 host + L3 file）默认挂（HICACHE=0 关闭）；实验用独立存储
+    # 目录避免与生产 /var/hicache 互相干扰。合成 key 的 u64 哈希支持见
+    # DSv4F-Opt.md §10.9。
+    if [ "${HICACHE:-1}" = "1" ]; then
+        export SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR="${HICACHE_DIR:-/var/hicache-exp}"
+        RADIX_ARGS="$RADIX_ARGS --enable-hierarchical-cache --hicache-ratio 2 --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout page_first --hicache-storage-backend file --hicache-storage-prefetch-policy wait_complete"
+    fi
+fi
 
 SPEC_ARGS=""
 if [ "${DSPARK:-0}" = "1" ]; then
@@ -76,7 +110,7 @@ exec python -m sglang.launch_server \
   --watchdog-timeout 1200 \
   --disable-shared-experts-fusion \
   --trust-remote-code \
-  --disable-radix-cache \
+  $RADIX_ARGS \
   --skip-server-warmup \
   --reasoning-parser deepseek-v4 \
   --tool-call-parser deepseekv4 \

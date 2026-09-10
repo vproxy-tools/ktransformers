@@ -2324,3 +2324,394 @@ log 零 mtp 加载记录。
 3. 正确性:A 档 999×999 ✓、bench 5/5 PASS。
 4. **生产维持 U=27 + SGLANG_KT_DSPARK_CPU_EXPERTS=1**,该 env 的
    ~9.5GB 注释得到实测印证(8.7GB 实测)。
+
+## 10. Soft Token Latent Reasoning 实验（2026-09-07，功能落地，默认关闭）
+
+**是什么**：思维链（`<think>`…`</think>`）内部不再采样离散 token——完整复用
+现有 logits 处理管线（penalty→temperature→softmax→top_k/top_p/min_p 过滤），
+把最终候选分布按概率加权平均 **input embedding**（soft embedding）作为下一自
+回归位置输入；latent position 与普通 token 一样占 position、产生 K/V。当过滤
+后分布 argmax == `</think>` 时输出真实 `</think>` 恢复标准 decoding。每个
+latent position 的候选 token 字符串+权重以 protobuf→base64 包成
+`<|latent|>…<|/latent|>` 随输出流下发（落在 reasoning_content 内），
+**块后固定带 `  \n` 展示空白**（两个空格 + 换行 = markdown 硬换行，
+2026-09-09 起，方便 agent 展示；恢复解析时 `extract_latent_blocks` 精确
+剥除展示空白——只处理两种真实接续：块间隙为纯空格/换行（任意数量，
+0 个的旧格式也兼容），或空白后紧跟真实 `</think>`；其他文本前的空白
+原样保留，不占 sequence position）；客户端
+原样回传即可恢复：服务端在 tokenize 前抽取 latent 块、按 token 字符串查词表
+（`convert_tokens_to_ids`，非 decode→encode 往返）、重建 soft embedding 做
+prefill。**DSpark 共存（2026-09-09 起，§10.12；初版全降级见 §10.10）**：
+单候选/think-end 步与贪心等价，直接走 DSpark verify；只有多候选 latent 步
+把下一步降级为 plain decode（pending soft embedding 门控），消费完自动恢复
+投机。
+
+### 10.1 开关与部署约束
+
+- `SGLANG_SOFT_THINKING=1`（**2026-09-08 起生产 ds4f.service 已默认开启**；
+  单请求可用 `chat_template_kwargs {"thinking": false}` 走纯普通解码）。
+- `SGLANG_SOFT_LATENT_TOPK_CAP`（候选数封顶，默认 4——2026-09-09 起由 256
+  收紧；实际分布大概率只有 3-4 个有效候选，无 top-k/top-p 过滤的请求
+  每位置候选即 top-4 归一化分布，soft embedding 质量无损（尾部单概率
+  ~1e-6），protobuf/日志体积大幅下降。
+  注意 cap 是缓存键的输入之一，改 cap 后旧 L3 中 latent 条目自然失效）、
+  `SGLANG_SOFT_LATENT_MIN_PROB`（候选概率绝对下限，默认 0.05——在管线
+  过滤+cap 后的归一化分布上再砍 <5% 的候选；若某位置全部候选都低于
+  5%（极平分布），回退保留管线过滤后的 top-cap 集合。0 关闭；同为
+  缓存键输入，改后旧 latent 条目自然失效）、
+  `SGLANG_SOFT_LATENT_MAX_STEPS`（单请求连续 latent 步数兜底，默认 0=不限）、
+  `SGLANG_SOFT_LATENT_DEBUG=1`（逐步 intercept/consume 诊断日志）。
+- 启动校验（server_args `_handle_soft_latent_thinking`）：TP 必须 1（加权要在
+  完整 embedding 表上做）；自动强制 `disable_overlap_schedule=True`
+  并告警。radix cache 与 HiCache 自 2026-09-08 起支持（latent 位置用内容派生
+  key，页哈希 u64 兼容改造，见 §10.7/§10.9）。注意：本 fork 的 event_loop
+  结果处理仍滞后一步（见 10.3 的应对）。
+- temp=0（贪心）下 soft 与逐 token 解码**数学等价**（单候选 weight=1.0，
+  pending embed = embed(argmax) 逐位相同）；要看到方法的真实效果需 temp>0。
+
+### 10.2 实现地图（third_party/sglang，dspark-kt-fix）
+
+- 纯逻辑 `srt/layers/soft_latent.py`：哨兵/think id 解析、protobuf 动态 schema
+  （无 codegen 依赖，venv protobuf 6.33.6）、`<|latent|>` 块抽取/拼装、
+  `filter_candidates`（镜像 Sampler 的 top_k/top_p/min_p 过滤）、
+  `weighted_embed`（fp32 加权求和→bf16）。
+- 采样拦截：`Sampler.forward` 在 latent 批次物化 probs 挂
+  `LogitsProcessorOutput.next_token_probs`（贪心路径补一个 softmax）；
+  `ModelRunner._soft_latent_intercept` 对 latent 行判定 argmax==128822→发真
+  `</think>`，否则 pending 写 soft embed + 簿记哨兵 id 128799 + payload。
+- 输入注入：pending buffer 按 req_pool_idx 索引（sample 写、下一步 forward
+  消费并清位）；decode eager 复用 `replace_embeds/replace_positions`（
+  `can_run_graph` 对 replace 已自动回退 eager，图零污染）；`_execute_decode`
+  补了透传。恢复侧 span 在 `prepare_for_extend` 逐 chunk 换算成 replace 覆写。
+- **shadow id（关键）**：latent 步给模型喂的 `input_ids` 用概率最高候选的 id
+  而非哨兵——DSv4 前 3 层是 hash-MoE（`HashTopK.tid2eid` 纯 token-id 查表），
+  用哨兵会把层 0-2 的专家路由全带歪（10.3 bug 1）。恢复侧占位 id 同理用首选候选。
+- 状态机与输出：`Req.soft_state/soft_outbox`；`batch_result_processor` 逐提交
+  token 迁移；`BatchTokenIDOutput` 末尾加 `latent_texts/latent_positions`
+  （msgspec 兼容），detokenizer 按显式位置剥离哨兵、把 latent 文本按序注入
+  `output_strs`（reasoning parser 原样落入 reasoning_content）。
+- 恢复入口：`serving_chat` dsv4 分支在 `encode_messages` 后、tokenize 前抽取；
+  `encoding_dsv4` 对含 latent 标记的 assistant 思维链**不再按惯例丢弃**
+  （`_drop_thinking_messages`/`render_message` 两处放行，只对带标记轮生效）；
+  vision+latent 同请求由 tokenizer_manager 做位置重映射后支持（§10.11）；
+  `continue_final_message`+latent 拒绝。
+
+### 10.3 bring-up 修掉的三个真 bug
+
+1. **hash-MoE 按 token id 路由**：初版 latent 步模型输入只有 soft embedding +
+   哨兵 id，层 0-2 的 `tid2eid[128799]` 路由全错——贪心轨迹在第 31 字符处与
+   对照分叉（' ' vs '需要'，分布差 ~1 nat，非平票）。修法=shadow id（10.2）。
+2. **`sampling_info` 批创建后不重建**：latent mask 冻结在建批时刻，`</think>`
+   后拦截器持续触发并把 EOS(argmax=1) 吞成哨兵→永不收尾。修法=
+   `prepare_for_decode` 每步刷新 mask。
+3. **`replace_embeds` 从 prefill 漏到 decode**：恢复请求 prefill 设了 110 个
+   replace 位置，`prepare_for_decode` 只清 `input_embeds` 不清 replace_*，decode
+   批次把 prefill 位置应用到长度 1 的 input_embeds → device assert 崩调度器。
+   修法=一并清空。
+
+   另有一个由结果处理滞后一步（本 fork event_loop 恒为 relay/重叠语义，
+   `disable_overlap_schedule` 并不消除结果滞后）引发的边界问题：退出 `</think>`
+   后拦截器多打一步、吞掉首个内容 token（内容整体错位一步，且该步分布与对照
+   完全一致但 token 被哨兵顶替）。修法=**拦截触发不看 host 状态**，改用 GPU 侧
+   事实：有 pending 必触发；上一步提交为 `</think>` 的永不触发（
+   `_soft_prev_ids/_soft_prev_pending` 逐步 stash）。
+
+### 10.4 实测（30001，0731，无 DSpark，EAGER 与 graph 均验）
+
+- **贪心等价性（机制正确性硬证据）**：同一 thinking 请求 temp=0，soft 输出与
+  普通流水线**逐位一致**——reasoning 文本 161/161 字符（前 30 token 逐 token
+  一致）、reasoning_tokens=111（110 latent+`</think>`）、content 202/202 字符
+  完全一致、finish=stop。
+- temp=0.8 快题（1+1=?，effort=low）：49 latent 步→真 `</think>`→"1+1 = 2。"
+  →stop，全程正确。temp=0.8 难题（9.11 vs 9.9）：候选分布合理（
+  "我们需要比较…"），长思考未在 2000 步内收尾属方法特性（可用
+  `SGLANG_SOFT_LATENT_MAX_STEPS` 兜底）。
+- **恢复往返**：把 110 个 latent 块的 reasoning_content 原样回传+新问题，日志
+  `restored 110 latent position(s)`，模型从恢复的 soft 状态续思考 163 步并答对。
+- 回归（feature 不设）：probe_dspark CLEAN、bench_dspark 5/5 ALL PASS
+  （25.78 tok/s，无投机基线口径）；单测 `tests/test_soft_latent.py` 20/20。
+
+### 10.5 已知限制
+
+- THINKING 中 argmax 出 EOS（非 `</think>`）会被当作普通 latent 步（EOS 被吞），
+  不自行终止；用 `SGLANG_SOFT_LATENT_MAX_STEPS` 兜底（设计语义如此）。
+- latent 请求被 retract 时，已生成 latent 段的 KV 以哨兵 embedding 重 prefill
+  （不自洽）；retract 时该请求会被打 `skip_radix_cache_insert`，防止不自洽 KV
+  以内容 key 进入 radix 树污染后续命中（§10.7）。并发 2 + 大 KV 池下罕见，
+  实验期接受。
+- logprobs 输出与 latent 步不对齐（记录的是哨兵的 logprob）；
+  detokenizer 已改为按哨兵位置精确拼接（§10.12），混合窗口不再错位。
+- DSpark 门控已收窄为 pending 降级，思维链内单候选步正常投机（§10.12）。
+  残余边界：若模型在 NORMAL 态自行吐出 `<think>`（多轮开关切换等罕见情形），
+  host 侧状态滞后一步，首个 latent 步可能以离散 token 提交——自洽但偏离契约。
+- 恢复只对含 latent 标记的思维链放行；普通历史思维链仍按 DeepSeek 惯例丢弃。
+
+### 10.6 事故与恢复（2026-09-07 晚）：生产 INT8 prefill 损坏
+
+实验收尾恢复生产后发现 **>64 token prompt 全部输出乱码**（qlen≥64 触发 INT8
+prefill；≤56 token 正常）。排查链：非思考/思考与长度无关（67 token 非思考同样
+乱码）→ `tests/bench_moe_sweep.py --check`（KT_CPU_INT8_PREFILL=1）INT8 内核数值
+7.83e-04 PASS（内核无恙）→ 定位为**持久巨页 arena 中的 INT8 镜像数据损坏**。
+INT8 镜像标记为当日 13:02 所建（0731 实验在其后）；0731 实验实例只写 fp4 段
+（与 vision-exp 同 key 同地址，0731 的 fp4 写入使生产 fp4 标记失效、23:06 全量
+重转），不触碰 I8V1 段——镜像损坏更可能先于本次实验存在（13:0x 那次生产的
+INT8 构建本身已坏，当日 19:35 停生产前未做探针无法确证）。
+
+**恢复**（§8.4 runbook）：`sudo rm -rf /var/lib/kt-hugepage-weights
+/dev/hugepages/kt_weights` → 两目录 root 重建并 chown → 重启全量冷转（fp4+INT8）。
+恢复后：probe_dspark CLEAN、bench_dspark 5/5（33.21 tok/s）、qa_battery 19/19、
+67 token INT8 路径答题正确。
+
+**教训**：跨模型实验实例共享持久 arena 会使对方 fp4 标记失效（无害但触发整轮
+重转）；实验前后应对生产跑 probe 以区分既有损坏与实验引入损坏。
+
+### 10.7 Latent 前缀缓存（2026-09-08，radix 支持落地）
+
+**问题**：§10.1 初版强制 `--disable-radix-cache`，因为 latent 位置在 token 序列里
+是占位 id（生成侧哨兵 128799 / 恢复侧首选候选 id），radix 键无法区分不同思维
+分布——token id 相同 ≠ KV 相同，开缓存会静默共享错误 KV。
+
+**方案：内容派生缓存键**。每个 latent 位置计算一个合成 int64 key =
+`2^62 + blake2b(候选token字符串 + float32权重位级) % 2^61`
+（`soft_latent.latent_cache_key`）。key 相同 ⟹ 候选集+权重+顺序全同 ⟹ soft
+embedding 与 hash-MoE 路由 id（首选候选）全同 ⟹ 共享 KV 安全。2^62 基址远离
+真实词表 id（~129k）与视觉哨兵（vocab+0..4）；61 位哈希空间碰撞可忽略
+（n=1e4 缓存位置时 ~n²/2^62 ≈ 2e-11）。生成侧在 `_soft_latent_track`（有候选
+字符串+权重）算 key 记入 `req.soft_key_overrides{全局位置: key}`；恢复侧在
+`assemble_prompt_ids`（同样有字符串）算 key 随 span 携带（span 变 4 元组），
+Req 构造时落入同一 dict——两条路径哈希输入逐位一致（proto float32 往返精确）。
+
+**radix 挂接**（仅当 `soft_key_overrides` 非空才走 key 替换，零开销旁路）：
+`Req.get_cache_key_ids()` 生成「token id 序列 + latent 位置替换为合成 key」；
+匹配侧 `init_next_round_input`（schedule_batch）与 `match_prefix_for_req`
+（schedule_policy）；插入侧 `cache_finished_req`/`cache_unfinished_req`——
+**注意本栈用的是 UnifiedRadixCache（hybrid SWA），它有自己的一对
+cache_finished/unfinished（unified_radix_cache.py），不走路基类**——初版只改了
+radix_cache.py 导致生成结果以哨兵 id 入库、永不命中（bring-up 实测抓到）。
+HiCache 继续禁止（合成 key > uint32，页哈希 `checked_u32` 会抛；L3 prefetch 直接
+哈希原始 token id 未打补丁）。page_size=256（DSv4 后端强制）无妨：对齐只作用于
+长度，不作用于内容。
+
+**附带的真 bug 修复（encoding_dsv4 过渡 marker）**：历史 assistant 轮的
+user→assistant 过渡恒渲染 `<｜Assistant｜></think>`（为"思维已丢弃"惯例设计），
+即使该轮思维因含 latent 标记被保留——回放 prompt 在 `<think>` 位置与原始生成流
+差一个 token（`</think>` vs `<think>`），任何前缀匹配都在 latent 段前断裂。
+修法=过渡 marker 跟随下一轮思维是否保留来选 `<think>`/`</think>`（含 latent
+标记 ⇒ `<think>`）。对无 latent 的生产路径行为逐位不变。**这也意味着
+2026-09-07 的恢复实验 prompt 在该位置差一个 token**（模型鲁棒性下仍答对），
+本次修复后回放与生成逐位对齐。
+
+**防污染**：retract 的请求若含 latent overrides，重 prefill 不会再注入 soft
+embedding（已知限制），其 KV 与内容 key 不再自洽——`reset_for_retract` 对此类
+请求置 `skip_radix_cache_insert`，永不入库。
+
+**测试证据**：
+- 单测 `tests/test_soft_latent.py` 32/32：key 确定性/区分性（权重、顺序、
+  字符串）、值域（≥2^62 且 <2^63、远离词表）、proto/float32 往返稳定、
+  同 argmax 不同尾部分布 key 不同、生成/恢复两侧 key 一致、`apply_latent_keys`。
+- 实机 `tests/test_soft_latent_cache.py`（SOFT=1 ./run_dspark.sh，30001，
+  radix 开启）8/8：① 贪心 A 生成 421 latent 块；② 回放+追问 cached=**512**/1240
+  ——page_size=256 下任何 ≥256 的命中必然穿越了 421 个 latent 位置（无内容 key
+  时匹配断在第一个 latent 位置，命中 0）；③ 换思维链文本对照命中 0；④ 篡改
+  首个 latent 块一个权重命中 0；⑤ flush 后回放 X 无缓存入库→回放 Y 命中
+  **1024**（更深）；⑥ Y 的缓存/无缓存输出**逐位一致**（同形态 prefill KV）。
+- **数值边界（非 bug）**：直接命中"生成态"KV 的回放（②）与全新重算输出允许
+  措辞漂移——latent 段 KV 由 decode 内核算出，重算走 prefill 内核，~1e-3 数值
+  差可翻转近平票贪心（与普通 prefix cache 同性质；实测两者答案语义一致）。
+  同形态（replay 命中 replay 的 prefill KV）则逐位一致（⑥）。
+- 普通文本对照：/generate 1200-token 重复 prompt 第二次命中 1024，且
+  cached/uncached 贪心输出逐位一致——非 latent 路径行为不受改动影响。
+
+**部署**：`run_dspark.sh` 新增 `SOFT=1` 模式（与 DSPARK=1 可组合、默认
+`SGLANG_SOFT_LATENT_MAX_STEPS=2000`、`--enable-cache-report` 便于观测）。
+2026-09-08 晚：soft thinking 配置（含 §10.9 HiCache、§10.10 DSpark 共存）
+已直接覆盖为生产 `ds4f.service` 并重启上线——验证：贪心思维题 226 个
+latent 块答案正确、probe CLEAN（探针已改为 dup 检测前剥离 latent 块）、
+qa_battery 19/19、内容区 accept len 2.0-2.4。
+
+### 10.8 事故二（2026-09-08）：INT8 镜像再次损坏——根因确认并修复实验流程
+
+§10.7 实验收尾恢复生产后 probe 再次报 CORRUPT（>64 token prompt 乱码、短 prompt
+正常，INT8 prefill 触发线签名与 §10.6 完全一致）。`bench_moe_sweep.py --check`
+（KT_CPU_INT8_PREFILL=1）内核数值 7.83e-04 PASS——内核无恙，镜像数据损坏。
+
+**根因（本次确认）**：0731 实验实例不开 `KT_CPU_INT8_PREFILL`，其 fp4-only 布局
+的 arena cursor 交错为 `[fp4]×41`；生产为 `[fp4][int8]×41`。两者共享默认持久
+arena（`/dev/hugepages/kt_weights` + `/var/lib/kt-hugepage-weights`）时，实验实例
+的 fp4 写入按不同交错落址，**覆写生产的 I8V1 INT8 镜像段**——这正是 §8.4 runbook
+"切换 INT8 开关双向都需先清池"的跨实例版本。§10.6 的"损坏先于实验"存疑结论
+作废：两次事故均紧跟 0731 实验周期，机制闭合。
+
+**修复**：实验实例与生产的持久巨页 arena 物理隔离。首选方案"独立 arena 目录"
+（`KT_HUGEPAGE_WEIGHT_DIR/_META_DIR` 指向 *_exp）实测**不可行**：巨页池 664G
+装不下两套 arena（生产 502G + 实验 fp4-only ~194G），实验实例后半段层回落
+堆分配，且半建 arena 在下次启动复用时直接在 `amx.py load_weights` SIGABRT。
+最终方案：`run_dspark.sh` 默认 `KT_HUGEPAGE_WEIGHTS=0`——实验实例直接关持久
+arena、全部走堆分配（功能正常，每次重启全量转换 ~2min）；要持久化需显式
+`KT_HUGEPAGE_WEIGHTS=1` + 独立目录（且先扩巨页池）。生产 ds4f.service 保持
+默认目录不变。
+
+**恢复**：按 §8.4 清池重建 + 全量冷转；复测 probe CLEAN、长 prompt INT8 路径
+答题正确、两轮带思考多轮对话正常。教训重申：实验停生产前先跑 probe，区分既有
+损坏与实验引入损坏（本次停生产前未跑，无法确证损坏确切时点，但机制证据充分）。
+
+### 10.9 HiCache 支持（2026-09-08）：页哈希 u64 化，soft thinking 解禁分层缓存
+
+**问题**：§10.7 禁止 HiCache 的唯一硬障碍是 L3 页哈希——`hash_binding.cpp` 对
+int64 token id 一律 `checked_u32` 降位，latent 合成 key（≥2^62）会直接抛异常；
+另外 L3 prefetch 路径（`scheduler._prefetch_kvcache`）直接哈希原始 token id，
+绕过 latent key 替换会全 miss。
+
+**改动**：
+- `hash_binding.cpp`：非 bigram 路径的 u64 输入改为**向后兼容的变长编码**——
+  全部能装进 u32 时输出与历史布局逐字节一致（生产现有 L3 内容不失效，实测
+  普通文本命中不变）；含宽 id 时该 id 编码为 `{0xFFFFFFFF, lo32, hi32}` 三词
+  （0xFFFFFFFF 永不是真实 token id，无歧义）。全小 id 页保留 AVX2 快路径。
+  bigram（EAGLE 专用，与 soft thinking 互斥部署）维持 checked_u32 不变。
+- `native_hash.py`：plain-list 兜底 `array("I")` 溢出时回退 `array("q")`。
+- `scheduler._prefetch_kvcache`：`soft_key_overrides` 非空时用
+  `get_cache_key_ids` 切片做存储哈希（与备份侧 node key 一致）。
+- `server_args._handle_soft_latent_thinking`：删除 hicache 禁令（TP=1、
+  强制非 overlap 保留）。
+
+**测试证据**：
+- 单测 `tests/test_soft_latent.py` 37/37（新增 `test_native_hash_u64`：u32/u64
+  输入与旧布局逐字节一致、宽 id 标记编码与 Python 参考一致、宽 id 可区分、
+  paged 链式路径、list 兜底）。
+- 实机（SOFT=1 HICACHE=1，30001，fresh L3 目录）`tests/test_soft_latent_cache.py`
+  **9/9**：L2 命中 512 穿 latent 段；换思维链/篡改权重两个对照 0；flush 清 L2 后
+  回放 X 命中 **L3 存储** 1024（write_through 备份含 latent 合成 key，存储文件
+  按页哈希落盘）；再次 flush 后回放 Y 命中 L3 1792；缓存/回载输出逐位一致。
+  普通文本 /generate 对照在新扩展下命中 1024/1200 不变。
+- 注意：L3 落盘持久**跨测试轮次**——对照组必须带 run-unique 前缀（nonce 置于
+  序列前部），否则会命中自己上一轮的历史（曾误判为区分度失效，实为己方命中，
+  反过来也证明篡改后的 key 在 L3 里可独立存取）。
+
+**部署**：`run_dspark.sh` SOFT 模式默认挂 HiCache（`HICACHE=0` 关闭，实验 L3
+目录 `HICACHE_DIR=/var/hicache-exp`）。生产 ds4f 重启已自动 JIT 重编
+`hicache_hash_cpp`——对 u32 id 哈希逐字节不变，**/var/hicache 既有 L3 内容
+继续有效**。
+
+### 10.10 DSpark 共存（2026-09-08）：soft 门控实测 + _forward_decode_plain 修复
+
+（注：本节描述的是初版"整批降级"门控；2026-09-09 起已被 §10.12 的
+verify clamp + pending 门控取代，思维链内单候选步正常投机。）
+
+**结论**：soft latent 与 DSpark 按请求状态共存——latent THINKING 态的请求把
+整个 decode 批降级为普通 target decode（`dspark_worker_v2._forward_decode` 顶部
+soft 门控，与 DSPARK_MAX_CTX 门控同机制），`</think>` 回到 NORMAL 态后自动恢复
+投机。实测（SOFT=1 DSPARK=1）：latent 阶段 accept len 1.00（全 plain），内容区
+accept len 最高 3.58（投机生效）；贪心「9.11 vs 9.9」421 个 latent 块，逐步
+argmax 轨迹与无 DSpark 参考**逐位一致**；test_soft_latent_cache 9/9。
+
+**顺带修掉的既有 bug（_forward_decode_plain seq_lens 契约）**：bring-up 时
+SOFT+DSpark 贪心轨迹第 5 步分叉、第 12 步脱轨（latent 块 2000 撞上限 vs 参考
+421），且 MAX_CTX=1 强制全 plain 时无 soft 也坏（probe essay 复读）——即
+`_forward_decode_plain` 从未正确过（生产 MAX_CTX=0 从不触发）。根因：该函数把
+spec-v2 约定（已提交前缀长度）的 `batch.seq_lens` 直接喂给普通 DECODE forward，
+而普通 decode 约定是 `prepare_for_decode` 在 forward 前 `seq_lens += 1`（含当前
+token）——导致 RoPE position 整体偏移一位、attention 因果长度少 1（当前 token
+自己的 KV 不在读窗口）、c4/c128 压缩器推进也落后一个 token；写侧
+`out_cache_loc` gather（用 prefix_lens）是对的，所以表现为"单步漂移后能短暂
+重合"的诡异轨迹。修法：forward 前把 `batch.seq_lens/seq_lens_cpu/orig_seq_lens`
++1（不持久化——scheduler 随后用发布的 new_seq_lens 覆盖，下一轮 prepare 从 req
+状态重种）。修复后 MAX_CTX=1 全 plain 的 probe 也 CLEAN。
+
+**部署**：`run_dspark.sh` 取消 SOFT/DSPARK 互斥；生产 `ds4f.service` 已含
+`--speculative-algorithm DSPARK` 与 soft 门控共存配置（见 §10.7 部署节的
+上线记录）。
+
+**视觉路径实测（2026-09-08，生产上线后）**：带图新请求的 latent 思考正常
+（表格读数题 109 个 latent 块、答案 82.7 正确、正常 stop）。
+探针 probe_dspark.py 已适配：dup 检测前先剥离 <|latent|> 块。
+
+### 10.11 视觉 + latent 回放（2026-09-08）：穿越图片展开的位置重映射
+
+**问题**：此前带图 + latent 历史的会话回放按设计 400——latent span 的位置在
+tokenize 前的文本空间计算（每个 `<｜deepseek_image｜>` 占位符算 1 个 token），
+而 mm processor 在 tokenize 之后把每个占位符展开为 283..286 个
+`vocab_size+type` 哨兵（`build_image_block`，长度随起点 mod 4 变化），span
+位置（及随之的 `soft_key_overrides`）不穿越展开重映射就会整体错位。
+
+**改动**：
+- `tokenizer_manager._remap_soft_latents_for_mm`（mm 处理后、构造
+  TokenizedGenerateReqInput 前）：用展开前 input_ids 中图片占位符的位置与
+  mm_items 的展开后 span 长度，把每个 latent span 位置加上它之前所有图片的
+  `Σ(span_len - 1)` 累计偏移（`soft_latent.shift_positions_for_expansions`），
+  并用 `item.offsets` 的起点交叉校验对齐（不符即 400，不静默错位）。
+  Req 侧零改动——`soft_key_overrides`、radix 四个建键点、HiCache prefetch
+  全部自动落在展开后坐标系。
+- `serving_chat` 删除 vision+latent 的 400 拒绝（`continue_final_message`
+  +latent 的拒绝保留）。
+
+**顺带修掉的崩溃（replace_embeds × mm pad_value）**：首次回放把调度器打崩——
+`vectorized_gather_kernel` 设备断言。根因：模型 pad_value =
+`1_000_000 + hash % 2^30`（radix 键用，远超 vocab），而
+`model_runner._extend_forward_kwargs` 在 replace_embeds 路径用
+`embed_layer(forward_batch.input_ids)` 裸 gather（正常 mm 路径有
+`embed_mm_inputs` 的 clamp 保护，replace 路径从未遇到过 pad_value）。
+两处修复：
+- `_extend_forward_kwargs` 的 base gather 改为 clamp 到 vocab 内（图片位的
+  base embedding 是垃圾无所谓，随即被覆盖）；
+- `deepseek_v4_vision.forward`：runner 传入 input_embeds 时（replace 路径）
+  不再跳过 `embed_mm_inputs`——算出图片 embedding 后按 `mm_token_mask`
+  只叠加图片 span（latent 位与图片 span 不相交，runner 已先散布 latent
+  override）。此前直接跳过会导致图片位拿到 clamp 垃圾 embedding（静默错误，
+  比崩溃更危险）。
+
+**测试证据**：
+- 单测 `tests/test_soft_latent.py` 44/44（新增 `shift_positions_for_expansions`
+  纯函数用例与 assemble→模拟展开→重映射→占位 id 对齐的端到端模拟）。
+- 生产实机 `tests/test_soft_latent_vision.py`（30000，无 --enable-cache-report，
+  缓存命中数从 journald `Prefill batch #cached-token` 行解析）**8/8**：
+  带图新请求产出 738 个 latent 块；带图回放被接受，日志
+  `remapped 738 latent position(s) past 1 image expansion(s)` +
+  `restored 738`；二次回放 cached=2048/new=256（穿越图片 span 与全部 latent
+  段）；篡改首个 latent 权重后 cached 掉到 256（匹配在首个 latent 位置截断，
+  图片段 + 首轮仍共享命中）；回放回答语义正确（表格内容）。
+
+### 10.12 单候选直通 + DSpark 进入思维链（2026-09-09）
+
+**Part A：单候选 latent 步直接输出真实 token。** 过滤（管线 + cap +
+min_prob 5%）后只剩 1 个候选的位置，soft embedding 退化为该候选自身的
+embedding 行（1.0×row，bit-exact），与采样该 token 完全等价——
+`_soft_latent_intercept` 对这类行直接提交真实 token（不出 latent 块、
+不留 pending、不产生合成缓存键）。效果：贪心（temp=0）思维链全部变成
+可读文本（0 个 latent 块）；temp=0.8 也只有真正多峰的位置出块（实测
+9.11-vs-9.9 每 100 步约 20-60 块）。附带收益：单候选 EOS 现在会正常
+终止请求（不再被吞成 latent 步，§10.5 的失控场景在贪心下消失）。
+状态机对 THINKING 中的真实 token 无需分支（保持 THINKING 继续）。
+
+**展示换行与精确剥离**：wire 格式块后固定带 `"  \n"`（markdown 硬换行，
+agent 展示用）。因为思维链文本流现在允许"latent 块 + 真实文本"混排，
+恢复解析改为：段首精确剥掉固定 padding 前缀（真实文本原样保留，哪怕
+它自身以空白开头）；旧格式（无 padding / `\n` / `\n\n`）按纯空白间隙
+或 `</think>` 前导空白整体剥离；其余一律不动（`_strip_display_whitespace`）。
+
+**detokenizer 精确拼接**：混排常态化后，原"全前置/全后置/告警前置"
+启发式在非流式请求（整个输出一个 flush 窗口）下会把全部 latent 块错误
+堆到真实文本之前。改为按哨兵位置计算精确字符偏移（对剥离哨兵后的
+read_ids 做前缀 decode）再拼接（`_splice_at_offsets`）。关键坑：首个
+flush 窗口含 prompt 尾部 surr 上下文（read_offset=5），fresh 窗口的
+read_ids 从窗口起点开始、base 必须为 0，稳态窗口 base=len(surr_ids)。
+
+**Part B：THINKING 态启用 DSpark。** 门控从"任何 THINKING 请求降级整批"
+收窄为"存在 pending soft embedding 才降级"（`_soft_pending_count > 0`）。
+单候选/think-end 位置与贪心等价，直接走 verify；latent 行强制 greedy
+accept（拒绝采样可能接受非 top 候选，与 plain 语义冲突）。verify 中发现
+多候选位置（`_soft_latent_clamp_accept`，eager accept 后、finalize 前）：
+截断 accepted 前缀到该位置、bonus 置哨兵、把该位置分布的 soft embedding
+与字符串形式 payload 分别写入 pending 缓冲与 `logits.latent_payloads`
+（verify 不走 tp_worker 的 id→string 转换）——哨兵位置的 KV 由下一步
+plain decode 用 soft embedding 重算覆盖（复用既有 pending/replace_embeds
+机制）。两个边界：扫描在 think-end-top 或单候选 EOS 位置停扫（其后的
+多候选位置属于 NORMAL 区，误 clamp 会把哨兵提交进内容流——实测泄漏过
+一次 `<｜System｜>` 文本，已修）；含 latent 行的批禁用 folded in-graph
+accept（图内 accept 无法截断）。
+
+**实测（生产 30000）**：temp=0.8 思维链 accept len 2.23（原 1.00），贪心
+3.77；6/6 请求无哨兵泄漏、答案正确；probe CLEAN；qa_battery 19/19；
+test_soft_latent_vision 8/8（含 clamp 产出的 latent 块的回放+radix 命中）。
+已知代价：clamp 位置提交进 draft KV 的 hidden 来自 verify 的被拒草稿输入
+（下一步 plain 只修正 target KV），latent 步后 draft 提议质量短暂下降，
+只影响 accept rate 不影响正确性。

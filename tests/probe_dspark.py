@@ -40,6 +40,18 @@ def dup_score(text):
     return hits
 
 
+# Soft latent reasoning（SGLANG_SOFT_THINKING）的 reasoning_content 由
+# <|latent|>...<|/latent|> 块构成， dup_score 会把块边界误判为重复——
+# 评分前先剥离（latent 模式下的复读检测退化为对可见文本部分进行）。
+# 注意块后的 "  \n" 展示空白（wrap_payload）一并剥掉，否则全部剥完后剩下的
+# 纯空白串自身触发 dup。
+_LATENT_RE = re.compile(r"<\|latent\|>.*?<\|/latent\|>[ \n]*")
+
+
+def visible(text):
+    return _LATENT_RE.sub("", text)
+
+
 fails = []
 
 rc, c = gen("12乘以3等于多少？只回答算式和结果。", 150)
@@ -50,11 +62,12 @@ rc, c = gen("把这句话翻译成英文：人工智能正在改变世界。", 2
 en = (c or "").strip()
 if not en or not re.search(r"[A-Za-z]{4,}\s+[A-Za-z]{3,}", (c or "")):
     fails.append(f"translate bad: {(rc+c)[:80]!r}")
-if len(rc) > 30 and dup_score(rc) > 2:
-    fails.append(f"reasoning dup ({dup_score(rc)}): {rc[:100]!r}")
+rc_v = visible(rc)
+if len(rc_v) > 30 and dup_score(rc_v) > 2:
+    fails.append(f"reasoning dup ({dup_score(rc_v)}): {rc_v[:100]!r}")
 
 rc, c = gen("写一段100字左右的短文，主题是海洋。", 350)
-body = rc + c
+body = visible(rc) + (c or "")
 if len(body) < 80:
     fails.append(f"essay too short: {body[:80]!r}")
 if dup_score(body) > 4:
