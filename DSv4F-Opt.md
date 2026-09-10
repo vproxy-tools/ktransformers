@@ -2348,8 +2348,10 @@ prefill。**DSpark 共存（2026-09-09 起，§10.12；初版全降级见 §10.1
 
 ### 10.1 开关与部署约束
 
-- `SGLANG_SOFT_THINKING=1`（**2026-09-08 起生产 ds4f.service 已默认开启**；
-  单请求可用 `chat_template_kwargs {"thinking": false}` 走纯普通解码）。
+- `SGLANG_SOFT_THINKING=1`（2026-09-08~09-10 曾开生产 ds4f.service，**2026-09-10
+  起生产回退关闭**——生产服务定位为不开 latent 的稳态，latent 只在实验实例
+  `run_dspark.sh SOFT=1`（30001）使用；单请求可用
+  `chat_template_kwargs {"thinking": false}` 走纯普通解码）。
 - `SGLANG_SOFT_LATENT_TOPK_CAP`（候选数封顶，默认 4——2026-09-09 起由 256
   收紧；实际分布大概率只有 3-4 个有效候选，无 top-k/top-p 过滤的请求
   每位置候选即 top-4 归一化分布，soft embedding 质量无损（尾部单概率
@@ -2528,6 +2530,9 @@ embedding（已知限制），其 KV 与内容 key 不再自洽——`reset_for_
 已直接覆盖为生产 `ds4f.service` 并重启上线——验证：贪心思维题 226 个
 latent 块答案正确、probe CLEAN（探针已改为 dup 检测前剥离 latent 块）、
 qa_battery 19/19、内容区 accept len 2.0-2.4。
+（**2026-09-10 回退**：生产恢复为不开 latent 的稳态配置，soft thinking
+只在实验实例使用；生产期间的 latent 键 L3 条目成为无害残留——正常
+token 流不会再产生这些合成键，自然淘汰。）
 
 ### 10.8 事故二（2026-09-08）：INT8 镜像再次损坏——根因确认并修复实验流程
 

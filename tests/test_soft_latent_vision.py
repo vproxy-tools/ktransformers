@@ -1,9 +1,12 @@
 """Integration test: vision + soft latent replay through the radix cache.
 
-Runs against the live production server (port 30000, vision-exp model,
-SGLANG_SOFT_THINKING=1). Production has no --enable-cache-report, so cache
-hits are read from the journald "Prefill batch ... #cached-token: N" lines
-instead of the usage payload.
+Runs against a live vision-exp server with SGLANG_SOFT_THINKING=1. NOTE
+(2026-09-10): production (ds4f.service, port 30000) NO LONGER enables soft
+latent — to run this test, start a dedicated latent-enabled vision instance,
+e.g. temporarily add the SGLANG_SOFT_* envs to the unit (cache-hit assertions
+read journald -u ds4f "Prefill batch ... #cached-token: N" lines), or point
+--port at an experimental instance started from run_dspark.sh with the
+vision-exp model (journal source must be adjusted accordingly).
 
 Proves that:
 1. an image + thinking request emits <|latent|> blocks (baseline);
